@@ -3,10 +3,11 @@
 use thiserror::Error;
 
 use crate::elf::{self, ElfError};
+use crate::emulate::{Emulation, Emulator};
 use crate::linux::{Action, Linux, Stdio};
 use crate::vcpu::{A0, Exit, ExitReason, MemoryFault, SP, Vcpu};
 
-/// Memory kept free for the stack between the heap limit and the top of guest memory.
+/// Memory kept free for the stack at the top of guest memory, above the heap and mappings.
 pub const STACK_SIZE: u32 = 1 << 20;
 /// Instructions per `run` call. Each slice boundary is a preemption point.
 pub const SLICE: u64 = 1 << 16;
@@ -32,7 +33,8 @@ pub enum RunError {
 pub struct Container<V> {
     pub vcpu: V,
     pub linux: Linux,
-    /// Instructions retired so far.
+    pub emulator: Emulator,
+    /// Instructions retired so far by the vCPU. Emulated instructions are not counted.
     pub steps: u64,
 }
 
@@ -54,6 +56,7 @@ impl<V: Vcpu> Container<V> {
         Ok(Self {
             vcpu,
             linux,
+            emulator: Emulator::default(),
             steps: 0,
         })
     }
@@ -78,6 +81,16 @@ impl<V: Vcpu> Container<V> {
                         self.vcpu.set_pc(exit.pc.wrapping_add(4));
                     }
                 },
+                ExitReason::IllegalInstruction(ins) => {
+                    match self.emulator.emulate(&mut self.vcpu, ins) {
+                        Emulation::Done => {}
+                        Emulation::Unsupported => return Err(RunError::Fault(exit)),
+                        Emulation::Fault(addr) => {
+                            let reason = ExitReason::MemoryFault(addr);
+                            return Err(RunError::Fault(Exit { reason, ..exit }));
+                        }
+                    }
+                }
                 _ => return Err(RunError::Fault(exit)),
             }
         }

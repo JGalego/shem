@@ -24,7 +24,7 @@ The starting point is [Qwenputer](https://divagr.com/blog/qwenputer), which comp
 | Guest runs | One user-mode program | A kernel and its programs |
 | Guest exits on | System calls | Device access, traps, timer ticks |
 | Host provides | Linux system calls ([`linux.rs`](../crates/shem/src/linux.rs)) | Virtual devices: console, block, timer |
-| ISA needed | RV32IM | RV32IMA plus Zicsr, M-mode traps, a timer |
+| ISA needed | RV32IM; the host emulates the A extension | RV32IMA plus Zicsr, M-mode traps, a timer |
 | Start cost | Load an ELF into memory | Boot a kernel, or resume a booted snapshot |
 
 Container mode comes first because user-mode RV32IM is exactly what a Qwenputer already implements, and there is no kernel to boot.
@@ -46,7 +46,7 @@ Two requirements follow for a neural vCPU:
 
 ## Design rules that come from running on a model
 
-1. **Exits are relatively cheap.** On real hardware a VM exit costs about a thousand instructions, so hypervisors avoid them. Here each guest instruction is a forward pass, about 1 ms at Qwenputer's published speed, and an exit costs a GPU sync plus a few tensor reads: by our estimate, about as much as a few instructions. So anything awkward goes to the host: system calls, atomics, page faults, possibly floating point.
+1. **Exits are relatively cheap.** On real hardware a VM exit costs about a thousand instructions, so hypervisors avoid them. Here each guest instruction is a forward pass, about 1 ms at Qwenputer's published speed, and an exit costs a GPU sync plus a few tensor reads: by our estimate, about as much as a few instructions. So anything awkward goes to the host: system calls, atomics, page faults, possibly floating point. Atomics already work this way: the vCPU exits on an A-extension instruction and [`emulate.rs`](../crates/shem/src/emulate.rs) carries it out, since musl's riscv32 port cannot be built without LR/SC.
 2. **Batching doesn't slow guests down when they diverge.** Every instruction runs the same fixed matrix multiplications, so many guests can decode in one batch for little more than the cost of one, until the GPU becomes compute-bound. Each guest is slow, but one GPU can run many of them. The batch scheduler is the hypervisor's scheduler: a guest that exits sits out while the others keep decoding.
 3. **Preemption is free.** The host drives every step, so a step budget replaces a timer interrupt.
 4. **`fork()` is a state copy.** Each guest process could be its own sequence, with the host acting as the kernel: fork clones the state, pipes are host buffers.
@@ -69,14 +69,14 @@ Two requirements follow for a neural vCPU:
 | Images | OCI image spec and registries | Digests, layer sharing, signing and existing registries for free |
 | Docker integration | A containerd shim, as runwasi does for Wasm (planned) | `docker run --runtime io.containerd.shem.v1` through Docker's containerd image store |
 | Builds | Own builder first, then a BuildKit frontend in Go (planned) | BuildKit frontends are written in Go |
-| Guest toolchain | Clang or GCC for rv32im/ilp32, in a Docker build stage | |
-| Testing | `cargo test`; the official riscv-tests; Spike as a golden model; differential traces between neural and reference vCPUs | |
+| Guest toolchain | Zig (`zig cc`) targeting `riscv32-linux-musl`, in [`toolchain/Dockerfile`](../toolchain/Dockerfile) | One hermetic binary that builds musl and compiler-rt for the exact target CPU. Works the same on x86-64 and arm64 hosts. |
+| Testing | `cargo test`; the official riscv-tests (`just guest-tests`); Spike as a golden model (planned); differential traces between neural and reference vCPUs (planned) | |
 
 ## Roadmap
 
-1. **Reference vCPU and container runtime.** Done: RV32IM, static ELF loading, the Linux stack layout, and a minimal system-call layer (`read`, `write`, `writev`, `close`, `brk`, `exit`).
-2. **ISA compliance.** Run the official riscv-tests against the reference vCPU, and cross-check it against Spike.
-3. **Real programs.** Filesystem system calls backed by a host root directory (`openat`, `fstat`, `lseek`, `getdents64`), anonymous `mmap`, a fixed clock. Goal: a static BusyBox.
+1. **Reference vCPU and container runtime.** Done: RV32IM, static ELF loading, the Linux stack layout, and a minimal system-call layer. The reference vCPU runs about 175 million instructions per second (measured on a simple loop).
+2. **ISA compliance.** Done: all 60 tests in the official rv32ui, rv32um and rv32ua suites pass, the last through host emulation. Still to do: cross-check against Spike.
+3. **Real programs.** In progress. C programs linked against musl run: stdio, `malloc` backed by anonymous `mmap` ([`mm.rs`](../crates/shem/src/mm.rs)), and atomics. Next: filesystem system calls backed by a host root directory (`openat`, `statx`, `llseek`, `getdents64`) and a fixed clock. Goal: a static BusyBox.
 4. **Neural vCPU.** A weight compiler and Triton executor behind the KVM-style RPC, with differential trace tests against the reference vCPU.
 5. **Images.** A Shemfile builder that writes OCI layouts, plus `WARM` snapshots. See [shemfile.md](shemfile.md).
 6. **Density.** Many guests batched on one GPU, and paged state with copy-on-write.

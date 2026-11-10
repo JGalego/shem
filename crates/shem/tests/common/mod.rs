@@ -1,8 +1,13 @@
 //! A tiny RV32IM assembler and ELF writer, so tests don't need a cross-compiler.
-#![allow(dead_code)]
+// Each test binary compiles this module separately and uses a different part of it.
+#![allow(dead_code, unused_imports, unused_macros)]
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+
+use shem::container::{Container, StartError};
+use shem::linux::Stdio;
+use shem::reference::ReferenceVcpu;
 
 pub const ZERO: u32 = 0;
 pub const RA: u32 = 1;
@@ -14,6 +19,7 @@ pub const A0: u32 = 10;
 pub const A1: u32 = 11;
 pub const A2: u32 = 12;
 pub const A3: u32 = 13;
+pub const A4: u32 = 14;
 pub const A7: u32 = 17;
 
 pub const ECALL: u32 = 0x0000_0073;
@@ -75,6 +81,14 @@ encoders! {
     bne(rs1: u32, rs2: u32, offset: i32) = b(1, rs1, rs2, offset);
     lui(rd: u32, upper: u32) = upper & 0xffff_f000 | rd << 7 | 0x37;
     auipc(rd: u32, upper: u32) = upper & 0xffff_f000 | rd << 7 | 0x17;
+    lr_w(rd: u32, rs1: u32) = amo(0x02, rd, rs1, 0);
+    sc_w(rd: u32, rs2: u32, rs1: u32) = amo(0x03, rd, rs1, rs2);
+    amoadd_w(rd: u32, rs2: u32, rs1: u32) = amo(0x00, rd, rs1, rs2);
+    amomaxu_w(rd: u32, rs2: u32, rs1: u32) = amo(0x1c, rd, rs1, rs2);
+}
+
+fn amo(funct5: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+    funct5 << 27 | rs2 << 20 | rs1 << 15 | 2 << 12 | rd << 7 | 0x2f
 }
 
 pub fn jal(rd: u32, offset: i32) -> u32 {
@@ -176,4 +190,22 @@ impl Write for SharedBuf {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// Load `elf` into a fresh reference vCPU with the given stdin, capturing stdout.
+pub fn start(
+    elf: &[u8],
+    argv: &[&str],
+    stdin: &[u8],
+    mem: u32,
+) -> Result<(Container<ReferenceVcpu>, SharedBuf), StartError> {
+    let stdout = SharedBuf::default();
+    let stdio = Stdio {
+        stdin: Box::new(std::io::Cursor::new(stdin.to_vec())),
+        stdout: Box::new(stdout.clone()),
+        stderr: Box::new(std::io::sink()),
+    };
+    let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    let container = Container::from_elf(ReferenceVcpu::new(mem), elf, &argv, &[], stdio)?;
+    Ok((container, stdout))
 }

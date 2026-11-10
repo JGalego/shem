@@ -1,0 +1,4 @@
+#!/bin/sh
+# Compile C for shem guests: static RV32IMA Linux executables, soft-float, against musl.
+# musl's riscv32 port needs the A extension; shem emulates it on the host.
+exec zig cc -target riscv32-linux-musl -mcpu=generic_rv32+m+a -static "$@"

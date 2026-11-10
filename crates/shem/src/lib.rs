@@ -6,6 +6,8 @@
 
 pub mod container;
 pub mod elf;
+pub mod emulate;
 pub mod linux;
+pub mod mm;
 pub mod reference;
 pub mod vcpu;

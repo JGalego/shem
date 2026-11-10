@@ -6,9 +6,9 @@ A Shemfile describes a model container image, the way a Dockerfile describes a c
 
 ```dockerfile
 # Stage 1: an ordinary Docker stage that cross-compiles the guest program
-FROM ghcr.io/me/rv32im-toolchain AS build
+FROM shem-toolchain AS build
 COPY hello.c .
-RUN riscv32-unknown-linux-gnu-gcc -march=rv32im -mabi=ilp32 -static -O2 -o hello hello.c
+RUN rv32-cc -O2 -o hello hello.c
 
 # Stage 2: the model container
 FROM ghcr.io/shem/qwen3.5-4b:rv32im      # machine image: model weights + compiled CPU
@@ -18,7 +18,7 @@ ENTRYPOINT ["/bin/hello"]
 WARM --until=syscall:read                # run at build time, save the state as a layer
 ```
 
-The image names are illustrative.
+`shem-toolchain` is the image built from [`toolchain/Dockerfile`](../toolchain/Dockerfile) (`just toolchain`); `ghcr.io/shem/qwen3.5-4b:rv32im` is illustrative.
 
 ## Stages
 
@@ -59,7 +59,7 @@ A `WARM` layer holds two things:
 
 Filesystem writes made during `WARM` become an ordinary filesystem layer.
 
-**WARM can run on the reference vCPU.** Snapshots are canonical, and a neural vCPU must be trace-equivalent to the reference one. So the builder can run `WARM` on the fast reference vCPU, at hundreds of millions of instructions per second instead of about a thousand, and the snapshot then resumes on the model. This is what makes VM mode practical: boot the kernel at build time on the CPU, and ship the booted state.
+**WARM can run on the reference vCPU.** Snapshots are canonical, and a neural vCPU must be trace-equivalent to the reference one. So the builder can run `WARM` on the fast reference vCPU, at about 175 million instructions per second instead of about a thousand, and the snapshot then resumes on the model. This is what makes VM mode practical: boot the kernel at build time on the CPU, and ship the booted state.
 
 ## Image format
 
