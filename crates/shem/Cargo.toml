@@ -1,0 +1,11 @@
+[package]
+name = "shem"
+version = "0.1.0"
+description = "Run containers and VMs inside a model's weights"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
