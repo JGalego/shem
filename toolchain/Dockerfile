@@ -46,3 +46,23 @@ RUN mkdir /out \
 
 FROM scratch AS riscv-tests
 COPY --from=riscv-tests-build /out/ /
+
+# BusyBox, statically linked for shem guests, installed as a minimal rootfs.
+FROM toolchain AS busybox-build
+ARG BUSYBOX_VERSION=1.38.0
+ARG BUSYBOX_SHA256=34f9ea6ff8636f2c9241153b9114eefa9e65674a45318ae1ef95bb5f31c53bb2
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bzip2 gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL "https://busybox.net/downloads/busybox-$BUSYBOX_VERSION.tar.bz2" -o /tmp/busybox.tar.bz2 \
+    && echo "$BUSYBOX_SHA256  /tmp/busybox.tar.bz2" | sha256sum -c - \
+    && mkdir /busybox \
+    && tar -xjf /tmp/busybox.tar.bz2 -C /busybox --strip-components=1
+WORKDIR /busybox
+COPY busybox.config.sh .
+RUN make defconfig >/dev/null && sh busybox.config.sh
+RUN make -j"$(nproc)" CC=rv32-cc HOSTCC=gcc AR="zig ar" SKIP_STRIP=y busybox \
+    && make CC=rv32-cc HOSTCC=gcc AR="zig ar" SKIP_STRIP=y CONFIG_PREFIX=/rootfs install >/dev/null
+
+FROM scratch AS busybox
+COPY --from=busybox-build /rootfs/ /

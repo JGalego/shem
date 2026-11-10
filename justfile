@@ -48,9 +48,10 @@ cc *args: toolchain
         -e ZIG_GLOBAL_CACHE_DIR=/zig-cache \
         {{ toolchain_image }} rv32-cc "$@"
 
-# Build the guest programs (riscv-tests and guests/) and run them; needs Docker
+# Build the guest programs (riscv-tests, guests/ and BusyBox) and run them; needs Docker
 guest-tests: toolchain
     docker build -q --target riscv-tests --output type=local,dest=target/riscv-tests toolchain
+    docker build -q --target busybox --output type=local,dest=target/busybox toolchain
     mkdir -p target/guests
     just cc -O2 -o target/guests/hello guests/hello.c
     cargo test --release --test guests -- --ignored

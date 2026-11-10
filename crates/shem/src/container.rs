@@ -74,7 +74,7 @@ impl<V: Vcpu> Container<V> {
             match exit.reason {
                 // A scheduler running many guests would switch to another one here.
                 ExitReason::Budget => {}
-                ExitReason::Ecall => match self.linux.handle(&mut self.vcpu) {
+                ExitReason::Ecall => match self.linux.handle(&mut self.vcpu, self.steps) {
                     Action::Exit(status) => return Ok(status),
                     Action::Return(value) => {
                         self.vcpu.set_reg(A0, value);

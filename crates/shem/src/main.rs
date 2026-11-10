@@ -34,6 +34,10 @@ enum Command {
         /// Set an environment variable in the guest (KEY=VALUE)
         #[arg(short, long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Host directory to use as the guest's root filesystem
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Executable to run, as a host path
         program: PathBuf,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -55,6 +59,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         mem,
         max_steps,
         env,
+        root,
         program,
         args,
     } = cli.command;
@@ -69,6 +74,11 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
     };
     let mut container = Container::from_elf(ReferenceVcpu::new(mem), &elf, &argv, &env, stdio)
         .with_context(|| format!("loading {}", program.display()))?;
+    if let Some(root) = root {
+        (container.linux)
+            .set_root(&root)
+            .with_context(|| format!("using {} as the root filesystem", root.display()))?;
+    }
     let status = container.run(max_steps);
     for (nr, count) in &container.linux.unsupported {
         eprintln!("shem: guest made unsupported system call {nr} ({count}x)");

@@ -51,11 +51,12 @@ Two requirements follow for a neural vCPU:
 3. **Preemption is free.** The host drives every step, so a step budget replaces a timer interrupt.
 4. **`fork()` is a state copy.** Each guest process could be its own sequence, with the host acting as the kernel: fork clones the state, pipes are host buffers.
 5. **The host can be the MMU.** Keep the guest's working set in the state and the rest in host memory. A miss exits and the host swaps rows in.
-6. **Determinism gives exact replay.** Execution is deterministic, so logging the exits is enough to replay a run bit for bit. It also makes build-time snapshots reproducible (see [the Shemfile spec](shemfile.md)).
+6. **Determinism gives exact replay.** Execution is deterministic, so logging the exits is enough to replay a run bit for bit. It also makes build-time snapshots reproducible (see [the Shemfile spec](shemfile.md)). The host keeps its side deterministic too: the clock is virtual (one nanosecond per retired instruction, starting at 2026-01-01, and sleeping advances it instantly), `getrandom` is a seeded PRNG, and directory listings are sorted. One gap remains: file timestamps come from the host filesystem.
 
 ## Isolation
 
-- The only way out of a guest is an exit, so the attack surface is the exit handler. [`linux.rs`](../crates/shem/src/linux.rs) treats every guest pointer and length as hostile: transfers are capped, and bad pointers return `EFAULT`.
+- The only way out of a guest is an exit, so the attack surface is the exit handler. The [system-call layer](../crates/shem/src/linux/) treats every guest pointer and length as hostile: transfers are capped, and bad pointers return `EFAULT`.
+- Guest paths resolve inside the root directory with chroot semantics ([`rootfs.rs`](../crates/shem/src/linux/rootfs.rs)): `..` stops at the root, and symlinks, absolute ones included, resolve relative to it. Resolution and the final open are separate host calls, so a concurrent writer to the host directory could race them; a single guest cannot. `openat2` with `RESOLVE_IN_ROOT` would close that gap on Linux hosts.
 - In a hybrid model, the language layers share activations with the CPU layers. Whether they can write into the CPU's state heads is a property of the weights. If the compiled heads are disjoint (zero blocks in the relevant projections), isolation can be checked by inspecting the matrices.
 - Guest output that flows back into a language model's context is untrusted input, and a possible prompt-injection channel. The host should filter it like any other device output.
 
@@ -76,9 +77,10 @@ Two requirements follow for a neural vCPU:
 
 1. **Reference vCPU and container runtime.** Done: RV32IM, static ELF loading, the Linux stack layout, and a minimal system-call layer. The reference vCPU runs about 175 million instructions per second (measured on a simple loop).
 2. **ISA compliance.** Done: all 60 tests in the official rv32ui, rv32um and rv32ua suites pass, the last through host emulation. Still to do: cross-check against Spike.
-3. **Real programs.** In progress. C programs linked against musl run: stdio, `malloc` backed by anonymous `mmap` ([`mm.rs`](../crates/shem/src/mm.rs)), and atomics. Next: filesystem system calls backed by a host root directory (`openat`, `statx`, `llseek`, `getdents64`) and a fixed clock. Goal: a static BusyBox.
-4. **Neural vCPU.** A weight compiler and Triton executor behind the KVM-style RPC, with differential trace tests against the reference vCPU.
-5. **Images.** A Shemfile builder that writes OCI layouts, plus `WARM` snapshots. See [shemfile.md](shemfile.md).
-6. **Density.** Many guests batched on one GPU, and paged state with copy-on-write.
-7. **VM mode.** `shem boot`, virtual devices, a no-MMU Linux kernel.
-8. **Ecosystem.** A containerd shim and a BuildKit frontend.
+3. **Real programs.** Done for single processes. C programs linked against musl run, and so does a static BusyBox with a host directory as its root filesystem (`shem run --root`): text tools, `sha256sum`, `awk`, `find`, file and directory operations, `date` and `sleep` on the virtual clock, and `sh` scripts that use only builtins. Not yet: `df` and anything else that reads `/proc`.
+4. **Processes.** `fork`, `execve`, `wait4` and pipes, with the host as the kernel and each process its own vCPU state (design rule 4). This is what shell pipelines and external commands need.
+5. **Neural vCPU.** A weight compiler and Triton executor behind the KVM-style RPC, with differential trace tests against the reference vCPU.
+6. **Images.** A Shemfile builder that writes OCI layouts, plus `WARM` snapshots. See [shemfile.md](shemfile.md).
+7. **Density.** Many guests batched on one GPU, and paged state with copy-on-write.
+8. **VM mode.** `shem boot`, virtual devices, a no-MMU Linux kernel.
+9. **Ecosystem.** A containerd shim and a BuildKit frontend.

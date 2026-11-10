@@ -17,7 +17,7 @@ Early. What works today is the host side, running on a reference vCPU:
 - an RV32IM interpreter that defines correct behaviour for any neural vCPU, and passes the official riscv-tests suites
 - host emulation of the A extension (atomics), so the vCPU itself stays RV32IM
 - a loader for static RV32 Linux executables, with the standard Linux stack layout
-- a Linux system-call layer with stdio, `brk` and anonymous `mmap`, enough for C programs linked against musl
+- a Linux system-call layer: files and directories in a host directory used as the guest's root, `brk` and anonymous `mmap`, and a virtual clock, enough for C programs linked against musl and for a static BusyBox
 - `shem run`, which runs an executable as a container
 
 There is no neural vCPU yet. See the [roadmap](docs/architecture.md#roadmap).
@@ -33,7 +33,10 @@ just hooks                                  # install the git hooks
 
 just cc -O2 -o target/hello guests/hello.c  # compile a C guest with the toolchain image
 just run target/hello one two               # run it as a container
-just guest-tests                            # build and run riscv-tests and the C guests
+just guest-tests                            # build and run riscv-tests, the C guests and BusyBox
+
+# after `just guest-tests`, BusyBox and its rootfs are in target/busybox
+just run --root target/busybox target/busybox/bin/busybox ls -l /bin
 ```
 
 Guest programs are static RV32 Linux executables. `just cc` builds them with Zig against musl, for RV32IMA with soft float; see [`toolchain/`](toolchain/).
@@ -46,7 +49,11 @@ crates/shem/src/
   reference.rs   the reference RV32IM interpreter
   emulate.rs     host emulation of instructions the vCPU lacks (atomics)
   elf.rs         ELF loading and the initial process stack
-  linux.rs       Linux system calls, implemented by the host
+  linux/         Linux system calls, implemented by the host
+    mod.rs       dispatch, processes, time and identity
+    files.rs     file descriptors, files and directories
+    rootfs.rs    path resolution inside the guest's root directory
+    abi.rs       system call numbers, errno values, flags and structs
   mm.rs          the guest address space: heap and anonymous mappings
   container.rs   the hypervisor loop for container mode
   main.rs        the shem CLI
