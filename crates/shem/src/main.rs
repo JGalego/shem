@@ -34,6 +34,10 @@ enum Command {
     Build(BuildArgs),
     /// List the images in the local store
     Images,
+    /// Push an image to an OCI registry (uses oras)
+    Push(PushArgs),
+    /// Pull an image from an OCI registry into the store (uses oras)
+    Pull(PullArgs),
     /// Boot an operating system kernel in VM mode, with its console on stdio
     Boot(BootArgs),
 }
@@ -102,6 +106,29 @@ struct BuildArgs {
 }
 
 #[derive(Args)]
+struct PushArgs {
+    /// Talk to the registry over plain HTTP, as to a local test registry
+    #[arg(long)]
+    plain_http: bool,
+    /// The image: name[:tag] in the store, or an OCI layout directory
+    image: String,
+    /// Where to push it, such as ghcr.io/me/app:1.0
+    remote: String,
+}
+
+#[derive(Args)]
+struct PullArgs {
+    /// Talk to the registry over plain HTTP, as to a local test registry
+    #[arg(long)]
+    plain_http: bool,
+    /// The name to store it under, if not the remote reference
+    #[arg(short, long)]
+    tag: Option<String>,
+    /// The image to pull, such as ghcr.io/me/app:1.0
+    remote: String,
+}
+
+#[derive(Args)]
 struct BootArgs {
     /// Guest memory size, such as 64M
     #[arg(long, default_value = "64M", value_parser = parse_size)]
@@ -124,6 +151,8 @@ fn main() -> ExitCode {
         Command::Run(args) => run(args),
         Command::Build(args) => build(args),
         Command::Images => images(),
+        Command::Push(args) => push(args),
+        Command::Pull(args) => pull(args),
         Command::Boot(args) => boot(args),
     };
     match result {
@@ -258,7 +287,8 @@ fn build(args: BuildArgs) -> anyhow::Result<u8> {
         }
         std::fs::remove_dir_all(&dir)?;
     }
-    let digest = built.write_layout(&dir, &tag)?;
+    let (_, tag_name) = image::parse_reference(&tag)?;
+    let digest = built.write_layout(&dir, tag_name)?;
     eprintln!("shem: built {tag} {digest}");
     Ok(0)
 }
@@ -289,6 +319,32 @@ fn boot(args: BootArgs) -> anyhow::Result<u8> {
             Ok(0)
         }
     }
+}
+
+fn image_dir(target: &str) -> anyhow::Result<PathBuf> {
+    let dir = Path::new(target);
+    if dir.join("oci-layout").is_file() {
+        return Ok(dir.to_path_buf());
+    }
+    let path = Store::open()?.path(target)?;
+    if !path.join("oci-layout").is_file() {
+        bail!("{target}: no such image (see `shem images`)");
+    }
+    Ok(path)
+}
+
+fn push(args: PushArgs) -> anyhow::Result<u8> {
+    let digest = image::push(&image_dir(&args.image)?, &args.remote, args.plain_http)?;
+    eprintln!("shem: pushed {} {digest}", args.remote);
+    Ok(0)
+}
+
+fn pull(args: PullArgs) -> anyhow::Result<u8> {
+    let local = args.tag.as_deref().unwrap_or(&args.remote);
+    let dir = Store::open()?.path(local)?;
+    let digest = image::pull(&args.remote, &dir, args.plain_http)?;
+    eprintln!("shem: pulled {} as {local} {digest}", args.remote);
+    Ok(0)
 }
 
 fn images() -> anyhow::Result<u8> {

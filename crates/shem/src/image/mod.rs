@@ -11,6 +11,7 @@
 
 mod build;
 mod layer;
+mod registry;
 pub mod shemfile;
 
 use std::collections::BTreeMap;
@@ -22,6 +23,7 @@ use sha2::{Digest, Sha256};
 
 pub use build::{BuildOptions, build};
 pub use layer::unpack;
+pub use registry::{pull, push};
 
 use crate::container::{Container, Frozen, FrozenHost};
 use crate::linux::{RootFs, Stdio};
@@ -350,20 +352,29 @@ impl Store {
     }
 }
 
-/// Split `name[:tag]`, checking the name is safe to use as a path.
+/// Split `name[:tag]`, checking the name is safe to use as a path. The name
+/// may start with a registry host and port, as in `localhost:5000/team/app`.
 pub fn parse_reference(reference: &str) -> anyhow::Result<(&str, &str)> {
     let (name, tag) = match reference.rsplit_once(':') {
         Some((name, tag)) if !tag.contains('/') => (name, tag),
         _ => (reference, "latest"),
     };
-    let valid = |s: &str, extra: &[char]| {
+    let word = |s: &str| {
         !s.is_empty()
+            && s != "."
+            && s != ".."
             && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c) || extra.contains(&c))
-            && s.split('/')
-                .all(|part| !part.is_empty() && part != "." && part != "..")
+                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
     };
-    if !valid(name, &['/']) || !valid(tag, &[]) {
+    let mut parts = name.split('/');
+    let first = parts.next().unwrap_or_default();
+    let host_ok = match first.split_once(':') {
+        Some((host, port)) => {
+            word(host) && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+        }
+        None => word(first),
+    };
+    if !host_ok || !parts.all(word) || !word(tag) {
         bail!("invalid image reference {reference:?}");
     }
     Ok((name, tag))

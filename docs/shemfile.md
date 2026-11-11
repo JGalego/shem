@@ -7,6 +7,8 @@ shem build -t hello examples/hello       # build into the local image store
 shem run hello                           # run it
 shem images                              # list the store
 shem build -o hello.oci examples/hello   # or write an OCI image layout directory
+shem push hello ghcr.io/me/hello:1.0     # push to an OCI registry
+shem pull ghcr.io/me/hello:1.0           # pull into the store, and run it by that name
 ```
 
 ## Examples
@@ -102,7 +104,9 @@ A shem image is an [OCI image layout](https://github.com/opencontainers/image-sp
 
 Images in the local store live under `$SHEM_HOME/images/<name>/<tag>`, by default `~/.local/share/shem/images`. Each run unpacks the image's filesystem into a fresh directory and removes it afterwards, like `docker run --rm`.
 
-Planned: a `application/vnd.shem.weights.v1+safetensors` layer for machine images that carry model weights, pushing and pulling through OCI registries, and compressed layers.
+`shem push` and `shem pull` copy images to and from any OCI registry with [ORAS](https://oras.land), which handles any media types, so registries need nothing special; `--plain-http` reaches a registry without TLS, such as a local one. Pushes go by manifest digest, and an image keeps its digest through the round trip. A test pushes a warm image to a registry, pulls it back, and runs it.
+
+Planned: a `application/vnd.shem.weights.v1+safetensors` layer for machine images that carry model weights, and compressed layers: a warm image's state layer holds all of its memory, uncompressed.
 
 ## Reproducibility
 

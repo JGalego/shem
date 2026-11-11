@@ -103,3 +103,12 @@ containerd-test: toolchain
         sudo journalctl -u containerd --no-pager | grep -iE 'shem|error|warn' | tail -30 || true
         exit 1
     fi
+
+# Push and pull an image through a local registry; needs Docker and oras
+registry-test:
+    #!/bin/sh
+    set -e
+    docker run -d --rm --name shem-test-registry -p 5000:5000 registry:2 >/dev/null
+    trap 'docker stop shem-test-registry >/dev/null' EXIT
+    sleep 1
+    SHEM_TEST_REGISTRY=localhost:5000 cargo test --release --test image registry -- --ignored

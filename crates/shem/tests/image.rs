@@ -348,7 +348,42 @@ fn image_references_are_checked() {
         parse_reference("me/hello:1.0").unwrap(),
         ("me/hello", "1.0")
     );
-    for bad in ["", "../x", "a//b", "x:../y", "x:", "has space"] {
+    let with_registry = parse_reference("localhost:5000/me/hello:1.0").unwrap();
+    assert_eq!(with_registry, ("localhost:5000/me/hello", "1.0"));
+    let untagged = parse_reference("localhost:5000/me/hello").unwrap();
+    assert_eq!(untagged, ("localhost:5000/me/hello", "latest"));
+    for bad in [
+        "",
+        "../x",
+        "a//b",
+        "x:../y",
+        "x:",
+        "has space",
+        "host:port/x",
+        "a/b:c/d:1",
+    ] {
         assert!(parse_reference(bad).is_err(), "{bad:?}");
     }
+}
+
+#[test]
+#[ignore = "needs oras and a registry: run `just registry-test`"]
+fn warm_images_round_trip_through_a_registry() {
+    let registry = std::env::var("SHEM_TEST_REGISTRY").unwrap_or_else(|_| "localhost:5000".into());
+    let shemfile = "FROM scratch\nCOPY echo /bin/echo\nENTRYPOINT [\"/bin/echo\"]\nWARM --until=syscall:read\n";
+    let ctx = context(shemfile, &[("echo", echo())]);
+    let image = build(ctx.path()).unwrap();
+    let dirs = tempfile::tempdir().unwrap();
+    let (pushed, pulled) = (dirs.path().join("pushed"), dirs.path().join("pulled"));
+    let digest = image.write_layout(&pushed, "latest").unwrap();
+
+    let remote = format!("{registry}/shem-tests/echo:warm");
+    assert_eq!(image::push(&pushed, &remote, true).unwrap(), digest);
+    assert_eq!(image::pull(&remote, &pulled, true).unwrap(), digest);
+    let back = Image::read_layout(&pulled).unwrap();
+    assert_eq!(back, image);
+    assert_eq!(
+        run(&back, &[], b"over the wire\n"),
+        (0, b"over the wire\n".to_vec())
+    );
 }

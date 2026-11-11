@@ -16,7 +16,7 @@ The name comes from the golem legend: a clay figure comes to life when a *shem*,
 Early, but every part of the design exists, from the reference vCPU to a model running guests.
 
 - **Containers** (`shem run`). The host is the guest's kernel: static RV32 Linux programs run with files from a host directory as their root, processes (`fork`, `execve`, `wait`, pipes, signal handlers), a virtual clock, and atomics emulated so the vCPU stays RV32IM. C programs linked against musl and a static BusyBox run, `sh` pipelines and job control included. `--trace` prints each system call.
-- **Images** (`shem build`). A [Shemfile](docs/shemfile.md) becomes a reproducible OCI image. `WARM` freezes a running guest into the image at build time, so `shem run` resumes it where the build left off.
+- **Images** (`shem build`). A [Shemfile](docs/shemfile.md) becomes a reproducible OCI image. `WARM` freezes a running guest into the image at build time, so `shem run` resumes it where the build left off. `shem push` and `shem pull` move images through OCI registries.
 - **VM mode** (`shem boot`). The host is the machine around a guest kernel, emulating the privileged architecture, a timer, a UART and a syscon: a no-MMU Linux 6.8 boots to a shell in two seconds ([docs/vm.md](docs/vm.md)).
 - **containerd**. `ctr run --runtime io.containerd.shem.v1` runs RV32 programs from ordinary OCI images on shem ([docs/containerd.md](docs/containerd.md)).
 - **The neural vCPU**. An RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state. It matches the reference vCPU exactly on the official riscv-tests and random programs, resumes snapshots the reference took, batches every running guest into one forward pass, and shares memory pages between them ([docs/neural.md](docs/neural.md)).
@@ -50,6 +50,7 @@ shem build -t hello examples/hello
 shem build -t warm-shell examples/warm-shell
 shem run hello
 echo 'echo hello from a warm shell' | shem run warm-shell
+shem push warm-shell ghcr.io/me/warm-shell:1.0   # needs oras (https://oras.land)
 
 # boot Linux in VM mode
 just linux-image

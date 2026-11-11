@@ -100,3 +100,21 @@ jobs:
       - uses: extractions/setup-just@v4
       - name: Run an RV32 container through containerd on shem
         run: just containerd-test
+
+  registry:
+    name: Registry (push and pull)
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oras-project/setup-oras@v2.0.3
+      - name: Push a warm image to a registry and pull it back
+        env:
+          SHEM_TEST_REGISTRY: localhost:5000
+        run: cargo test --release --test image registry -- --ignored
