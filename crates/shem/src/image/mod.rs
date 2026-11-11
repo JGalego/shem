@@ -12,6 +12,7 @@
 //! [OCI image layout]: https://github.com/opencontainers/image-spec/blob/main/image-layout.md
 
 mod build;
+mod docker;
 mod layer;
 mod registry;
 pub mod shemfile;
@@ -24,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub use build::{BuildOptions, CONTAINER_MEM, VM_MEM, build};
+pub use docker::WARM_DIR;
 pub use layer::unpack;
 pub use registry::{pull, push};
 

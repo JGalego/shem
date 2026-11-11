@@ -119,3 +119,109 @@ fn a_kill_stops_a_running_process() {
         128 + 15
     );
 }
+
+/// A program that writes `msg` and exits with status 3.
+fn greeter(msg: &[u8]) -> Vec<u8> {
+    let data_at = BASE + 84;
+    let code = [
+        addi(10, 0, 1), // write(1, msg, len)
+        lui(11, data_at + 0x800),
+        addi(11, 11, ((data_at & 0xfff) as i32 ^ 0x800) - 0x800),
+        addi(12, 0, msg.len() as i32),
+        addi(17, 0, 64),
+        ECALL,
+        addi(10, 0, 3), // exit(3)
+        addi(17, 0, 93),
+        ECALL,
+    ];
+    elf(&code, msg)
+}
+
+#[test]
+fn annotations_choose_the_vcpu() {
+    use containerd_shim_shem::bundle::{DEFAULT_NEURAL_SOCKET, VcpuKind};
+
+    let dir = bundle_with(greeter(b"hi\n"));
+    assert_eq!(Bundle::load(dir.path()).unwrap().vcpu, VcpuKind::Reference);
+    let config = |annotations: &str| {
+        let text = format!(
+            r#"{{"process": {{"args": ["/bin/hello"]}}, "annotations": {{{annotations}}}}}"#
+        );
+        std::fs::write(dir.path().join("config.json"), text).unwrap();
+        Bundle::load(dir.path())
+    };
+    let neural = config(r#""dev.shem.vcpu": "neural""#).unwrap();
+    assert_eq!(neural.vcpu, VcpuKind::Neural(DEFAULT_NEURAL_SOCKET.into()));
+    let elsewhere = config(r#""dev.shem.vcpu": "neural", "dev.shem.neural-socket": "/run/m.sock""#);
+    assert_eq!(
+        elsewhere.unwrap().vcpu,
+        VcpuKind::Neural("/run/m.sock".into())
+    );
+    assert!(config(r#""dev.shem.vcpu": "gpu""#).is_err());
+}
+
+#[test]
+fn warm_images_resume_from_their_state_in_the_root() {
+    use shem::container::{Container, Pause, Stop};
+    use shem::reference::ReferenceVcpu;
+
+    let msg = b"resumed\n";
+    let dir = bundle_with(greeter(msg));
+    // Freeze the program just before its write, as WARM would
+    let program = greeter(msg);
+    let quiet = Stdio {
+        stdin: Box::new(std::io::empty()),
+        stdout: Box::new(std::io::sink()),
+        stderr: Box::new(std::io::sink()),
+    };
+    let argv = ["/bin/hello".to_string()];
+    let mut container =
+        Container::from_elf(ReferenceVcpu::new(1 << 20), &program, &argv, &[], quiet).unwrap();
+    assert_eq!(
+        container.run_until(None, Some(Pause::Syscall(64))).unwrap(),
+        Stop::Paused
+    );
+    let frozen = container.freeze().unwrap();
+    let warm = dir.path().join("rootfs/.shem");
+    std::fs::create_dir(&warm).unwrap();
+    std::fs::write(
+        warm.join("container.json"),
+        serde_json::to_vec(&frozen.host).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(warm.join("machine.state"), frozen.machine.encode()).unwrap();
+
+    let bundle = Bundle::load(dir.path()).unwrap();
+    let out = Captured::default();
+    let stdio = Stdio {
+        stdin: Box::new(std::io::empty()),
+        stdout: Box::new(out.clone()),
+        stderr: Box::new(std::io::sink()),
+    };
+    assert_eq!(bundle::run(&bundle, stdio, &AtomicU32::new(0)).unwrap(), 3);
+    assert_eq!(out.0.lock().unwrap().as_slice(), msg);
+    assert!(!warm.exists(), "the guest never saw its own state");
+}
+
+#[test]
+#[ignore = "needs a neural vCPU server: set SHEM_NEURAL_SOCKET to its socket"]
+fn annotated_bundles_run_inside_the_model() {
+    let socket = std::env::var("SHEM_NEURAL_SOCKET").expect("SHEM_NEURAL_SOCKET");
+    let msg = b"hello from inside the model\n";
+    let dir = bundle_with(greeter(msg));
+    let config = format!(
+        r#"{{"process": {{"args": ["/bin/hello"]}},
+            "linux": {{"resources": {{"memory": {{"limit": 1048576}}}}}},
+            "annotations": {{"dev.shem.vcpu": "neural", "dev.shem.neural-socket": "{socket}"}}}}"#
+    );
+    std::fs::write(dir.path().join("config.json"), config).unwrap();
+    let bundle = Bundle::load(dir.path()).unwrap();
+    let out = Captured::default();
+    let stdio = Stdio {
+        stdin: Box::new(std::io::empty()),
+        stdout: Box::new(out.clone()),
+        stderr: Box::new(std::io::sink()),
+    };
+    assert_eq!(bundle::run(&bundle, stdio, &AtomicU32::new(0)).unwrap(), 3);
+    assert_eq!(out.0.lock().unwrap().as_slice(), msg);
+}

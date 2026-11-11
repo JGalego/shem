@@ -38,6 +38,9 @@ enum Command {
     Push(PushArgs),
     /// Pull an image from an OCI registry into the store (uses oras)
     Pull(PullArgs),
+    /// Write an image as an OCI archive for `docker load`, to run with
+    /// `docker run --runtime io.containerd.shem.v1`
+    Save(SaveArgs),
     /// Boot an operating system kernel in VM mode, with its console on stdio
     Boot(BootArgs),
 }
@@ -138,6 +141,18 @@ struct PushArgs {
 }
 
 #[derive(Args)]
+struct SaveArgs {
+    /// Write to this file instead of stdout
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// The name Docker gives the image (default: the image's own)
+    #[arg(short, long)]
+    tag: Option<String>,
+    /// The image: name[:tag] in the store, or an OCI layout directory
+    image: String,
+}
+
+#[derive(Args)]
 struct PullArgs {
     /// Talk to the registry over plain HTTP, as to a local test registry
     #[arg(long)]
@@ -176,6 +191,7 @@ fn main() -> ExitCode {
         Command::Images => images(),
         Command::Push(args) => push(args),
         Command::Pull(args) => pull(args),
+        Command::Save(args) => save(args),
         Command::Boot(args) => boot(args),
     };
     match result {
@@ -402,6 +418,21 @@ fn image_dir(target: &str) -> anyhow::Result<PathBuf> {
 fn push(args: PushArgs) -> anyhow::Result<u8> {
     let digest = image::push(&image_dir(&args.image)?, &args.remote, args.plain_http)?;
     eprintln!("shem: pushed {} {digest}", args.remote);
+    Ok(0)
+}
+
+fn save(args: SaveArgs) -> anyhow::Result<u8> {
+    use std::io::{IsTerminal, Write};
+    let image = load_image(&args.image)?;
+    let name = args.tag.as_deref().unwrap_or(&args.image);
+    let archive = image.docker_archive(name)?;
+    match &args.output {
+        Some(path) => std::fs::write(path, archive)?,
+        None if std::io::stdout().is_terminal() => {
+            bail!("not writing an archive to a terminal: pipe it to `docker load` or give --output")
+        }
+        None => std::io::stdout().lock().write_all(&archive)?,
+    }
     Ok(0)
 }
 

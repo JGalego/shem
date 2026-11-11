@@ -159,6 +159,67 @@ fn warm_images_resume_at_the_frozen_system_call() {
 }
 
 #[test]
+fn images_save_as_docker_archives_with_their_state_as_files() {
+    use std::collections::BTreeMap;
+    use std::io::Read;
+
+    let shemfile = "FROM scratch\nCOPY echo /bin/echo\nENTRYPOINT [\"/bin/echo\"]\nWARM --until=syscall:read\n";
+    let ctx = context(shemfile, &[("echo", echo())]);
+    let image = build(ctx.path()).unwrap();
+    let archive = image.docker_archive("echo").unwrap();
+    assert_eq!(
+        archive,
+        image.docker_archive("echo").unwrap(),
+        "reproducible"
+    );
+
+    let mut files = BTreeMap::new();
+    for entry in tar::Archive::new(&archive[..]).entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let name = entry.path().unwrap().to_string_lossy().into_owned();
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).unwrap();
+        files.insert(name, data);
+    }
+    let json = |data: &[u8]| serde_json::from_slice::<serde_json::Value>(data).unwrap();
+    let blob = |digest: &serde_json::Value| {
+        let hex = digest.as_str().unwrap().strip_prefix("sha256:").unwrap();
+        files[&format!("blobs/sha256/{hex}")].clone()
+    };
+    let index = json(&files["index.json"]);
+    let entry = &index["manifests"][0];
+    assert_eq!(entry["platform"]["architecture"], "riscv32");
+    assert_eq!(
+        entry["annotations"]["io.containerd.image.name"],
+        "docker.io/library/echo:latest"
+    );
+    let manifest = json(&blob(&entry["digest"]));
+    let config = json(&blob(&manifest["config"]["digest"]));
+    assert_eq!(
+        (config["os"].as_str(), config["architecture"].as_str()),
+        (Some("linux"), Some("riscv32"))
+    );
+    assert_eq!(config["config"]["Entrypoint"][0], "/bin/echo");
+
+    // Each layer decompresses to its diff ID, and the last holds the state
+    let root = tempfile::tempdir().unwrap();
+    let layers = manifest["layers"].as_array().unwrap();
+    for (layer, diff_id) in layers
+        .iter()
+        .zip(config["rootfs"]["diff_ids"].as_array().unwrap())
+    {
+        let tar = zstd::decode_all(&blob(&layer["digest"])[..]).unwrap();
+        assert_eq!(image::digest(&tar), diff_id.as_str().unwrap());
+        image::unpack(&tar, root.path()).unwrap();
+    }
+    assert!(root.path().join("bin/echo").is_file());
+    let frozen = image.warm_state().unwrap().unwrap();
+    let state = fs::read(root.path().join(".shem/machine.state")).unwrap();
+    assert_eq!(state, frozen.machine.encode());
+    assert!(root.path().join(".shem/container.json").is_file());
+}
+
+#[test]
 fn warm_images_take_no_arguments() {
     let shemfile = "FROM scratch\nCOPY echo /bin/echo\nENTRYPOINT [\"/bin/echo\"]\nWARM --until=syscall:read\n";
     let ctx = context(shemfile, &[("echo", echo())]);

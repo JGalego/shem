@@ -2,8 +2,13 @@
 //!
 //! A bundle is a directory holding `config.json`, the [runtime spec], and the
 //! container's root filesystem. This module reads the parts shem uses (the
-//! process's arguments, environment and working directory, the root, and the
-//! memory limit) and runs the process as a shem container.
+//! process's arguments, environment and working directory, the root, the
+//! memory limit, and annotations that choose the vCPU) and runs the process as
+//! a shem container.
+//!
+//! The annotation `dev.shem.vcpu=neural` runs the container inside the model,
+//! on a neural vCPU server (`python -m shem_neural.server`) at the socket that
+//! `dev.shem.neural-socket` names, by default `/tmp/shem-neural.sock`.
 //!
 //! [runtime spec]: https://github.com/opencontainers/runtime-spec/blob/main/config.md
 
@@ -12,15 +17,28 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, bail};
 use serde_json::Value;
-use shem::container::{Container, RunError};
-use shem::image::find_program;
+use shem::container::{Container, Frozen, FrozenHost, RunError};
+use shem::image::{WARM_DIR, find_program};
 use shem::linux::{RootFs, Stdio};
+use shem::neural::NeuralVcpu;
 use shem::reference::ReferenceVcpu;
+use shem::vcpu::{MachineState, Vcpu};
 
 /// Guest memory when the bundle sets no memory limit.
 pub const DEFAULT_MEMORY: u32 = 64 << 20;
-/// Instructions between checks for a kill request.
+/// Instructions between checks for a kill request: about a hundredth of a
+/// second on the reference vCPU, and a second on a neural one.
 const SLICE: u64 = 1 << 20;
+const NEURAL_SLICE: u64 = 1 << 10;
+pub const DEFAULT_NEURAL_SOCKET: &str = "/tmp/shem-neural.sock";
+
+/// Which vCPU runs the container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VcpuKind {
+    Reference,
+    /// A neural vCPU, on the server at this socket.
+    Neural(PathBuf),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bundle {
@@ -29,6 +47,7 @@ pub struct Bundle {
     pub cwd: String,
     pub root: PathBuf,
     pub memory: u32,
+    pub vcpu: VcpuKind,
 }
 
 impl Bundle {
@@ -53,33 +72,92 @@ impl Bundle {
             Some(limit) if limit > 0 && limit < u32::MAX as i64 => (limit as u32) & !0xfff,
             _ => DEFAULT_MEMORY,
         };
+        let annotations = &config["annotations"];
+        let vcpu = match annotations["dev.shem.vcpu"].as_str() {
+            None | Some("reference") => VcpuKind::Reference,
+            Some("neural") => VcpuKind::Neural(PathBuf::from(
+                annotations["dev.shem.neural-socket"]
+                    .as_str()
+                    .unwrap_or(DEFAULT_NEURAL_SOCKET),
+            )),
+            Some(other) => bail!("unknown dev.shem.vcpu {other:?}: reference or neural"),
+        };
         Ok(Self {
             args,
             env: strings(&process["env"]),
             cwd: process["cwd"].as_str().unwrap_or("/").to_string(),
             root: dir.join(root),
             memory,
+            vcpu,
         })
     }
 }
 
-/// Run the bundle's process to completion and return its exit status. A
-/// nonzero `kill` (a signal number) stops it at the next slice boundary, with
-/// the status a shell reports for that signal.
-pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8> {
-    let rootfs = RootFs::new(&bundle.root).context("the bundle's root filesystem")?;
-    let program = find_program(&rootfs, &bundle.cwd, &bundle.env, &bundle.args[0])?;
-    let elf = std::fs::read(program)?;
-    let vcpu = ReferenceVcpu::new(bundle.memory);
-    let mut container = Container::from_elf(vcpu, &elf, &bundle.args, &bundle.env, stdio)?;
-    container.set_root(&bundle.root)?;
-    if bundle.cwd != "/" {
-        container.set_cwd(&bundle.cwd).map_err(|errno| {
-            anyhow::anyhow!("working directory {}: errno {}", bundle.cwd, errno.0)
-        })?;
+/// The frozen container of a warm image (`shem save` puts its state under
+/// `/.shem`), if the root filesystem holds one. The files are removed, since
+/// the guest was frozen without them.
+fn warm_state(root: &Path) -> anyhow::Result<Option<Frozen>> {
+    let dir = root.join(WARM_DIR);
+    if !dir.join("container.json").is_file() {
+        return Ok(None);
     }
+    let host: FrozenHost = serde_json::from_slice(&std::fs::read(dir.join("container.json"))?)
+        .context("the warm image's container.json")?;
+    let machine = MachineState::decode(&std::fs::read(dir.join("machine.state"))?)
+        .context("the warm image's machine.state")?;
+    std::fs::remove_dir_all(&dir)?;
+    Ok(Some(Frozen { machine, host }))
+}
+
+/// Run the bundle's process to completion and return its exit status. A warm
+/// image resumes where it was frozen, with the memory it was frozen with,
+/// ignoring the bundle's arguments. A nonzero `kill` (a signal number) stops
+/// it at the next slice boundary, with the status a shell reports for that
+/// signal.
+pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8> {
+    match &bundle.vcpu {
+        VcpuKind::Reference => run_on(bundle, stdio, kill, SLICE, |mem| {
+            Ok(ReferenceVcpu::new(mem))
+        }),
+        VcpuKind::Neural(socket) => run_on(bundle, stdio, kill, NEURAL_SLICE, |mem| {
+            NeuralVcpu::connect(socket, mem).with_context(|| {
+                format!(
+                    "connecting to the neural vCPU server at {}",
+                    socket.display()
+                )
+            })
+        }),
+    }
+}
+
+fn run_on<V: Vcpu + Clone>(
+    bundle: &Bundle,
+    stdio: Stdio,
+    kill: &AtomicU32,
+    slice: u64,
+    vcpu: impl FnOnce(u32) -> anyhow::Result<V>,
+) -> anyhow::Result<u8> {
+    let mut container = if let Some(frozen) = warm_state(&bundle.root)? {
+        let vcpu = vcpu(frozen.machine.mem.len() as u32)?;
+        let mut container = Container::thaw(vcpu, &frozen, stdio)?;
+        container.set_root(&bundle.root)?;
+        container
+    } else {
+        let rootfs = RootFs::new(&bundle.root).context("the bundle's root filesystem")?;
+        let program = find_program(&rootfs, &bundle.cwd, &bundle.env, &bundle.args[0])?;
+        let elf = std::fs::read(program)?;
+        let vcpu = vcpu(bundle.memory)?;
+        let mut container = Container::from_elf(vcpu, &elf, &bundle.args, &bundle.env, stdio)?;
+        container.set_root(&bundle.root)?;
+        if bundle.cwd != "/" {
+            container.set_cwd(&bundle.cwd).map_err(|errno| {
+                anyhow::anyhow!("working directory {}: errno {}", bundle.cwd, errno.0)
+            })?;
+        }
+        container
+    };
     loop {
-        match container.run(Some(container.steps + SLICE)) {
+        match container.run(Some(container.steps + slice)) {
             Ok(status) => return Ok(status),
             Err(RunError::StepLimit(_)) => match kill.load(Ordering::SeqCst) {
                 0 => continue,

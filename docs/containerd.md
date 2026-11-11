@@ -14,7 +14,9 @@ docker build --platform linux/riscv32 -t shem-hello .
 docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 shem-hello one two
 ```
 
-Docker 23 and later take a containerd shim's name as `--runtime` with no configuration, so installing the binary is the only setup. The platform is `linux/riscv32`, which is what the image is: RV32 Linux programs. The runtime is what puts them on shem; without it, Docker tries to run them on the host CPU and fails with `exec format error`. `just docker-test` builds and runs an image this way and checks the output and the exit status, and CI runs it on every push.
+Docker 23 and later take a containerd shim's name as `--runtime` with no configuration, so installing the binary is the only setup. Add `--annotation dev.shem.vcpu=neural` to run the container inside the model, on a neural vCPU server listening at `/tmp/shem-neural.sock`, or at the socket `dev.shem.neural-socket` names.
+
+`shem save IMAGE | docker load` puts a shem image into Docker, warm images included: their frozen state travels as an ordinary layer under `/.shem`, which the shim thaws instead of starting the entrypoint. The platform is `linux/riscv32`, which is what the image is: RV32 Linux programs. The runtime is what puts them on shem; without it, Docker tries to run them on the host CPU and fails with `exec format error`. `just docker-test` builds and runs an image this way and checks the output and the exit status, and CI runs it on every push.
 
 ## With containerd
 
@@ -46,7 +48,5 @@ The part that turns a bundle into a container ([`bundle.rs`](../crates/container
 
 ## Not yet
 
-- Shem images with warm state: containerd unpacks only standard layers, so for now the shim starts the entrypoint cold.
-- The neural vCPU, which needs a server; the shim uses the reference vCPU.
 - `ctr exec` and `docker exec`, pausing, checkpoints and resource statistics, and `-t` terminals.
 - A Kubernetes `RuntimeClass` example.
