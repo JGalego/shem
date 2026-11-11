@@ -84,3 +84,12 @@ Two requirements follow for a neural vCPU:
 7. **Density.** Done for the neural executor: memory in shared pages with copy-on-write and content deduplication, so forks and containers resumed from one warm image share memory, and continuous batching of every running vCPU into one forward pass, which multiplies throughput about 32 times at 64 guests on one CPU core ([neural.md](neural.md#density)). Not yet: GPU kernels.
 8. **VM mode.** Done on the reference vCPU. `shem boot` boots a no-MMU Linux 6.8 to a shell in about 350 million instructions, two seconds, with the host emulating the privileged architecture, the timer and the devices ([vm.md](vm.md)). Not yet: VM mode on the neural vCPU, booted snapshots, block and network devices.
 9. **Ecosystem.** Partly done. A containerd shim, `containerd-shim-shem-v1`, runs RV32 executables from ordinary OCI images on shem through `ctr run --runtime io.containerd.shem.v1` ([containerd.md](containerd.md)), and CI runs it. Not yet: a BuildKit frontend for Shemfiles, pushing and pulling shem images through registries, and Kubernetes.
+
+### Next
+
+- **Registries.** `shem push` and `shem pull`. Images are standard OCI image layouts, so ORAS (`oras cp --from-oci-layout`) can already copy them to and from any registry; shem should do it itself.
+- **A BuildKit frontend** for Shemfiles, so `docker buildx build` parses, caches and pushes them.
+- **Faster neural execution.** Triton kernels for GPUs, and fewer, larger operations per forward pass.
+- **VM mode on the neural vCPU**, which needs a RAM base address in the network, and **booted snapshots**, so an image can ship a kernel that has already booted.
+- **Builds and filesystems.** A build cache keyed on layer digests, overlayfs instead of copied layers, and cross-checking the reference vCPU against Spike.
+- **Guest coverage.** File-backed `mmap`, `/proc`, terminals and threads.

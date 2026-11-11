@@ -11,22 +11,18 @@ shem treats the host as a hypervisor and a model as the machine. The model suppl
 
 The name comes from the golem legend: a clay figure comes to life when a *shem*, a slip of paper with words on it, is placed in its mouth. Here the weights are the clay and the program is the shem.
 
-## Status
+## What works
 
-Early, but both halves exist: the host, and a model to run guests on.
+Early, but every part of the design exists, from the reference vCPU to a model running guests.
 
-- an RV32IM interpreter that defines correct behaviour for any neural vCPU, and passes the official riscv-tests suites
-- host emulation of the A extension (atomics), so the vCPU itself stays RV32IM
-- a loader for static RV32 Linux executables, with the standard Linux stack layout
-- a Linux system-call layer: files and directories in a host directory used as the guest's root, `brk` and anonymous `mmap`, and a virtual clock, enough for C programs linked against musl and for a static BusyBox
-- processes: `fork`, `execve`, `wait`, pipes, process groups and signal handlers, with the host as the kernel and a scheduler that gives each process a turn
-- `shem run`, which runs an executable as a container (`--trace` prints each system call)
-- images: `shem build` turns a [Shemfile](docs/shemfile.md) into a reproducible OCI image, and `WARM` freezes a running guest into it, so `shem run` resumes it where the build left off
-- VM mode: `shem boot` boots a no-MMU Linux kernel to a shell, with the host emulating the privileged architecture and the devices ([docs/vm.md](docs/vm.md))
-- a containerd shim: `ctr run --runtime io.containerd.shem.v1` runs RV32 programs from ordinary OCI images on shem ([docs/containerd.md](docs/containerd.md))
-- a neural vCPU: an RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state, that matches the reference exactly on the official riscv-tests; it batches every running guest into one forward pass and shares memory pages between them ([docs/neural.md](docs/neural.md))
+- **Containers** (`shem run`). The host is the guest's kernel: static RV32 Linux programs run with files from a host directory as their root, processes (`fork`, `execve`, `wait`, pipes, signal handlers), a virtual clock, and atomics emulated so the vCPU stays RV32IM. C programs linked against musl and a static BusyBox run, `sh` pipelines and job control included. `--trace` prints each system call.
+- **Images** (`shem build`). A [Shemfile](docs/shemfile.md) becomes a reproducible OCI image. `WARM` freezes a running guest into the image at build time, so `shem run` resumes it where the build left off.
+- **VM mode** (`shem boot`). The host is the machine around a guest kernel, emulating the privileged architecture, a timer, a UART and a syscon: a no-MMU Linux 6.8 boots to a shell in two seconds ([docs/vm.md](docs/vm.md)).
+- **containerd**. `ctr run --runtime io.containerd.shem.v1` runs RV32 programs from ordinary OCI images on shem ([docs/containerd.md](docs/containerd.md)).
+- **The neural vCPU**. An RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state. It matches the reference vCPU exactly on the official riscv-tests and random programs, resumes snapshots the reference took, batches every running guest into one forward pass, and shares memory pages between them ([docs/neural.md](docs/neural.md)).
+- **The reference vCPU**. An RV32IM interpreter that defines correct behaviour for the neural one, passes the official riscv-tests, and runs about 175 million instructions per second.
 
-See the [roadmap](docs/architecture.md#roadmap) for what comes next.
+See the [roadmap](docs/architecture.md#roadmap) for what is next.
 
 ## Quickstart
 
@@ -41,6 +37,8 @@ just cc -O2 -o target/hello guests/hello.c  # compile a C guest with the toolcha
 just run target/hello one two               # run it as a container
 just guest-tests                            # build and run riscv-tests, the C guests and BusyBox
 just neural-tests                           # test the neural vCPU, alone and against the reference
+just vm-tests                               # boot Linux, run commands in its shell, power off
+just containerd-test                        # run a container through containerd (needs sudo)
 
 # after `just guest-tests`, BusyBox and its rootfs are in target/busybox
 just run --root target/busybox target/busybox/bin/busybox ls -l /bin
