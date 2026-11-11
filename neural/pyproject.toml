@@ -32,6 +32,7 @@ Repository = "https://github.com/JGalego/shem"
 shem-neural-server = "shem_neural.server:main"
 shem-neural-generate = "shem_neural.model.generate:main"
 shem-neural-import = "shem_neural.model.importers:main"
+shem-neural-export = "shem_neural.export:main"
 
 [dependency-groups]
 dev = [

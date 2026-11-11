@@ -144,6 +144,10 @@ jobs:
         run: cargo publish --workspace --dry-run --locked
       - name: Build the Python package
         run: uv build --project neural
+      - name: Export the compiled CPU, as a release publishes it on Hugging Face
+        run: |
+          uv run --project neural python -m shem_neural.export target/weights
+          test -s target/weights/model.safetensors && test -s target/weights/README.md
 
   models:
     name: Model images (against transformers)
