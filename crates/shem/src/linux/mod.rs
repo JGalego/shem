@@ -24,11 +24,13 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 pub use abi::Errno;
 use abi::*;
 use files::{FdTable, MAX_FDS};
 pub use rootfs::{Resolved, RootFs};
-pub use signal::{Delivery, SigAction, Signals};
+pub use signal::{Delivery, FrozenSignals, SigAction, Signals};
 
 use crate::container::STACK_SIZE;
 use crate::mm::AddressSpace;
@@ -129,6 +131,34 @@ pub enum Action {
     GetPgid { pid: u32 },
 }
 
+/// The shared state a warm image stores: the virtual clock and the PRNG.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenLinux {
+    pub slept_ns: u64,
+    pub random: u64,
+}
+
+/// What a warm image stores of a process. The root filesystem is not part of
+/// it: it comes from the image's layers when the image runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenProcess {
+    pub cwd: String,
+    pub umask: u32,
+    pub mm: AddressSpace,
+    pub signals: FrozenSignals,
+}
+
+/// Why a process cannot be frozen.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FreezeError {
+    #[error("only a single process can be frozen, and this container has {0}")]
+    Processes(usize),
+    #[error("files other than stdin, stdout and stderr are open, and they cannot be frozen yet")]
+    OpenFiles,
+    #[error("the working directory is not valid UTF-8")]
+    Cwd,
+}
+
 /// What the whole container shares.
 pub struct Linux {
     /// Virtual nanoseconds the guest has spent asleep.
@@ -163,6 +193,21 @@ impl Linux {
         Self {
             slept_ns: 0,
             random: RANDOM_SEED,
+            unsupported: BTreeMap::new(),
+        }
+    }
+
+    pub fn freeze(&self) -> FrozenLinux {
+        FrozenLinux {
+            slept_ns: self.slept_ns,
+            random: self.random,
+        }
+    }
+
+    pub fn thaw(frozen: &FrozenLinux) -> Self {
+        Self {
+            slept_ns: frozen.slept_ns,
+            random: frozen.random,
             unsupported: BTreeMap::new(),
         }
     }
@@ -394,6 +439,45 @@ impl Process {
             signals: Signals::default(),
             mm: AddressSpace::new(brk, top),
         }
+    }
+
+    /// Capture what a warm image needs to resume this process.
+    pub fn freeze(&self) -> Result<FrozenProcess, FreezeError> {
+        if !self.files.only_stdio() {
+            return Err(FreezeError::OpenFiles);
+        }
+        Ok(FrozenProcess {
+            cwd: String::from_utf8(self.cwd.clone()).map_err(|_| FreezeError::Cwd)?,
+            umask: self.umask,
+            mm: self.mm.clone(),
+            signals: self.signals.freeze(),
+        })
+    }
+
+    /// Rebuild a frozen process as init, with its standard streams on `stdio`.
+    pub fn thaw(frozen: &FrozenProcess, stdio: Stdio) -> Self {
+        let mut process = Self::new(1, stdio, 0, 0);
+        process.cwd = frozen.cwd.clone().into_bytes();
+        process.umask = frozen.umask;
+        process.mm = frozen.mm.clone();
+        process.signals = Signals::thaw(&frozen.signals);
+        process
+    }
+
+    /// Change the working directory, which must be a directory in the root.
+    pub fn set_cwd(&mut self, path: &str) -> Result<(), Errno> {
+        let root = self.root.as_ref().ok_or(Errno::ENOENT)?;
+        let resolved = root.resolve(&self.cwd, path.as_bytes(), true)?;
+        if !std::fs::metadata(&resolved.host)?.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        self.cwd = resolved.guest;
+        Ok(())
+    }
+
+    /// The process's root filesystem, if it has one.
+    pub fn root(&self) -> Option<&RootFs> {
+        self.root.as_deref()
     }
 
     /// Give the process a filesystem: the host directory `root` becomes its `/`,

@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Status](https://img.shields.io/badge/status-experimental-orange)](docs/architecture.md#roadmap)
 
-shem treats the host as a hypervisor and a model as the machine. The model supplies a CPU, compiled into its weights, and RAM, which is its recurrent state, as in [Qwenputer](https://divagr.com/blog/qwenputer). The host supplies everything else: system calls, devices, scheduling and storage. Images are built from a [Shemfile](docs/shemfile.md) and stored in OCI registries, like Docker images.
+shem treats the host as a hypervisor and a model as the machine. The model supplies a CPU, compiled into its weights, and RAM, which is its recurrent state, as in [Qwenputer](https://divagr.com/blog/qwenputer). The host supplies everything else: system calls, devices, scheduling and storage. Images are built from a [Shemfile](docs/shemfile.md) as OCI images, like Docker images, and can carry a running guest, frozen at build time.
 
 The name comes from the golem legend: a clay figure comes to life when a *shem*, a slip of paper with words on it, is placed in its mouth. Here the weights are the clay and the program is the shem.
 
@@ -21,6 +21,7 @@ Early, but both halves exist: the host, and a model to run guests on.
 - a Linux system-call layer: files and directories in a host directory used as the guest's root, `brk` and anonymous `mmap`, and a virtual clock, enough for C programs linked against musl and for a static BusyBox
 - processes: `fork`, `execve`, `wait`, pipes, process groups and signal handlers, with the host as the kernel and a scheduler that gives each process a turn
 - `shem run`, which runs an executable as a container (`--trace` prints each system call)
+- images: `shem build` turns a [Shemfile](docs/shemfile.md) into a reproducible OCI image, and `WARM` freezes a running guest into it, so `shem run` resumes it where the build left off
 - a neural vCPU: an RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state, that matches the reference exactly on the official riscv-tests ([docs/neural.md](docs/neural.md))
 
 See the [roadmap](docs/architecture.md#roadmap) for what comes next.
@@ -30,7 +31,7 @@ See the [roadmap](docs/architecture.md#roadmap) for what comes next.
 You need Rust 1.88 or later, [just](https://github.com/casey/just) and [pre-commit](https://pre-commit.com). Building guest programs also needs Docker, and the neural vCPU needs [uv](https://docs.astral.sh/uv/).
 
 ```sh
-just build                                  # build target/release/shem
+just build                                  # build target/release/shem (put it on PATH as shem)
 just test                                   # run the unit and integration tests
 just hooks                                  # install the git hooks
 
@@ -42,6 +43,13 @@ just neural-tests                           # test the neural vCPU, alone and ag
 # after `just guest-tests`, BusyBox and its rootfs are in target/busybox
 just run --root target/busybox target/busybox/bin/busybox ls -l /bin
 just run --root target/busybox target/busybox/bin/busybox sh -c 'ls /bin | wc -l'
+
+# build images from Shemfiles, and run them
+just busybox-image
+shem build -t hello examples/hello
+shem build -t warm-shell examples/warm-shell
+shem run hello
+echo 'echo hello from a warm shell' | shem run warm-shell
 
 # run a guest on the neural vCPU
 just neural-server &
@@ -67,15 +75,17 @@ crates/shem/src/
   mm.rs          the guest address space: heap and anonymous mappings
   container.rs   container mode: processes, the scheduler, fork, exec and wait
   neural.rs      the neural vCPU, as the host reaches it over a socket
+  image/         images: Shemfile parser, builder, OCI layouts, the local store
   main.rs        the shem CLI
 crates/shem/tests/  unit, integration and guest-program tests
 neural/         the neural vCPU: ISA table, weight compiler, network, executor, server
 toolchain/      the guest toolchain image and the riscv-tests environment
 guests/         C guest programs
+examples/       example Shemfiles
 docs/
   architecture.md  design, tech stack and roadmap
   neural.md        how the neural vCPU works, and its protocol
-  shemfile.md      the Shemfile and image format (draft)
+  shemfile.md      the Shemfile and the image format
 ```
 
 ## License

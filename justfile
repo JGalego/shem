@@ -48,8 +48,8 @@ cc *args: toolchain
         -e ZIG_GLOBAL_CACHE_DIR=/zig-cache \
         {{ toolchain_image }} rv32-cc "$@"
 
-# Build the guest programs (riscv-tests, guests/ and BusyBox) and run them; needs Docker
-guest-tests: toolchain
+# Build the guest programs (riscv-tests, guests/, BusyBox, examples/) and run them; needs Docker
+guest-tests: toolchain busybox-image
     docker build -q --target riscv-tests --output type=local,dest=target/riscv-tests toolchain
     docker build -q --target busybox --output type=local,dest=target/busybox toolchain
     mkdir -p target/guests
@@ -65,3 +65,7 @@ neural-tests: toolchain
 # Serve neural vCPUs on a Unix socket, for `shem run --vcpu neural`
 neural-server socket="/tmp/shem-neural.sock":
     uv run --project neural python -m shem_neural.server --socket {{ socket }}
+
+# Build the BusyBox rootfs as a Docker image, for Shemfiles to COPY --from
+busybox-image:
+    docker build -q --target busybox -t shem-busybox toolchain

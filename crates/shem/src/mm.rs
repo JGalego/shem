@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::elf::PAGE_SIZE;
 use crate::vcpu::Vcpu;
 
@@ -17,7 +19,7 @@ pub enum MapError {
     NoMemory,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddressSpace {
     brk_start: u32,
     brk: u32,

@@ -7,6 +7,7 @@
 pub mod container;
 pub mod elf;
 pub mod emulate;
+pub mod image;
 pub mod linux;
 pub mod mm;
 pub mod neural;

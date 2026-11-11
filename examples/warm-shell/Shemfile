@@ -1,0 +1,10 @@
+# A BusyBox shell, started at build time and frozen just before it first reads
+# its script from stdin. Running the image skips the shell's startup and goes
+# straight to reading. `just busybox-image` builds shem-busybox.
+FROM shem-busybox AS busybox
+
+FROM scratch
+COPY --from=busybox / /
+ENV PATH=/bin:/sbin:/usr/bin:/usr/sbin
+ENTRYPOINT ["/bin/sh"]
+WARM --until=syscall:read

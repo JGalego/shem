@@ -15,8 +15,12 @@ use thiserror::Error;
 
 use crate::elf::{self, ElfError};
 use crate::emulate::{Emulation, Emulator};
-use crate::linux::{Action, Delivery, Exec, Linux, Process, Report, Stdio, Termination, Wait};
-use crate::vcpu::{A0, Exit, ExitReason, MemoryFault, SP, Vcpu};
+use crate::linux::{
+    Action, Delivery, Exec, FreezeError, FrozenLinux, FrozenProcess, Linux, Process, Report, Stdio,
+    Termination, Wait,
+};
+use crate::vcpu::{A0, A7, Exit, ExitReason, MachineState, MemoryFault, SP, SnapshotError, Vcpu};
+use serde::{Deserialize, Serialize};
 
 /// Memory kept free for the stack at the top of guest memory, above the heap and mappings.
 pub const STACK_SIZE: u32 = 1 << 20;
@@ -45,6 +49,40 @@ pub enum StartError {
     Elf(#[from] ElfError),
     #[error("arguments and environment do not fit on the stack: {0}")]
     Stack(#[from] MemoryFault),
+}
+
+/// Where `run_until` should stop before init exits, as `WARM --until` asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pause {
+    /// Just before init's first system call with this number is serviced.
+    Syscall(u32),
+    /// Once this many instructions have retired.
+    Steps(u64),
+    /// When init executes `ebreak`; it resumes after the `ebreak`.
+    Ebreak,
+}
+
+/// How `run_until` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    Exited(u8),
+    Paused,
+}
+
+/// A container frozen for a warm image: init's machine state on the vCPU, and
+/// the host-side state that goes with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frozen {
+    pub machine: MachineState,
+    pub host: FrozenHost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenHost {
+    pub steps: u64,
+    pub linux: FrozenLinux,
+    pub process: FrozenProcess,
+    pub reservation: Option<u32>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -85,6 +123,8 @@ pub struct Container<V> {
     pub faults: Vec<(u32, Exit)>,
     /// Print each system call and its outcome to stderr, like strace.
     pub trace: bool,
+    pause: Option<Pause>,
+    paused: bool,
 }
 
 impl<V: Vcpu + Clone> Container<V> {
@@ -110,7 +150,55 @@ impl<V: Vcpu + Clone> Container<V> {
             steps: 0,
             faults: Vec::new(),
             trace: false,
+            pause: None,
+            paused: false,
         })
+    }
+
+    /// Resume a frozen container: init picks up exactly where it was frozen,
+    /// with its standard streams on `stdio`. The root filesystem is set
+    /// separately, from the image's layers.
+    pub fn thaw(mut vcpu: V, frozen: &Frozen, stdio: Stdio) -> Result<Self, SnapshotError> {
+        vcpu.restore(&frozen.machine)?;
+        let task = Task {
+            process: Process::thaw(&frozen.host.process, stdio),
+            vcpu,
+            emulator: Emulator::with_reservation(frozen.host.reservation),
+            state: State::Runnable,
+        };
+        Ok(Self {
+            linux: Linux::thaw(&frozen.host.linux),
+            tasks: BTreeMap::from([(INIT, task)]),
+            next_pid: INIT + 1,
+            steps: frozen.host.steps,
+            faults: Vec::new(),
+            trace: false,
+            pause: None,
+            paused: false,
+        })
+    }
+
+    /// Freeze the container for a warm image. Only a lone init can be frozen,
+    /// holding nothing but its standard streams.
+    pub fn freeze(&self) -> Result<Frozen, FreezeError> {
+        if self.tasks.len() != 1 {
+            return Err(FreezeError::Processes(self.tasks.len()));
+        }
+        let init = &self.tasks[&INIT];
+        Ok(Frozen {
+            machine: init.vcpu.snapshot(),
+            host: FrozenHost {
+                steps: self.steps,
+                linux: self.linux.freeze(),
+                process: init.process.freeze()?,
+                reservation: init.emulator.reservation(),
+            },
+        })
+    }
+
+    /// Set init's working directory, a directory in its root filesystem.
+    pub fn set_cwd(&mut self, path: &str) -> Result<(), crate::linux::Errno> {
+        self.tasks.get_mut(&INIT).unwrap().process.set_cwd(path)
     }
 
     /// Give the guest a filesystem: the host directory `root` becomes `/`.
@@ -130,13 +218,29 @@ impl<V: Vcpu + Clone> Container<V> {
     /// Run until init exits, and return its exit status: the exit code, or 128
     /// plus the signal that killed it.
     pub fn run(&mut self, max_steps: Option<u64>) -> Result<u8, RunError> {
+        match self.run_until(max_steps, None)? {
+            Stop::Exited(status) => Ok(status),
+            Stop::Paused => unreachable!("no pause was asked for"),
+        }
+    }
+
+    /// Run until init exits, or until `pause` holds.
+    pub fn run_until(
+        &mut self,
+        max_steps: Option<u64>,
+        pause: Option<Pause>,
+    ) -> Result<Stop, RunError> {
+        (self.pause, self.paused) = (pause, false);
         loop {
             let mut progress = false;
             let pids: Vec<u32> = self.tasks.keys().copied().collect();
             for pid in pids {
                 progress |= self.turn(pid, max_steps)?;
+                if self.paused {
+                    return Ok(Stop::Paused);
+                }
                 if let State::Zombie(termination) = self.tasks[&INIT].state {
-                    return Ok(termination.status());
+                    return Ok(Stop::Exited(termination.status()));
                 }
             }
             if !progress {
@@ -164,17 +268,34 @@ impl<V: Vcpu + Clone> Container<V> {
             Delivery::Nothing if parked => return Ok(self.syscall(pid)),
             Delivery::Nothing => {}
         }
-        let budget = match max_steps {
+        let mut budget = match max_steps {
             None => SLICE,
             Some(max) if self.steps >= max => return Err(RunError::StepLimit(max)),
             Some(max) => SLICE.min(max - self.steps),
         };
+        if let Some(Pause::Steps(at)) = self.pause {
+            if self.steps >= at {
+                self.paused = true;
+                return Ok(false);
+            }
+            budget = budget.min(at - self.steps);
+        }
         let exit = task.vcpu.run(budget);
         self.steps += exit.steps;
+        let init = pid == INIT;
         match exit.reason {
             ExitReason::Budget => {}
+            // Pause with the pc still on the ecall, so that resuming services
+            // the call with the input it gets then.
+            ExitReason::Ecall if init && self.pause == Some(Pause::Syscall(task.vcpu.reg(A7))) => {
+                self.paused = true;
+            }
             ExitReason::Ecall => {
                 self.syscall(pid);
+            }
+            ExitReason::Ebreak if init && self.pause == Some(Pause::Ebreak) => {
+                task.vcpu.set_pc(exit.pc.wrapping_add(4));
+                self.paused = true;
             }
             ExitReason::IllegalInstruction(ins) => {
                 let task = self.tasks.get_mut(&pid).unwrap();

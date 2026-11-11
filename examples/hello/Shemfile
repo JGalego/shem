@@ -1,0 +1,11 @@
+# Compile a C program in an ordinary Docker stage with the guest toolchain
+# (`just toolchain` builds shem-toolchain), then ship it in a shem image.
+FROM shem-toolchain AS build
+WORKDIR /src
+COPY hello.c .
+RUN rv32-cc -O2 -o hello hello.c
+
+FROM scratch
+COPY --from=build /src/hello /bin/hello
+ENTRYPOINT ["/bin/hello"]
+CMD ["from", "a", "shem", "image"]

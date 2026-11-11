@@ -42,6 +42,15 @@ pub struct Emulator {
 }
 
 impl Emulator {
+    /// An emulator holding `reservation`, as a warm image restores it.
+    pub fn with_reservation(reservation: Option<u32>) -> Self {
+        Self { reservation }
+    }
+
+    pub fn reservation(&self) -> Option<u32> {
+        self.reservation
+    }
+
     /// Emulate `ins`, which the vCPU just refused at its current pc.
     pub fn emulate(&mut self, vcpu: &mut dyn Vcpu, ins: u32) -> Emulation {
         if ins & 0x7f != OP_AMO || (ins >> 12) & 7 != WIDTH_W {

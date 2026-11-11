@@ -308,3 +308,61 @@ fn containers_fork_and_pipe_on_the_neural_vcpu() {
     assert_eq!(neural.steps, reference.steps);
     assert_same("pipeline", &reference.state, &neural.state);
 }
+
+#[test]
+#[ignore = "needs uv and PyTorch: run `just neural-tests`"]
+fn warm_images_built_on_the_reference_resume_on_the_neural_vcpu() {
+    // write(1, "ready\n"), then echo one read of stdin, then exit(0)
+    let mut data = b"ready\n".to_vec();
+    data.resize(16 + 64, 0);
+    let buf = DATA + 16;
+    let echo = elf(
+        &program![
+            addi(A0, ZERO, 1),
+            li(A1, DATA),
+            addi(A2, ZERO, 6),
+            addi(A7, ZERO, 64),
+            ECALL,
+            addi(A0, ZERO, 0),
+            li(A1, buf),
+            addi(A2, ZERO, 64),
+            addi(A7, ZERO, 63),
+            ECALL,
+            addi(A2, A0, 0),
+            addi(A0, ZERO, 1),
+            li(A1, buf),
+            addi(A7, ZERO, 64),
+            ECALL,
+            addi(A0, ZERO, 0),
+            addi(A7, ZERO, 93),
+            ECALL,
+        ],
+        &data,
+    );
+    let context = tempfile::tempdir().unwrap();
+    std::fs::write(context.path().join("echo"), echo).unwrap();
+    let shemfile =
+        "FROM scratch\nCOPY echo /echo\nENTRYPOINT [\"/echo\"]\nWARM --until=syscall:read\n";
+    std::fs::write(context.path().join("Shemfile"), shemfile).unwrap();
+    let image = shem::image::build(&shem::image::BuildOptions {
+        shemfile: context.path().join("Shemfile"),
+        context: context.path().to_path_buf(),
+        build_args: Default::default(),
+        mem: MEM,
+    })
+    .unwrap();
+
+    let server = Server::start();
+    let root = tempfile::tempdir().unwrap();
+    let stdout = SharedBuf::default();
+    let stdio = linux::Stdio {
+        stdin: Box::new(std::io::Cursor::new(b"resumed on the model\n".to_vec())),
+        stdout: Box::new(stdout.clone()),
+        stderr: Box::new(std::io::sink()),
+    };
+    let make = |mem| Ok(NeuralVcpu::connect(&server.socket, mem)?);
+    let mut container =
+        shem::image::start(&image, make, &[], &[], stdio, root.path(), MEM).unwrap();
+    assert_eq!(container.run(Some(MAX_STEPS)), Ok(0));
+    assert_eq!(stdout.contents(), b"resumed on the model\n");
+}

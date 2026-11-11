@@ -11,6 +11,8 @@
 //! trampoline in the vDSO; shem has no vDSO, so it lives in the frame, which
 //! works because guest memory has no execute protection.
 
+use serde::{Deserialize, Serialize};
+
 use super::Termination;
 use super::abi::{Errno, SIG_DFL, SIG_IGN, SIGKILL, SIGSTOP};
 use crate::vcpu::{A0, MemoryFault, SP, Vcpu};
@@ -41,7 +43,7 @@ const UCONTEXT_SIZE: u32 = UC_REGS + 32 * 4 + 528;
 const FRAME_SIZE: u32 = (SIGINFO_SIZE + UCONTEXT_SIZE + 8).next_multiple_of(16);
 
 /// What `sigaction` sets for one signal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SigAction {
     pub handler: u32,
     pub flags: u32,
@@ -197,6 +199,25 @@ impl Signals {
         Delivery::Handler
     }
 
+    /// The dispositions, mask and pending set, for a warm image.
+    pub fn freeze(&self) -> FrozenSignals {
+        FrozenSignals {
+            actions: self.actions.to_vec(),
+            blocked: self.blocked,
+            pending: self.pending,
+        }
+    }
+
+    pub fn thaw(frozen: &FrozenSignals) -> Self {
+        let mut signals = Self::default();
+        for (slot, action) in signals.actions.iter_mut().zip(&frozen.actions) {
+            *slot = *action;
+        }
+        signals.blocked = frozen.blocked;
+        signals.pending = frozen.pending;
+        signals
+    }
+
     /// `rt_sigreturn`: restore the registers and mask saved in the frame at sp.
     pub fn sigreturn(&mut self, vcpu: &mut dyn Vcpu) -> Result<(), MemoryFault> {
         let uc = vcpu.reg(SP).wrapping_add(SIGINFO_SIZE);
@@ -258,4 +279,12 @@ fn push_frame(
     vcpu.set_reg(RA, base + trampoline);
     vcpu.set_pc(handler);
     Ok(())
+}
+
+/// Signal state as a warm image stores it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenSignals {
+    pub actions: Vec<SigAction>,
+    pub blocked: u64,
+    pub pending: u64,
 }

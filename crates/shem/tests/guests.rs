@@ -200,3 +200,55 @@ fn busybox_shell_runs_pipelines_jobs_and_traps() {
     assert_eq!(killed.result, Ok(128 + 15), "killed by SIGTERM");
     assert_eq!(killed.stdout, "");
 }
+
+fn build_example(name: &str) -> shem::image::Image {
+    let context = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples")
+        .join(name);
+    shem::image::build(&shem::image::BuildOptions {
+        shemfile: context.join("Shemfile"),
+        context,
+        build_args: Default::default(),
+        mem: MEM,
+    })
+    .unwrap_or_else(|err| panic!("building examples/{name}: {err:#} (run `just guest-tests`)"))
+}
+
+fn run_image(image: &shem::image::Image, args: &[&str], stdin: &[u8]) -> (u8, String) {
+    let root = tempfile::tempdir().unwrap();
+    let stdout = common::SharedBuf::default();
+    let stdio = shem::linux::Stdio {
+        stdin: Box::new(std::io::Cursor::new(stdin.to_vec())),
+        stdout: Box::new(stdout.clone()),
+        stderr: Box::new(std::io::sink()),
+    };
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let make = |mem| Ok(shem::reference::ReferenceVcpu::new(mem));
+    let mut container =
+        shem::image::start(image, make, &args, &[], stdio, root.path(), MEM).unwrap();
+    let status = container.run(Some(MAX_STEPS)).unwrap();
+    (
+        status,
+        String::from_utf8_lossy(&stdout.contents()).into_owned(),
+    )
+}
+
+#[test]
+#[ignore = "needs Docker and the toolchain images: run `just guest-tests`"]
+fn example_images_build_and_run() {
+    let hello = build_example("hello");
+    assert_eq!(
+        run_image(&hello, &[], b""),
+        (0, "hello from a shem image\n".into())
+    );
+    assert_eq!(
+        run_image(&hello, &["again"], b""),
+        (0, "hello again\n".into())
+    );
+
+    let shell = build_example("warm-shell");
+    assert!(shell.warm_state().unwrap().is_some());
+    let script = b"echo hello from a warm shell\nuname -m\necho $((6 * 7))\n";
+    let expected = "hello from a warm shell\nriscv32\n42\n";
+    assert_eq!(run_image(&shell, &[], script), (0, expected.into()));
+}

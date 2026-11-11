@@ -165,6 +165,16 @@ impl FdTable {
         self.slots.retain(|_, slot| !slot.cloexec);
     }
 
+    /// Whether the only descriptors open are the standard streams, as a warm
+    /// image requires: other open files live on the host.
+    pub fn only_stdio(&self) -> bool {
+        self.slots.keys().copied().eq([0, 1, 2])
+            && self.slots.values().all(|slot| {
+                let kind = &slot.description.lock().unwrap().kind;
+                matches!(kind, Kind::Input(_) | Kind::Output(_))
+            })
+    }
+
     /// Close every descriptor, as when a process exits.
     pub fn close_all(&mut self) {
         self.slots.clear();
