@@ -107,6 +107,11 @@ def compile_weights() -> dict[str, torch.Tensor]:
     }
 
 
+def to(weights: dict[str, torch.Tensor], device: torch.device | str) -> dict[str, torch.Tensor]:
+    """The weights on `device`, where the network will run."""
+    return {name: tensor.to(device) for name, tensor in weights.items()}
+
+
 def save(weights: dict[str, torch.Tensor], path: Path) -> None:
     save_file({name: t.contiguous() for name, t in weights.items()}, str(path))
 

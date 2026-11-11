@@ -19,7 +19,11 @@ in the delta rule, but pages make guests cheap to hold:
   interned by content, so guests resumed from the same snapshot share them,
   like Linux's KSM.
 
-Tests check that the two forms give identical runs.
+`FlatMemory` is for GPUs: each guest's bytes in their own row on the device,
+with no sharing and no host-side bookkeeping, so a whole step can be compiled
+into a few kernels.
+
+Tests check that the forms give identical runs.
 """
 
 import hashlib
@@ -46,14 +50,14 @@ class DeltaMemory:
     def read(self, addr: torch.Tensor, count: int) -> torch.Tensor:
         """The bytes at `addr .. addr + count`, as a (batch, count) tensor: one
         one-hot query per byte."""
-        keys = self._key(addr[:, None] + torch.arange(count))
+        keys = self._key(addr[:, None] + torch.arange(count, device=addr.device))
         queries = F.one_hot(keys, self.size).to(DTYPE)
         return torch.einsum("bm,bkm->bk", self.state, queries)
 
     def write(self, addr: torch.Tensor, values: torch.Tensor, beta: torch.Tensor) -> None:
         """Write bytes at `addr ..` with the delta rule, one gate per byte:
         `values` and `beta` are (batch, count)."""
-        keys = self._key(addr[:, None] + torch.arange(values.shape[1]))
+        keys = self._key(addr[:, None] + torch.arange(values.shape[1], device=addr.device))
         for k in range(values.shape[1]):
             onehot = F.one_hot(keys[:, k], self.size).to(DTYPE)
             old = (self.state * onehot).sum(-1)
@@ -69,6 +73,47 @@ class DeltaMemory:
         copy = DeltaMemory(self.state.shape[0], self.size, self.dense)
         copy.state = self.state.clone()
         return copy
+
+    def release(self) -> None:
+        pass
+
+
+class FlatMemory:
+    """Each guest's memory as its own row of bytes on the device. A write with
+    beta 0 lands on a scratch byte past the end, so the scatter never has two
+    writers for a real byte, and nothing depends on data outside the kernels."""
+
+    def __init__(self, batch: int, size: int, device: torch.device | str = "cpu"):
+        self.size = size
+        self.dense = False
+        self.bytes = torch.zeros(batch, size + 1, dtype=torch.uint8, device=device)
+
+    @classmethod
+    def of(cls, data: torch.Tensor) -> "FlatMemory":
+        """A view of existing (B, size + 1) bytes, which writes update in place."""
+        memory = cls.__new__(cls)
+        memory.size, memory.dense, memory.bytes = data.shape[1] - 1, False, data
+        return memory
+
+    def _keys(self, addr: torch.Tensor, count: int) -> torch.Tensor:
+        return (addr[:, None] + torch.arange(count, device=addr.device)).clamp(0, self.size - 1).long()
+
+    def read(self, addr: torch.Tensor, count: int) -> torch.Tensor:
+        return self.bytes.gather(1, self._keys(addr, count)).to(DTYPE)
+
+    def write(self, addr: torch.Tensor, values: torch.Tensor, beta: torch.Tensor) -> None:
+        keys = torch.where(beta > 0, self._keys(addr, values.shape[1]), self.size)
+        self.bytes.scatter_(1, keys, values.round().to(torch.uint8))
+
+    def get_bytes(self, row: int, addr: int, length: int) -> bytes:
+        return bytes(self.bytes[row, addr : addr + length].cpu().tolist())
+
+    def set_bytes(self, row: int, addr: int, data: bytes) -> None:
+        values = torch.tensor(list(data), dtype=torch.uint8, device=self.bytes.device)
+        self.bytes[row, addr : addr + len(data)] = values
+
+    def clone(self) -> "FlatMemory":
+        return FlatMemory.of(self.bytes.clone())
 
     def release(self) -> None:
         pass

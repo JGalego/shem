@@ -1,23 +1,25 @@
 import torch
 
-from shem_neural.memory import PAGE_SIZE, ZERO_PAGE, DeltaMemory, PagedMemory, PagePool
+from shem_neural.memory import PAGE_SIZE, ZERO_PAGE, DeltaMemory, FlatMemory, PagedMemory, PagePool
 
 SIZE = 16 * PAGE_SIZE
 
 
-def test_paged_and_delta_memory_agree_on_random_traffic():
+def test_delta_paged_and_flat_memory_agree_on_random_traffic():
     generator = torch.Generator().manual_seed(3)
-    delta, paged = DeltaMemory(2, SIZE), PagedMemory(2, SIZE)
+    memories = DeltaMemory(2, SIZE), PagedMemory(2, SIZE), FlatMemory(2, SIZE)
     for _ in range(200):
         addr = torch.randint(0, SIZE - 4, (2,), generator=generator).to(torch.float64)
         values = torch.randint(0, 256, (2, 4), generator=generator).to(torch.float64)
         beta = torch.randint(0, 2, (2, 4), generator=generator).to(torch.float64)
-        delta.write(addr, values, beta)
-        paged.write(addr, values, beta)
+        for memory in memories:
+            memory.write(addr, values, beta)
         probe = torch.randint(0, SIZE - 4, (2,), generator=generator).to(torch.float64)
-        assert torch.equal(delta.read(probe, 4), paged.read(probe, 4))
+        reads = [memory.read(probe, 4) for memory in memories]
+        assert all(torch.equal(reads[0], read) for read in reads)
     for row in range(2):
-        assert delta.get_bytes(row, 0, SIZE) == paged.get_bytes(row, 0, SIZE)
+        contents = {memory.get_bytes(row, 0, SIZE) for memory in memories}
+        assert len(contents) == 1
 
 
 def test_fresh_memory_costs_nothing_until_written():

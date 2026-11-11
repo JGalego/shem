@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from . import isa
-from .memory import DeltaMemory, PagedMemory, PagePool
+from .memory import DeltaMemory, FlatMemory, PagedMemory, PagePool
 
 DTYPE = torch.float64
 TWO32 = 2.0**32
@@ -71,21 +71,30 @@ class State:
     pc: torch.Tensor  # (B,)
     pc_low: torch.Tensor  # (B, 2): the low bits of pc, for the alignment check
     regs: torch.Tensor  # (B, 32, 32): one row of bits per register
-    mem: DeltaMemory | PagedMemory
+    mem: DeltaMemory | PagedMemory | FlatMemory
     instret: torch.Tensor  # (B,)
 
     @classmethod
-    def zeros(cls, batch: int, mem_size: int, dense: bool = False, pool: PagePool | None = None) -> "State":
+    def zeros(
+        cls,
+        batch: int,
+        mem_size: int,
+        dense: bool = False,
+        pool: PagePool | None = None,
+        device: torch.device | str = "cpu",
+        flat: bool = False,
+    ) -> "State":
         """Machines with zeroed registers and memory: a delta-rule state matrix
-        with `dense`, otherwise pages from `pool`."""
-        mem = DeltaMemory(batch, mem_size) if dense else PagedMemory(batch, mem_size, pool)
-        return cls(
-            pc=torch.zeros(batch, dtype=DTYPE),
-            pc_low=torch.zeros(batch, 2, dtype=DTYPE),
-            regs=torch.zeros(batch, 32, 32, dtype=DTYPE),
-            mem=mem,
-            instret=torch.zeros(batch, dtype=DTYPE),
-        )
+        with `dense`, a row of bytes per guest on `device` with `flat`, and
+        otherwise pages from `pool`."""
+        if dense:
+            mem = DeltaMemory(batch, mem_size)
+        elif flat:
+            mem = FlatMemory(batch, mem_size, device)
+        else:
+            mem = PagedMemory(batch, mem_size, pool)
+        zeros = lambda *shape: torch.zeros(*shape, dtype=DTYPE, device=device)  # noqa: E731
+        return cls(pc=zeros(batch), pc_low=zeros(batch, 2), regs=zeros(batch, 32, 32), mem=mem, instret=zeros(batch))
 
     @classmethod
     def stack(cls, states: list["State"]) -> "State":
@@ -118,11 +127,19 @@ class State:
 
 
 class NeuralCpu:
-    def __init__(self, weights: dict[str, torch.Tensor], fused: bool = True):
+    def __init__(self, weights: dict[str, torch.Tensor], fused: bool = True, static: bool = False):
+        """With `static`, every unit runs on every step, even the multiplier and
+        divider when no guest needs them: no control flow depends on data, so
+        the step can be compiled into a fixed graph of kernels. The weights'
+        device is where the network runs."""
         self.w = weights
         self.fused = fused
+        self.static = static
+        self.device = weights["powers"].device
         self.powers = weights["powers"]
-        self.clear_bit0 = torch.ones(32, dtype=DTYPE)
+        self.byte_places = BYTE_PLACES.to(self.device)
+        self.levels = LEVELS.to(self.device)
+        self.clear_bit0 = torch.ones(32, dtype=DTYPE, device=self.device)
         self.clear_bit0[0] = 0
 
     def value(self, bits: torch.Tensor) -> torch.Tensor:
@@ -138,12 +155,12 @@ class NeuralCpu:
         """Bytes as bits: a one-hot over the 256 values, then a table lookup."""
         if self.fused:
             return self.w["byte_bits"][b.long()]
-        onehot = clamp01(1 - (b[..., None] - LEVELS).abs())
+        onehot = clamp01(1 - (b[..., None] - self.levels).abs())
         return onehot @ self.w["byte_bits"]
 
     def decompose(self, x: torch.Tensor, n: int) -> torch.Tensor:
         if self.fused:
-            return (x.long()[..., None] >> torch.arange(n) & 1).to(DTYPE)
+            return (x.long()[..., None] >> torch.arange(n, device=x.device) & 1).to(DTYPE)
         return decompose(x, n)
 
     def wrap_bits(self, x: torch.Tensor) -> torch.Tensor:
@@ -165,7 +182,7 @@ class NeuralCpu:
         fetch_fault = clamp01(clamp01(pc + 4 - mem_size) + s.pc_low.sum(-1))
         fetched = s.mem.read(pc, 4)
         ibits = self.byte_bits(fetched).reshape(batch, 32)
-        word = fetched @ BYTE_PLACES
+        word = fetched @ self.byte_places
 
         # Decode
         is_ = torch.relu(1 - (ibits @ w["decode_w"].T + w["decode_c"]))
@@ -198,11 +215,11 @@ class NeuralCpu:
         # them. Otherwise their results would be routed nowhere, so skipping
         # them changes nothing.
         route = is_ @ w["result_route"]
-        zero = torch.zeros(batch, dtype=DTYPE)
+        zero = torch.zeros_like(pc)
         mul = mulh = mulhsu = mulhu = div = divu = rem = remu = zero
-        if route[:, _MUL].any():
+        if self.static or route[:, _MUL].any():
             mul, mulh, mulhsu, mulhu = self.multiply(a_bits, o_bits, a, o)
-        if route[:, _DIV].any():
+        if self.static or route[:, _DIV].any():
             div, divu, rem, remu = self.divide(a_bits, o_bits, a, o)
 
         # Memory
@@ -216,7 +233,7 @@ class NeuralCpu:
         sign_half = self.byte_bits(loaded[:, 1])[:, 7]
         lbu = loaded[:, 0]
         lhu = lbu + 256 * loaded[:, 1]
-        lw = loaded @ BYTE_PLACES
+        lw = loaded @ self.byte_places
         lb = lbu + (TWO32 - 256) * sign_byte
         lh = lhu + (TWO32 - 65536) * sign_half
 
@@ -256,7 +273,7 @@ class NeuralCpu:
         writes = route.sum(-1) * (1 - rd[:, 0]) * commit
         s.regs = s.regs + writes[:, None, None] * rd[:, :, None] * (rd_bits[:, None, :] - s.regs)
         store_bytes = b_bits.reshape(batch, 4, 8) @ self.powers[:8]
-        gates = commit[:, None] * clamp01(store_size[:, None] - torch.arange(4))
+        gates = commit[:, None] * clamp01(store_size[:, None] - torch.arange(4, device=self.device))
         s.mem.write(addr, store_bytes, gates)
         keep = (1 - commit)[:, None]
         s.pc = commit * self.value(next_bits) + (1 - commit) * pc

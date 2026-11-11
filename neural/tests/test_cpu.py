@@ -27,6 +27,8 @@ from rv32 import (
 )  # fmt: skip
 
 from shem_neural.compile import compile_weights, isa
+from shem_neural.cpu import EBREAK as EBREAK_EXIT
+from shem_neural.cpu import MEMORY_FAULT as MEMORY_FAULT_EXIT
 from shem_neural.cpu import NeuralCpu, State
 from shem_neural.vcpu import (
     BUDGET,
@@ -41,6 +43,7 @@ MEM = 64 << 10
 WEIGHTS = compile_weights()
 CPU = NeuralCpu(WEIGHTS)
 DENSE_CPU = NeuralCpu(WEIGHTS, fused=False)
+STATIC_CPU = NeuralCpu(WEIGHTS, static=True)
 
 
 def load(code: bytes, dense: bool = False) -> NeuralVcpu:
@@ -180,6 +183,52 @@ def test_fused_units_match_the_network_on_random_values():
     fused = torch.stack(CPU.divide(a_bits, o_bits, a, o))
     dense = torch.stack(DENSE_CPU.divide(a_bits, o_bits, a, o))
     assert torch.equal(fused, dense)
+
+
+BATCH = [
+    assemble(li(A0, 6), li(A1, 7), m("mul", A2, A0, A1), EBREAK),
+    assemble(li(A0, 100), li(A1, 7), m("divu", A2, A0, A1), sw(A2, ZERO, 0x800), EBREAK),
+    assemble(addi(S0, ZERO, 3), addi(S0, S0, -1), bne(S0, ZERO, -4), EBREAK),
+    assemble(li(T0, 0x2000), addi(T1, ZERO, -5), sw(T1, T0, 0), lb(A0, T0, 1), lbu(A1, T0, 3), EBREAK),
+]
+
+
+def run_batch(cpu: NeuralCpu, state: State, steps: int) -> None:
+    """Step every guest `steps` times, holding each one once it has exited,
+    as the server does."""
+    halted = torch.zeros(state.pc.shape[0], dtype=torch.bool, device=state.pc.device)
+    for _ in range(steps):
+        exits, _ = cpu.step(state, active=~halted)
+        halted |= exits.sum(-1) > 0
+
+
+def test_flat_memory_and_static_executor_match_the_paged_one():
+    paged, flat = State.zeros(len(BATCH), MEM), State.zeros(len(BATCH), MEM, flat=True)
+    for k, code in enumerate(BATCH):
+        paged.mem.set_bytes(k, 0, code)
+        flat.mem.set_bytes(k, 0, code)
+    run_batch(CPU, paged, 50)
+    run_batch(STATIC_CPU, flat, 50)
+    for name in ("pc", "pc_low", "regs", "instret"):
+        assert torch.equal(getattr(paged, name), getattr(flat, name)), name
+    for k in range(len(BATCH)):
+        assert paged.mem.get_bytes(k, 0, MEM) == flat.mem.get_bytes(k, 0, MEM)
+
+
+def test_gpu_batch_steps_in_place_and_keeps_each_first_exit():
+    from shem_neural.gpu import Batch
+
+    paged, batch = State.zeros(len(BATCH), MEM), Batch(WEIGHTS, len(BATCH), MEM)
+    for k, code in enumerate(BATCH):
+        paged.mem.set_bytes(k, 0, code)
+        batch.state.mem.set_bytes(k, 0, code)
+    run_batch(CPU, paged, 50)
+    batch.run(50)
+    assert torch.equal(paged.regs, batch.state.regs)
+    assert torch.equal(paged.instret, batch.state.instret)
+    assert batch.halted.all()
+    assert batch.exits.argmax(-1).tolist() == [EBREAK_EXIT, MEMORY_FAULT_EXIT, EBREAK_EXIT, EBREAK_EXIT]
+    assert batch.info[1] == 2**32 - 2048  # the store to -2048
 
 
 def test_a_batch_runs_different_programs_like_separate_vcpus():
