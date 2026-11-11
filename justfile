@@ -117,15 +117,18 @@ docker-test: toolchain
     mkdir -p target/oci-hello
     just cc -O2 -o target/oci-hello/hello guests/hello.c
     printf 'FROM scratch\nCOPY hello /hello\nENTRYPOINT ["/hello"]\n' | docker build -q --platform linux/riscv32 -t shem-hello:riscv32 -f - target/oci-hello
+    docker info --format 'Docker {{{{.ServerVersion}}, storage {{{{.Driver}} {{{{json .DriverStatus}}'
     status=0
-    timeout 120 docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 shem-hello:riscv32 one two > target/oci-hello/docker.txt || status=$?
+    timeout -k 5 60 docker run --name shem-docker-test --runtime io.containerd.shem.v1 --platform linux/riscv32 shem-hello:riscv32 one two > target/oci-hello/docker.txt 2>&1 || status=$?
     cat target/oci-hello/docker.txt
     echo "docker run exited with status $status (the program exits with its argument count, 3)"
     if ! grep -q "sum of squares below 100000" target/oci-hello/docker.txt || [ "$status" != 3 ]; then
-        docker info 2>&1 | grep -iE 'version|storage|driver|runtime' || true
-        sudo journalctl -u containerd -u docker --no-pager | grep -iE 'shem|error|warn' | tail -30 || true
+        docker ps -a --no-trunc --filter name=shem-docker-test || true
+        docker inspect --format '{{{{json .State}}' shem-docker-test || true
+        sudo journalctl -u containerd -u docker --since "-3min" --no-pager | tail -60 || true
         exit 1
     fi
+    docker rm shem-docker-test >/dev/null
 
 # Push and pull an image through a local registry; needs Docker and oras
 registry-test:
