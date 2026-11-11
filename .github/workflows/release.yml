@@ -6,6 +6,7 @@ name: Release
 #   - shem and containerd-shim-shem-v1 binaries, with build provenance, on the GitHub release
 #   - the guest toolchain, the shem-neural runtime and the docker build frontend images on GHCR, for amd64 and arm64
 #   - the examples as shem images on GHCR: programs, a warm shell, a booted Linux, and models
+#   - the compiled CPU's weights, with a model card, on the Hugging Face Hub
 #   - release notes from the conventional commits since the last tag
 # Running it by hand builds and checks everything, and publishes nothing.
 
@@ -210,9 +211,28 @@ jobs:
       - name: Publish with trusted publishing
         run: uv publish dist/*
 
+  weights:
+    name: Compiled weights on Hugging Face
+    needs: [verify, crates, pypi]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: huggingface
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+      - name: Export, upload and tag the weights
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO || 'JGalego/shem-rv32im' }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          uv run --project neural python -m shem_neural.export weights --version "$VERSION"
+          uvx --from huggingface_hub hf upload "$HF_REPO" weights . --commit-message "shem $VERSION"
+          uvx --from huggingface_hub hf repos tag create "$HF_REPO" "v$VERSION"
+
   release:
     name: GitHub release
-    needs: [verify, binaries, images, examples, crates, pypi]
+    needs: [verify, binaries, images, examples, crates, pypi, weights]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
