@@ -8,3 +8,4 @@
 - [The neural vCPU](neural.md)
 - [VM mode](vm.md)
 - [containerd and Docker](containerd.md)
+- [Kubernetes](kubernetes.md)
