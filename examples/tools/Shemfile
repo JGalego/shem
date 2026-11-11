@@ -1,0 +1,16 @@
+# A model that calls programs. Qwen3-0.6B does the language; the RV32IM CPU,
+# compiled into a layer of its own, does the arithmetic. When the model calls
+# mul, the host runs the program exactly on that compiled layer and hands the
+# answer back to the model.
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS tools
+RUN apk add --no-cache zig
+WORKDIR /src
+COPY mul.c .
+RUN zig cc -target riscv32-linux-musl -mcpu=generic_rv32+m+a -static -O2 -o mul mul.c
+
+FROM hf.co/Qwen/Qwen3-0.6B
+COPY --from=shem:rv32im / /model/compiled/rv32im/
+COPY --from=tools /src/mul /usr/local/bin/mul
+COPY mul.json /usr/local/bin/mul.json
+ENTRYPOINT ["shem:generate", "--tools", "/usr/local/bin", "--max-tokens", "256", "--system", "Use the tools for arithmetic. Answer in one short sentence."]
+CMD ["What is 123456789 times 987654321?"]

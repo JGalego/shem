@@ -1,0 +1,11 @@
+{
+  "description": "Multiply two whole numbers of any length exactly. Use it for every multiplication.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "a": {"type": "string", "description": "the first number, in decimal digits"},
+      "b": {"type": "string", "description": "the second number, in decimal digits"}
+    },
+    "required": ["a", "b"]
+  }
+}

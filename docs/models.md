@@ -97,13 +97,44 @@ sudo shem-neural-server --socket /tmp/shem-neural.sock
 
 Its socket is open only to its user (and root). A CI job runs a prompt, piped turns, a live session with `docker exec`, and a `docker commit` whose image remembers the conversation.
 
+## Compiled layers and tools
+
+A model image can carry compiled layers: blocks whose weights are compiled from a specification rather than trained. The RV32IM CPU of the [neural vCPU](neural.md) is one, and a Shemfile adds it like any other layer ([`examples/tools`](../examples/tools/Shemfile)):
+
+```dockerfile
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS tools
+RUN apk add --no-cache zig
+COPY mul.c .
+RUN zig cc -target riscv32-linux-musl -mcpu=generic_rv32+m+a -static -O2 -o mul mul.c
+
+FROM hf.co/Qwen/Qwen3-0.6B
+COPY --from=shem:rv32im / /model/compiled/rv32im/
+COPY --from=tools /mul /usr/local/bin/mul
+COPY mul.json /usr/local/bin/mul.json
+ENTRYPOINT ["shem:generate", "--tools", "/usr/local/bin", "--system", "Use the tools for arithmetic."]
+CMD ["What is 123456789 times 987654321?"]
+```
+
+```
+$ shem run tools
+shem: ran mul 123456789 987654321 on the compiled RV32IM layer, 2,881 instructions
+121932631112635269.
+```
+
+- `COPY --from=shem:rv32im` copies a layer shem compiles from the instruction set at build time, with `shem build` and `docker build` alike: the weights, a `config.json` that describes the machine, and a model card. Compiling is deterministic, so every build carries the same weights, and the release publishes them ([jgalego/shem-rv32im](https://huggingface.co/jgalego/shem-rv32im)).
+- `--tools DIR` offers the image's programs in `DIR` to the model, through the chat template's own tool format. A program's interface is `NAME.json` beside it (a function's `description` and `parameters`, which become its arguments in order), or by default a list of `args` and `stdin`.
+- When the model calls a tool, the host routes the call to the compiled layer: it runs the program with `shem run --vcpu neural`, on a neural vCPU whose weights are the image's layer and whose system calls the host services in the image's filesystem, and hands the output back to the model as the tool's reply, up to four times a turn. Language goes through the model's trained blocks and exact work through its compiled ones; the host is the router between them.
+- The model must be one that calls tools: Qwen3-0.6B does, where Qwen3.5-0.8B answers the multiplication itself, and gets it wrong. Tool calls are read in either format templates ask for, JSON or `<function=...>` tags.
+
+A test builds the example and checks the exact products of 9- and 11-digit numbers, through `shem run` and `docker run`. A 23-digit product takes the neural vCPU 9,794 instructions, about 10 seconds; the reply is the 45-digit answer, exact.
+
 ## Running
 
-Run the model server on a GPU when there is one: `--device auto` (the default) picks one, and `--device cpu` or `--device cuda` choose. [`jobs/models_gpu.py`](../neural/jobs/models_gpu.py) checks both models on a GPU against the CPU (logits, greedy replies, and a session saved on the GPU that continues identically) and times them, on Hugging Face Jobs.
+Run the model server on a GPU when there is one: `--device auto` (the default) picks one, and `--device cpu` or `--device cuda` choose. [`jobs/models_gpu.py`](../neural/jobs/models_gpu.py) checks both models on a GPU against the CPU (logits, greedy replies, and a session saved on the GPU that continues identically) and times them, on Hugging Face Jobs. On an L4, Qwen3-0.6B decodes at 27.8 tokens a second (7.1 on the CPU) and Qwen3.5-0.8B at 31.2 (5.6), with logits within 7e-5 of the CPU's and the same replies.
 
-`shem run` unpacks a model image once, into `$SHEM_HOME/rootfs/<digest>`, and the driver loads the weights from there. The runtime computes in float32 on the CPU, so sessions are repeatable: Qwen3-0.6B replies at about five tokens a second.
+`shem run` unpacks a model image once, into `$SHEM_HOME/rootfs/<digest>`, and the driver loads the weights from there. The runtime computes in float32, so sessions are repeatable on the same device.
 
 ## Next
 
-- **Compiled layers.** Exact circuits, such as the RV32IM CPU of the [neural vCPU](neural.md), as block types spliced into a model, and tool calls that run programs on them.
-- **Speed.** The model server holding loaded models and batching sessions, on GPUs.
+- **More compiled layers.** Other specifications compiled into blocks, and compiled layers that read and write the residual stream directly instead of through a tool call.
+- **Speed.** Batching sessions of the same model in one forward pass, as the neural vCPU batches guests.

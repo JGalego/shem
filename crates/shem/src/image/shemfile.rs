@@ -100,7 +100,10 @@ pub fn parse(text: &str) -> Result<Vec<Stage>, ParseError> {
             None => (logical.to_ascii_uppercase(), String::new()),
         };
         if keyword == "FROM" {
-            let words: Vec<&str> = rest.split_whitespace().collect();
+            // Flags such as --platform are Docker's, for the stage's lines as given
+            let words: Vec<&str> = (rest.split_whitespace())
+                .skip_while(|word| word.starts_with("--"))
+                .collect();
             let (from, name) = match words.as_slice() {
                 [from] => (from.to_string(), None),
                 [from, r#as, name] if r#as.eq_ignore_ascii_case("as") => {

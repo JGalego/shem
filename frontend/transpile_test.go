@@ -113,6 +113,21 @@ CMD ["Who are you?"]
 	}
 }
 
+func TestCompiledLayersComeFromTheirContext(t *testing.T) {
+	src := "FROM scratch\nCOPY --from=shem:rv32im / /model/compiled/rv32im/\nCOPY --from=shem:rv32im /config.json /x\n"
+	names, err := Compiled([]byte(src))
+	if err != nil || len(names) != 1 || names[0] != "rv32im" {
+		t.Fatalf("compiled %v, %v", names, err)
+	}
+	out := transpile(t, src, nil)
+	if strings.Count(out, "COPY --from=shem-compiled-rv32im ") != 2 || strings.Contains(out, "shem:rv32im") {
+		t.Error(out)
+	}
+	if _, err := Compiled([]byte("FROM scratch\nCOPY --from=shem:x86 / /\n")); err == nil {
+		t.Error("shem:x86 is no compiled layer")
+	}
+}
+
 func TestKernelsBecomeLabels(t *testing.T) {
 	out := transpile(t, "FROM scratch\nKERNEL /boot/Image console=ttyS0 quiet\n", nil)
 	if !strings.Contains(out, `LABEL dev.shem.kernel="/boot/Image" dev.shem.bootargs="console=ttyS0 quiet"`) {

@@ -26,6 +26,8 @@ Restart containerd.
 sudo systemctl restart containerd
 ```
 
+Images the kubelet pulls for the `shem` runtime class are pulled for `linux/riscv32`. An image loaded onto a node by hand (`ctr -n k8s.io images import`) is read for the node's own platform instead, unless it is labelled with its own: `ctr -n k8s.io images label IMAGE io.cri-containerd.image.platform=linux/riscv32`.
+
 The kubelet must ask for images by runtime class, or it looks for `linux/amd64` ones and reports `ErrImageNeverPull` or pulls the wrong platform: turn on the `RuntimeClassInImageCriApi` feature gate (in the kubelet's configuration, `featureGates: {RuntimeClassInImageCriApi: true}`).
 
 ## In the cluster

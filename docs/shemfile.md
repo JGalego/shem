@@ -81,6 +81,7 @@ The last stage is the image. It must be a **shem stage**: `FROM scratch`, or `FR
 | Instruction | In a shem stage |
 |---|---|
 | `FROM` | `scratch`, or a shem image's layout directory, whose layers, config and frozen state the new image builds on |
+| `COPY --from=shem:rv32im src dest` | Copies a compiled layer, which shem compiles at build time: the RV32IM CPU, for a model's tools ([models.md](models.md#compiled-layers-and-tools)) |
 | `COPY [--from=stage] src... dest` | As in Docker: a directory's contents are copied into `dest`; a file goes to `dest`, or into it when `dest` ends in `/` or there are several sources. Each `COPY` is one layer. Sources must stay inside the context. |
 | `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`, `ARG`, `LABEL` | As in Docker, including shell and exec forms, and `$NAME` and `${NAME}` substitution from `ARG` and `ENV` |
 | `WARM` | New; see below |

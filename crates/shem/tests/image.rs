@@ -383,6 +383,11 @@ WARM --until=syscall:read --max-steps=1000
             max_steps: Some(1000)
         }
     );
+    let flagged = shemfile::parse("FROM --platform=$BUILDPLATFORM alpine:3.22 AS build\n").unwrap();
+    assert_eq!(
+        (flagged[0].from.as_str(), flagged[0].name.as_deref()),
+        ("alpine:3.22", Some("build"))
+    );
     let warm = shemfile::parse("FROM hf.co/Qwen/Qwen3-0.6B\nWARM --until=prompt\n").unwrap();
     assert_eq!(
         warm[0].instructions[0],

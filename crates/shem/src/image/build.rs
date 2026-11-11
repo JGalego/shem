@@ -304,6 +304,7 @@ impl Builder<'_> {
     fn copy(&mut self, from: Option<&str>, sources: &[String], dest: &str) -> anyhow::Result<()> {
         let sources: Vec<String> = sources.iter().map(|s| self.expand(s)).collect();
         let source_root = match from {
+            Some(name) if name.starts_with(model::DRIVER_PREFIX) => self.compiled(name)?,
             Some(stage) => self.docker_export(stage, &sources)?,
             None => self.options.context.clone(),
         };
@@ -520,6 +521,19 @@ impl Builder<'_> {
         self.image.config.memory = Some(frozen.machine.mem.len() as u32);
         self.frozen_vm = Some(frozen);
         Ok(())
+    }
+
+    /// The compiled layer `shem:NAME`, which `COPY --from` copies: built from
+    /// its specification by shem, once per build.
+    fn compiled(&mut self, from: &str) -> anyhow::Result<PathBuf> {
+        if let Some(dir) = self.docker.get(from) {
+            return Ok(dir.path().to_path_buf());
+        }
+        let dir = tempfile::tempdir()?;
+        model::compile(&from[model::DRIVER_PREFIX.len()..], dir.path())?;
+        let path = dir.path().to_path_buf();
+        self.docker.insert(from.to_string(), dir);
+        Ok(path)
     }
 
     /// `WARM --until=prompt` in a model image: prime a session with the

@@ -60,7 +60,32 @@ fn python(module: &str) -> Command {
             .arg(concat!("shem-neural==", env!("CARGO_PKG_VERSION"))),
     };
     command.args(["python", "-m", module]);
+    // Tools' programs run through this shem, on the model's compiled layer
+    if let Ok(exe) = std::env::current_exe() {
+        command.env("SHEM_BIN", exe);
+    }
     command
+}
+
+/// The compiled layers shem can build, for `COPY --from=shem:NAME`.
+pub const COMPILED: [&str; 1] = ["rv32im"];
+
+/// Compile the layer `name` into `out`: its weights, its description and
+/// its model card, as `shem_neural.export` writes them.
+pub fn compile(name: &str, out: &Path) -> anyhow::Result<()> {
+    if !COMPILED.contains(&name) {
+        bail!("shem:{name} is no compiled layer; there is shem:rv32im");
+    }
+    let status = python("shem_neural.export")
+        .arg(out)
+        .arg("--version")
+        .arg(env!("CARGO_PKG_VERSION"))
+        .status()
+        .context("compiling the layer, which needs uv")?;
+    if !status.success() {
+        bail!("compiling shem:{name} failed ({status})");
+    }
+    Ok(())
 }
 
 /// Import `repo` at `revision` into `out`, as a manifest and weights files.

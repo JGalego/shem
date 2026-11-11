@@ -30,24 +30,31 @@ class Tokenizer:
         self.template = env.from_string((directory / spec["chat_template"]).read_text())
         self.eos = set(spec["eos"])
 
-    def chat(self, messages: list[dict], thinking: bool = False) -> list[int]:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> list[int]:
         """The tokens of `messages`, ready for the assistant's reply."""
-        return self.encode(self.render(messages, thinking))
+        return self.encode(self.render(messages, tools))
 
-    def render(self, messages: list[dict], thinking: bool = False) -> str:
-        """The text of `messages` in the chat template, ready for the reply."""
-        return self.template.render(messages=messages, add_generation_prompt=True, enable_thinking=thinking)
+    def render(self, messages: list[dict], tools: list[dict] | None = None, reply: bool = True) -> str:
+        """The text of `messages` in the chat template, offering `tools`, and
+        with `reply`, ready for the assistant's reply."""
+        return self.template.render(
+            messages=messages, tools=tools or None, add_generation_prompt=reply, enable_thinking=False
+        )
+
+    def stop_texts(self) -> list[str]:
+        """The text of each token that ends a reply, such as `<|im_end|>`."""
+        return [self.inner.id_to_token(i) for i in self.eos if self.inner.id_to_token(i)]
 
     def encode(self, text: str) -> list[int]:
         return self.inner.encode(text, add_special_tokens=False).ids
 
-    def prefix(self, messages: list[dict]) -> list[int]:
+    def prefix(self, messages: list[dict], tools: list[dict] | None = None) -> list[int]:
         """The tokens every conversation that starts with `messages` and
         continues with a user turn begins with. Found by rendering two such
         conversations and keeping what they share, so it works with any
         template, including ones that refuse a conversation with no user turn."""
-        a = self.chat(messages + [{"role": "user", "content": "A"}])
-        b = self.chat(messages + [{"role": "user", "content": "?"}])
+        a = self.chat(messages + [{"role": "user", "content": "A"}], tools)
+        b = self.chat(messages + [{"role": "user", "content": "?"}], tools)
         shared = next((i for i, (x, y) in enumerate(zip(a, b, strict=False)) if x != y), min(len(a), len(b)))
         return a[:shared]
 

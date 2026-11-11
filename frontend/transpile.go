@@ -20,6 +20,8 @@ import (
 //   - WARM --until=prompt becomes a stage that runs the model's driver in the
 //     shem-neural image and copies the primed session into /.shem;
 //   - KERNEL becomes the labels a VM image carries;
+//   - COPY --from=shem:NAME copies a compiled layer (a named context the
+//     frontend fills by compiling it), such as shem:rv32im, the RV32IM CPU;
 //   - other stages are Docker stages, built on the build platform.
 //
 // The last stage is the image, built for linux/riscv32.
@@ -85,6 +87,39 @@ func hfReference(base string) (repo, revision string, ok bool) {
 	}
 	repo, revision, _ = strings.Cut(rest, ":")
 	return repo, revision, true
+}
+
+// compiledPrefix names the compiled layers shem builds, as in COPY --from=shem:rv32im.
+const compiledPrefix = "shem:"
+
+// CompiledContext is the named context that holds the compiled layer `name`.
+func CompiledContext(name string) string {
+	return "shem-compiled-" + name
+}
+
+// Compiled lists the compiled layers a Shemfile copies, each once.
+func Compiled(src []byte) ([]string, error) {
+	_, stages, err := parse(src)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	seen := map[string]bool{}
+	for _, st := range stages {
+		for _, node := range st.nodes {
+			if !strings.EqualFold(node.Value, "copy") {
+				continue
+			}
+			if name, ok := strings.CutPrefix(flag(node, "from"), compiledPrefix); ok && !seen[name] {
+				if name != "rv32im" {
+					return nil, fmt.Errorf("line %d: shem:%s is no compiled layer; there is shem:rv32im", node.StartLine, name)
+				}
+				seen[name] = true
+				names = append(names, name)
+			}
+		}
+	}
+	return names, nil
 }
 
 // Imports lists the models a Shemfile builds on, in order.
@@ -214,6 +249,12 @@ func Transpile(src []byte, imported map[string]Imported, neuralImage string) (st
 					label += " dev.shem.bootargs=" + jsonString(strings.Join(words[1:], " "))
 				}
 				write("%s", label)
+			case "copy":
+				text := original(node)
+				if name, ok := strings.CutPrefix(flag(node, "from"), compiledPrefix); ok {
+					text = strings.Replace(text, "--from="+compiledPrefix+name, "--from="+CompiledContext(name), 1)
+				}
+				write("%s", text)
 			default:
 				write("%s", original(node))
 			}

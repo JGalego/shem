@@ -61,6 +61,10 @@ struct VcpuArgs {
     /// Unix socket of a running neural vCPU server (python -m shem_neural.server)
     #[arg(long, value_name = "PATH", env = "SHEM_NEURAL_SOCKET")]
     neural_socket: Option<PathBuf>,
+    /// A compiled CPU layer for the neural vCPU, such as a model image's
+    /// model/compiled/rv32im, instead of the server's own weights
+    #[arg(long, value_name = "PATH")]
+    neural_weights: Option<PathBuf>,
 }
 
 impl VcpuArgs {
@@ -71,8 +75,13 @@ impl VcpuArgs {
 }
 
 /// A neural vCPU with memory at `base`, on the server at `socket`.
-fn neural(socket: &Path, mem: u32, base: u32) -> anyhow::Result<NeuralVcpu> {
-    NeuralVcpu::connect_with_base(socket, mem, base)
+fn neural(
+    socket: &Path,
+    mem: u32,
+    base: u32,
+    weights: Option<&Path>,
+) -> anyhow::Result<NeuralVcpu> {
+    NeuralVcpu::connect_with(socket, mem, base, weights)
         .with_context(|| format!("connecting to {}", socket.display()))
 }
 
@@ -208,7 +217,10 @@ fn run(args: RunArgs) -> anyhow::Result<u8> {
         VcpuKind::Reference => launch(&args, |mem, base| Ok(ReferenceVcpu::with_base(mem, base))),
         VcpuKind::Neural => {
             let socket = args.vcpu.socket()?;
-            launch(&args, |mem, base| neural(&socket, mem, base))
+            let weights = args.vcpu.neural_weights.clone();
+            launch(&args, |mem, base| {
+                neural(&socket, mem, base, weights.as_deref())
+            })
         }
     }
 }
@@ -402,7 +414,8 @@ fn boot(args: BootArgs) -> anyhow::Result<u8> {
             boot_on(vcpu, &kernel, &args)
         }
         VcpuKind::Neural => {
-            let vcpu = neural(&args.vcpu.socket()?, args.mem, vm::RAM_BASE)?;
+            let weights = args.vcpu.neural_weights.as_deref();
+            let vcpu = neural(&args.vcpu.socket()?, args.mem, vm::RAM_BASE, weights)?;
             boot_on(vcpu, &kernel, &args)
         }
     }

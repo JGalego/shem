@@ -83,6 +83,19 @@ func build(ctx context.Context, c client.Client) (*client.Result, error) {
 		forward["context:"+imp.Name] = "input:" + imp.Name
 	}
 
+	compiled, err := Compiled(src)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range compiled {
+		def, err := compileLayer(ctx, c, name, neuralImage, buildPlatform)
+		if err != nil {
+			return nil, fmt.Errorf("compiling shem:%s: %w", name, err)
+		}
+		inputs[CompiledContext(name)] = def
+		forward["context:"+CompiledContext(name)] = "input:" + CompiledContext(name)
+	}
+
 	dockerfile, err := Transpile(src, imported, neuralImage)
 	if err != nil {
 		return nil, err
@@ -123,6 +136,27 @@ func readShemfile(ctx context.Context, c client.Client, filename string) ([]byte
 		return nil, err
 	}
 	return ref.ReadFile(ctx, client.ReadRequest{Filename: filename})
+}
+
+// compileLayer compiles the layer `name` in the shem-neural image, on the
+// build platform, and returns a state holding just its files: the weights,
+// their description and the model card. Compiling is deterministic, so the
+// layer is the same from one build to the next.
+func compileLayer(ctx context.Context, c client.Client, name, neuralImage string, platform ocispecs.Platform) (*pb.Definition, error) {
+	out := path.Join("/out/compiled", name)
+	compiled := llb.Image(neuralImage, llb.Platform(platform), llb.WithMetaResolver(c)).Run(
+		llb.Args([]string{"shem-neural-export", out, "--version", version}),
+		llb.WithCustomName("[shem] compiling shem:"+name),
+	).Root()
+	files := llb.Scratch().File(
+		llb.Copy(compiled, out+"/", "/", &llb.CopyInfo{CopyDirContentsOnly: true}),
+		llb.WithCustomName("[shem] the compiled layer shem:"+name),
+	)
+	def, err := files.Marshal(ctx, llb.Platform(platform))
+	if err != nil {
+		return nil, err
+	}
+	return def.ToPB(), nil
 }
 
 // importModel runs the importer for `imp` in the shem-neural image, on the

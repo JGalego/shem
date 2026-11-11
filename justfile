@@ -141,7 +141,8 @@ model-containers-test:
     sudo install -m 0755 target/release/containerd-shim-shem-v1 /usr/local/bin/
     uv sync -q --project neural
     # As root, to read the containers' root filesystems, which containerd mounts
-    sudo neural/.venv/bin/python -m shem_neural.server --socket /tmp/shem-neural.sock > target/model-server.log 2>&1 &
+    # SHEM_BIN runs tools' programs on the model's compiled layer
+    sudo env SHEM_BIN="$PWD/target/release/shem" neural/.venv/bin/python -m shem_neural.server --socket /tmp/shem-neural.sock > target/model-server.log 2>&1 &
     trap 'sudo pkill -f "shem_neural[.]server" || true' EXIT
     until [ -S /tmp/shem-neural.sock ]; do sleep 1; done
     target/release/shem build -t qwen3 examples/qwen3
@@ -163,6 +164,11 @@ model-containers-test:
     docker commit live qwen3-remembers >/dev/null
     timeout 30 docker rm -f live >/dev/null
     check "joana" "$(timeout 300 $run --rm qwen3-remembers --max-tokens 24 'What did I tell you my name is?')"
+    echo "--- programs on a compiled layer, with shem run and docker run"
+    target/release/shem build -t tools examples/tools
+    check "121932631112635269" "$(timeout 600 target/release/shem run tools 'What is 123456789 times 987654321?')"
+    target/release/shem save tools | docker load
+    check "8888888888711111111112" "$(timeout 600 $run --rm tools 'What is 99999999999 times 88888888888?')"
 
 # Run an RV32 program in a Pod on shem, in a kind cluster; needs Docker, kind and kubectl
 kubernetes-test:
@@ -184,6 +190,8 @@ kubernetes-test:
         "  platform = 'linux/riscv32'" | docker exec -i "$node" sh -c 'cat >> /etc/containerd/config.toml'
     docker exec "$node" systemctl restart containerd
     docker save shem-k8s-hello:latest | docker exec -i "$node" ctr -n k8s.io images import --all-platforms -
+    # Imported images are read for the node's own platform unless labelled with theirs
+    docker exec "$node" ctr -n k8s.io images label docker.io/library/shem-k8s-hello:latest io.cri-containerd.image.platform=linux/riscv32
     kubectl apply -f examples/kubernetes/runtimeclass.yaml
     sed 's#image: .*#image: docker.io/library/shem-k8s-hello:latest#; s#imagePullPolicy: .*#imagePullPolicy: Never#' examples/kubernetes/hello.yaml | kubectl apply -f -
     if ! kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/shem-hello --timeout=120s; then

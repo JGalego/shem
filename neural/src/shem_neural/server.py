@@ -70,8 +70,10 @@ class Models:
     model share its weights, however many containers unpack it; and the live
     sessions of running containers, by the ID the shim gives them."""
 
-    def __init__(self, device: str = "auto"):
+    def __init__(self, device: str = "auto", socket: Path | None = None):
         self.device = device
+        #: This server's socket, where tools' programs run on its vCPUs
+        self.socket = socket
         self.loaded: dict[str, tuple] = {}
         self.sessions: dict[str, Live] = {}
         self.lock = threading.Lock()
@@ -100,11 +102,11 @@ class Models:
         if request.get("session"):
             args.session = Path(request["session"])
         model, tokenizer = self.get(Path(request["model"]))
-        session = generate.start(model, tokenizer, args, err=_Stream(write))
+        session = generate.start(model, tokenizer, args, err=_Stream(write), vcpu_socket=self.socket)
         prompt = " ".join(args.prompt) or request.get("stdin", "")
         with _all_cores():
             if session is not None and prompt:
-                generate.converse(session, tokenizer, prompt, args.max_tokens, out=_Stream(write))
+                generate.converse(session, tokenizer, prompt, args.max_tokens, out=_Stream(write), err=_Stream(write))
         if session is not None and request.get("session_id"):
             self.sessions[request["session_id"]] = Live(tokenizer, args, session)
 
@@ -120,7 +122,7 @@ class Models:
             return
         max_tokens = args.max_tokens if "--max-tokens" in request.get("argv", []) else live.args.max_tokens
         with live.lock, _all_cores():
-            generate.converse(live.session, live.tokenizer, text, max_tokens, out=_Stream(write))
+            generate.converse(live.session, live.tokenizer, text, max_tokens, out=_Stream(write), err=_Stream(write))
 
     def save(self, request: dict) -> bytes:
         """A live session's files, as `docker commit` freezes them into the
@@ -227,7 +229,7 @@ class Batcher:
                     job.result = first.run(job.budget)
                     job.done.set()
                     continue
-                jobs = [j for j in self.jobs if j.vcpu.mem_size == first.mem_size]
+                jobs = [j for j in self.jobs if j.vcpu.mem_size == first.mem_size and j.vcpu.cpu is first.cpu]
                 arrivals = self.arrivals
                 batch = State.stack([j.vcpu.state for j in jobs])
                 self.largest = max(self.largest, len(jobs))
@@ -266,12 +268,30 @@ class Registry:
     def __init__(self, dense: bool):
         weights = compile_weights()
         self.cpu = NeuralCpu(weights, fused=not dense)
+        #: CPUs from compiled layers that images carry, by their weights' digest
+        self.cpus: dict[str, NeuralCpu] = {hashlib.sha256(_tensors_bytes(weights)).hexdigest(): self.cpu}
         self.dense = dense
         self.vcpus: dict[int, NeuralVcpu] = {}
         self.pools: dict[int, PagePool] = {}  # by memory size
         self.ids = itertools.count(1)
         self.lock = threading.RLock()
         self.batcher = Batcher(self.lock)
+
+    def cpu_for(self, path: Path) -> NeuralCpu:
+        """The CPU whose weights are the compiled layer at `path` (its
+        `model.safetensors`, or the directory holding it). Images built by the
+        same shem carry this server's own weights, and share its CPU."""
+        from .compile import load
+
+        if path.is_dir():
+            path = path / "model.safetensors"
+        weights = load(path)
+        if set(weights) != set(self.cpu.w):
+            raise ValueError(f"{path}: not the weights of a compiled RV32IM CPU")
+        digest = hashlib.sha256(_tensors_bytes(weights)).hexdigest()
+        if digest not in self.cpus:
+            self.cpus[digest] = NeuralCpu(weights, fused=not self.dense)
+        return self.cpus[digest]
 
     def add(self, vcpu: NeuralVcpu) -> int:
         vcpu_id = next(self.ids)
@@ -294,8 +314,10 @@ class Registry:
         if op == Op.CREATE:
             (mem_size,) = struct.unpack_from("<I", payload, 1)
             (base,) = struct.unpack_from("<I", payload, 5) if len(payload) >= 9 else (0,)
+            weights = payload[9:].decode() if len(payload) > 9 else ""
+            cpu = self.cpu_for(Path(weights)) if weights else self.cpu
             pool = None if self.dense else self.pools.setdefault(mem_size, PagePool())
-            return struct.pack("<I", self.add(NeuralVcpu(mem_size, self.cpu, self.dense, pool, base)))
+            return struct.pack("<I", self.add(NeuralVcpu(mem_size, cpu, self.dense, pool, base)))
         (vcpu_id,) = struct.unpack_from("<I", payload, 1)
         args = payload[5:]
         vcpu = self.vcpus[vcpu_id]
@@ -335,6 +357,11 @@ class Registry:
         raise ValueError(f"unknown op {op}")
 
 
+def _tensors_bytes(weights: dict[str, torch.Tensor]) -> bytes:
+    """The weights' names and values, for a digest."""
+    return b"".join(name.encode() + weights[name].contiguous().numpy().tobytes() for name in sorted(weights))
+
+
 def read_frame(stream) -> bytes | None:
     header = stream.read(4)
     if len(header) < 4:
@@ -349,12 +376,13 @@ def write_frame(stream, payload: bytes) -> None:
 
 
 def make_server(
-    socket_path: Path, dense: bool = False, device: str = "auto"
+    socket_path: Path, dense: bool = False, device: str = "auto", single_thread: bool = True
 ) -> tuple[socketserver.BaseServer, Registry]:
     """A server on `socket_path`, not yet serving, and its registry of vCPUs."""
-    torch.set_num_threads(1)  # tiny tensors: threads only add overhead
+    if single_thread:
+        torch.set_num_threads(1)  # tiny tensors: threads only add overhead
     registry = Registry(dense)
-    models = Models(device)
+    models = Models(device, socket_path)
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):

@@ -53,8 +53,23 @@ impl NeuralVcpu {
     /// Create a vCPU whose memory occupies `base .. base + mem_size`, as RAM
     /// does in VM mode.
     pub fn connect_with_base(socket: &Path, mem_size: u32, base: u32) -> io::Result<Self> {
+        Self::connect_with(socket, mem_size, base, None)
+    }
+
+    /// Create a vCPU as `connect_with_base` does, whose CPU is the compiled
+    /// layer at `weights` (an image's `model/compiled/rv32im`) rather than
+    /// the server's own.
+    pub fn connect_with(
+        socket: &Path,
+        mem_size: u32,
+        base: u32,
+        weights: Option<&Path>,
+    ) -> io::Result<Self> {
         let conn = Arc::new(Mutex::new(UnixStream::connect(socket)?));
-        let args = [mem_size.to_le_bytes(), base.to_le_bytes()].concat();
+        let mut args = [mem_size.to_le_bytes(), base.to_le_bytes()].concat();
+        if let Some(weights) = weights {
+            args.extend(weights.as_os_str().as_encoded_bytes());
+        }
         let reply =
             request(&conn, CREATE, &args)?.map_err(|refused| io::Error::other(refused.message))?;
         Ok(Self {
