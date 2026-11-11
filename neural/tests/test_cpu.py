@@ -256,3 +256,27 @@ def test_a_batch_runs_different_programs_like_separate_vcpus():
         assert torch.equal(batch.regs[k], vcpu.state.regs[0])
         assert batch.mem.get_bytes(k, 0, MEM) == vcpu.read_mem(0, MEM)
         assert batch.pc[k] == vcpu.state.pc[0]
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_memory_can_start_at_a_base_address(dense):
+    from shem_neural.vcpu import MemoryFault
+
+    base = 0x8000_0000
+    vcpu = NeuralVcpu(MEM, DENSE_CPU if dense else CPU, dense, base=base)
+    data = base + 0x2000
+    code = assemble(li(T0, data), addi(T1, ZERO, 42), sw(T1, T0, 0), lw(A0, T0, 0), lw(A1, ZERO, 0), EBREAK)
+    vcpu.write_mem(base, code)
+    vcpu.pc = base
+    assert vcpu.run(100) == (EXIT_MEMORY_FAULT, 0, 5)  # address 0 is below memory
+    assert vcpu.reg(A0) == 42
+    assert vcpu.read_mem(data, 4) == (42).to_bytes(4, "little")
+    with pytest.raises(MemoryFault):
+        vcpu.read_mem(0, 4)
+    with pytest.raises(MemoryFault):
+        vcpu.read_mem(base + MEM - 2, 4)
+    vcpu.pc = base + MEM  # just past the end
+    assert vcpu.run(10) == (EXIT_MEMORY_FAULT, base + MEM, 0)
+    other = NeuralVcpu(MEM, CPU, base=base)
+    other.restore(vcpu.snapshot())
+    assert other.snapshot() == vcpu.snapshot()

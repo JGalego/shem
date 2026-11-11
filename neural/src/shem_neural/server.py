@@ -171,8 +171,9 @@ class Registry:
     def _handle(self, op: Op, payload: bytes) -> bytes:
         if op == Op.CREATE:
             (mem_size,) = struct.unpack_from("<I", payload, 1)
+            (base,) = struct.unpack_from("<I", payload, 5) if len(payload) >= 9 else (0,)
             pool = None if self.dense else self.pools.setdefault(mem_size, PagePool())
-            return struct.pack("<I", self.add(NeuralVcpu(mem_size, self.cpu, self.dense, pool)))
+            return struct.pack("<I", self.add(NeuralVcpu(mem_size, self.cpu, self.dense, pool, base)))
         (vcpu_id,) = struct.unpack_from("<I", payload, 1)
         args = payload[5:]
         vcpu = self.vcpus[vcpu_id]

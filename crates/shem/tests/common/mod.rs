@@ -2,6 +2,8 @@
 // Each test binary compiles this module separately and uses a different part of it.
 #![allow(dead_code, unused_imports, unused_macros)]
 
+pub mod machine;
+
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 

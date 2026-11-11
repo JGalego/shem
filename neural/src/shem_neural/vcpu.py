@@ -38,13 +38,22 @@ def _bits(value: int) -> torch.Tensor:
 
 
 class NeuralVcpu:
-    def __init__(self, mem_size: int, cpu: NeuralCpu | None = None, dense: bool = False, pool: PagePool | None = None):
+    def __init__(
+        self,
+        mem_size: int,
+        cpu: NeuralCpu | None = None,
+        dense: bool = False,
+        pool: PagePool | None = None,
+        base: int = 0,
+    ):
         """With `dense`, run the network as described, one-hot products and all;
         otherwise use the fused executor, which computes the same thing faster,
-        with memory paged from `pool`, shared with other vCPUs."""
+        with memory paged from `pool`, shared with other vCPUs. Memory starts
+        at the guest address `base`, as RAM does in VM mode."""
         self.cpu = cpu or NeuralCpu(compile_weights(), fused=not dense)
         self.dense = dense
-        self.state = State.zeros(1, mem_size, dense, pool)
+        self.base = base
+        self.state = State.zeros(1, mem_size, dense, pool, base=base)
 
     @property
     def mem_size(self) -> int:
@@ -77,23 +86,23 @@ class NeuralVcpu:
         if index != 0:
             self.state.regs[0, index] = _bits(value)
 
-    def _range(self, addr: int, length: int) -> slice:
-        if addr < 0 or addr + length > self.mem_size:
+    def _offset(self, addr: int, length: int) -> int:
+        """The offset into memory of `length` bytes at the guest address `addr`."""
+        offset = addr - self.base
+        if offset < 0 or offset + length > self.mem_size:
             raise MemoryFault(f"{length} bytes at {addr:#010x}")
-        return slice(addr, addr + length)
+        return offset
 
     def read_mem(self, addr: int, length: int) -> bytes:
-        self._range(addr, length)
-        return self.state.mem.get_bytes(0, addr, length)
+        return self.state.mem.get_bytes(0, self._offset(addr, length), length)
 
     def write_mem(self, addr: int, data: bytes) -> None:
-        self._range(addr, len(data))
-        self.state.mem.set_bytes(0, addr, data)
+        self.state.mem.set_bytes(0, self._offset(addr, len(data)), data)
 
     def reset(self) -> None:
         pool = None if self.dense else self.state.mem.pool
         self.state.mem.release()
-        self.state = State.zeros(1, self.mem_size, self.dense, pool)
+        self.state = State.zeros(1, self.mem_size, self.dense, pool, base=self.base)
 
     def release(self) -> None:
         """Give back this vCPU's memory, before dropping it."""
@@ -109,7 +118,7 @@ class NeuralVcpu:
             int(self.state.instret[0]),
             self.mem_size,
         )
-        return header + self.read_mem(0, self.mem_size)
+        return header + self.read_mem(self.base, self.mem_size)
 
     def restore(self, snapshot: bytes) -> None:
         """Rebuild the whole state from a canonical snapshot, whichever vCPU took it."""
@@ -124,11 +133,11 @@ class NeuralVcpu:
         for i, value in enumerate(regs):
             self.set_reg(i, value)
         self.state.instret[0] = instret
-        self.write_mem(0, snapshot[_SNAPSHOT_HEADER.size :])
+        self.write_mem(self.base, snapshot[_SNAPSHOT_HEADER.size :])
 
     def clone(self) -> "NeuralVcpu":
         """A copy for `fork`: same weights, copied state."""
         copy = NeuralVcpu.__new__(NeuralVcpu)
-        copy.cpu, copy.dense = self.cpu, self.dense
+        copy.cpu, copy.dense, copy.base = self.cpu, self.dense, self.base
         copy.state = self.state.clone()
         return copy

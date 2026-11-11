@@ -75,7 +75,7 @@ jobs:
           enable-cache: true
           cache-dependency-glob: neural/uv.lock
       - uses: extractions/setup-just@v4
-      - name: Unit tests, then riscv-tests and random programs on both vCPUs
+      - name: Unit tests, then riscv-tests, random programs, VM mode and Linux on both vCPUs
         run: just neural-tests
 
   vm:

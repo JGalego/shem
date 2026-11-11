@@ -68,7 +68,14 @@ WARM --until=output:"~ # "
 - They also freeze and thaw a machine mid-run, pause on console output, and build a VM image from a small kernel, cold and warm.
 - `just vm-tests` downloads the Linux image, pinned by commit and checksum, boots it, waits for the shell prompt, types `uname -sm` and `echo $((6 * 7))`, checks the answers, and types `poweroff`. It also freezes Linux at its prompt and resumes it on a fresh vCPU, and builds a booted Linux image twice, checking that the digests match and that the image answers at its prompt. CI runs it on every push.
 
-## Not yet
+## On the neural vCPU
 
-- **VM mode on the neural vCPU.** The kernel expects RAM at `0x80000000`; the reference vCPU has a base address for that, and the neural vCPU does not yet.
+`--vcpu neural` works for `shem boot` and for VM images, as it does for containers. The kernel expects RAM at `0x80000000`, so the neural vCPU takes a base address, and the network computes every fetch, load and store as an offset from it ([neural.md](neural.md#one-forward-pass)). Booting takes about 350 million instructions, which is days at a thousand instructions per second, so the practical way is a booted image: `WARM` boots the kernel on the reference vCPU, and the neural vCPU resumes at the prompt. A test does exactly that and runs a shell command on both vCPUs, about 180,000 instructions, which end in identical states.
+
+```sh
+just neural-server &
+echo 'echo $((6 * 7))' | shem run --vcpu neural --neural-socket /tmp/shem-neural.sock linux   # minutes, not seconds
+```
+
+## Not yet
 - **Interrupt-driven devices.** The UART is polled; there is no interrupt controller, and no block device or network.

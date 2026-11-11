@@ -28,6 +28,7 @@ The weights can be saved as safetensors, the format a machine image carries them
 | Memory | B × mem_size | A delta-rule state with one row per byte |
 | pc | B, plus its two low bits | The pc's low bits drive the alignment check |
 | instret | B | Instructions retired |
+| base | B | The guest address where memory starts: 0 for containers, `0x80000000` in VM mode |
 
 Both the register file and memory are written with the delta rule, `S ← S + β (v − S k) kᵀ`, with a one-hot key `k`. With β = 1 that replaces the keyed row exactly; with β = 0 it changes nothing. A read is `S q` with a one-hot query `q`, which returns the row. This is how Gated DeltaNet layers hold memory in Qwenputer.
 
@@ -35,7 +36,7 @@ Both the register file and memory are written with the delta rule, `S ← S + β
 
 [`cpu.py`](../neural/src/shem_neural/cpu.py), in order:
 
-1. **Fetch.** Four one-hot reads of memory at the pc give the instruction's bytes, and a table lookup turns them into 32 bits. A clamp flags a pc that is misaligned or out of range.
+1. **Fetch.** Four one-hot reads of memory at the pc's offset from the base give the instruction's bytes, and a table lookup turns them into 32 bits. A clamp flags a pc that is misaligned or out of range. The offset is `pc − base + 2³² · clamp(base − pc)`: below the base it wraps past the end of memory, so it faults, as on the reference vCPU. Loads and stores use the same offset.
 2. **Decode.** The mismatch-counting layer gives the instruction one-hot. Three more give one-hots for `rd`, `rs1` and `rs2`.
 3. **Operands.** Attention reads of the register file with the `rs1` and `rs2` one-hots give the operands' bits. The selection matrices give the immediate's bits. The second operand is the immediate or `rs2`, chosen by `uses_imm`.
 4. **Units.** Every unit computes its result for every guest: adder, logic (`a·b`, `a + b − a·b`, `a + b − 2a·b` on bits), shifter (attention over the shift matrices, with sign fill for `sra`), comparator, load extractor, multiplier (on 16-bit halves, so every partial value stays exact) and divider (restoring division, 32 unrolled compare-and-subtract layers). Values are integers, linear in the bits. A stack of threshold layers, `decompose`, turns a value back into bits.
@@ -73,7 +74,9 @@ For GPUs the fused executor has a **static** mode, which always runs every unit,
   - all 60 official riscv-tests (rv32ui, rv32um, rv32ua) run through containers on both, with the same exit status, the same instruction count, and the same final pc, registers and memory;
   - random straight-line programs over every register and immediate ALU instruction;
   - a snapshot taken midway on the reference vCPU, resumed on the neural one;
-  - a container that forks, pipes a byte from child to parent and reaps the child, which exercises cloning the neural vCPU.
+  - a container that forks, pipes a byte from child to parent and reaps the child, which exercises cloning the neural vCPU;
+  - VM mode, with RAM at `0x80000000`: machine-mode programs that take traps and timer interrupts and idle in `wfi`, with the same console output, the same CSRs and timer, and the same final state;
+  - **Linux**: a no-MMU Linux 6.8, booted to its prompt on the reference vCPU, then thawed on both vCPUs, where it reads `echo $((6 * 7))` from the console, runs it and prints the next prompt. That is about 180,000 instructions of kernel and BusyBox, through timer interrupts, CSR emulation, device accesses and atomics, and every byte of the 64 MiB of RAM ends the same. It takes the neural vCPU about four minutes.
 
 `just neural-tests` runs them all, and CI runs them on every push.
 
@@ -111,7 +114,7 @@ The host talks to the server ([`server.py`](../neural/src/shem_neural/server.py)
 
 | Op | Arguments | Result |
 |---|---|---|
-| 1 `CREATE` | u32 memory size | u32 id |
+| 1 `CREATE` | u32 memory size, optionally u32 base address (default 0) | u32 id |
 | 2 `DROP` | | |
 | 3 `CLONE` | | u32 id of the copy |
 | 4 `RUN` | u64 budget | u8 exit reason, u32 detail, u32 pc, u64 instructions |

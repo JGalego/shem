@@ -10,12 +10,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::machine::*;
 use common::*;
 use shem::container::{Container, RunError};
 use shem::linux;
 use shem::neural::NeuralVcpu;
 use shem::reference::ReferenceVcpu;
 use shem::vcpu::{MachineState, Vcpu};
+use shem::vm::{self, Console, DEFAULT_BOOTARGS, Halt, Machine, Pause, RAM_BASE, Stop, VmError};
 
 const MEM: u32 = 1 << 20;
 const MAX_STEPS: u64 = 1_000_000;
@@ -365,4 +367,104 @@ fn warm_images_built_on_the_reference_resume_on_the_neural_vcpu() {
         shem::image::start(&image, make, &[], &[], stdio, root.path(), MEM).unwrap();
     assert_eq!(container.run(Some(MAX_STEPS)), Ok(0));
     assert_eq!(stdout.contents(), b"resumed on the model\n");
+}
+
+/// Boot `kernel` in VM mode on `vcpu` and run it until it stops. Returns how
+/// it stopped, its console output, and the machine frozen at the end.
+fn run_machine<V: Vcpu>(vcpu: V, kernel: &[u8]) -> (Result<Halt, VmError>, Vec<u8>, vm::Frozen) {
+    let output = SharedBuf::default();
+    let (_keys, input) = std::sync::mpsc::channel();
+    let console = Console::new(input, Box::new(output.clone()));
+    let mut machine = Machine::boot(vcpu, kernel, DEFAULT_BOOTARGS, console).unwrap();
+    let halt = machine.run(Some(MAX_STEPS));
+    (halt, output.contents(), machine.freeze())
+}
+
+#[test]
+#[ignore = "needs uv and PyTorch: run `just neural-tests`"]
+fn vm_mode_runs_identically_on_both_vcpus() {
+    let server = Server::start();
+    // An ecall into the trap handler and back, timer interrupts while
+    // spinning, and wfi skipping idle time, with RAM at 0x80000000
+    let ecall = with_handler(
+        |_| program![addi(A0, ZERO, 0x41 - 11), ECALL, putc(A0), poweroff()],
+        program![
+            csr(2, T2, MCAUSE, ZERO),
+            add(A0, A0, T2),
+            csr(2, T2, MEPC, ZERO),
+            addi(T2, T2, 4),
+            csr(1, ZERO, MEPC, T2),
+            MRET,
+        ],
+    );
+    let kernels = [
+        ("traps", ecall),
+        ("timer", timer_program(10, program![beq(A2, ZERO, 0)])),
+        (
+            "idle",
+            timer_program(2000, program![WFI, beq(A2, ZERO, -4)]),
+        ),
+    ];
+    for (name, kernel) in kernels {
+        let reference = run_machine(ReferenceVcpu::with_base(RAM, RAM_BASE), &kernel);
+        let vcpu = NeuralVcpu::connect_with_base(&server.socket, RAM, RAM_BASE).unwrap();
+        let neural = run_machine(vcpu, &kernel);
+        assert_eq!(reference.0, Ok(Halt::Poweroff), "{name}");
+        assert_eq!(neural.0, reference.0, "{name}");
+        assert_eq!(neural.1, reference.1, "{name}: console output");
+        assert_eq!(neural.2.host, reference.2.host, "{name}: the host's half");
+        assert_same(name, &reference.2.machine, &neural.2.machine);
+    }
+}
+
+/// Thaw Linux, frozen at its prompt, on `vcpu`, type a command, and run until
+/// the next prompt. Returns the console output and the machine frozen there.
+fn resume_linux<V: Vcpu>(vcpu: V, frozen: &vm::Frozen) -> (Vec<u8>, vm::Frozen) {
+    let output = SharedBuf::default();
+    let (keys, input) = std::sync::mpsc::channel();
+    b"echo $((6 * 7))\n"
+        .iter()
+        .for_each(|b| keys.send(*b).unwrap());
+    drop(keys); // so that wfi does not wait for more
+    let console = Console::new(input, Box::new(output.clone()));
+    let mut machine = Machine::thaw(vcpu, frozen, console).unwrap();
+    let limit = Some(frozen.host.steps + 1_000_000);
+    let prompt = Some(Pause::Output(b"~ # ".to_vec()));
+    assert_eq!(machine.run_until(limit, prompt), Ok(Stop::Paused));
+    (output.contents(), machine.freeze())
+}
+
+#[test]
+#[ignore = "needs uv, PyTorch and a Linux image: run `just neural-tests`"]
+fn booted_linux_runs_identically_on_both_vcpus() {
+    const LINUX_RAM: u32 = 64 << 20;
+    let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/linux/Image");
+    let kernel = std::fs::read(&image).expect("download the image first: just linux-image");
+
+    // Boot to the prompt on the reference vCPU, as a VM image's WARM does
+    let (_keys, input) = std::sync::mpsc::channel();
+    let console = Console::new(input, Box::new(std::io::sink()));
+    let vcpu = ReferenceVcpu::with_base(LINUX_RAM, RAM_BASE);
+    let mut machine = Machine::boot(vcpu, &kernel, DEFAULT_BOOTARGS, console).unwrap();
+    let prompt = Some(Pause::Output(b"~ # ".to_vec()));
+    assert_eq!(
+        machine.run_until(Some(2_000_000_000), prompt),
+        Ok(Stop::Paused)
+    );
+    let frozen = machine.freeze();
+
+    // Then run a shell command on both vCPUs from there: about 180,000
+    // instructions of kernel and BusyBox
+    let server = Server::start();
+    let reference = resume_linux(ReferenceVcpu::with_base(LINUX_RAM, RAM_BASE), &frozen);
+    let vcpu = NeuralVcpu::connect_with_base(&server.socket, LINUX_RAM, RAM_BASE).unwrap();
+    let neural = resume_linux(vcpu, &frozen);
+    let text = String::from_utf8_lossy(&reference.0).into_owned();
+    assert!(text.contains("\n42"), "{text}");
+    assert_eq!(
+        String::from_utf8_lossy(&neural.0),
+        String::from_utf8_lossy(&reference.0)
+    );
+    assert_eq!(neural.1.host, reference.1.host);
+    assert_same("linux", &reference.1.machine, &neural.1.machine);
 }

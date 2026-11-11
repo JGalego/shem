@@ -47,9 +47,16 @@ struct Refused {
 impl NeuralVcpu {
     /// Create a vCPU with `mem_size` bytes of memory on the server at `socket`.
     pub fn connect(socket: &Path, mem_size: u32) -> io::Result<Self> {
+        Self::connect_with_base(socket, mem_size, 0)
+    }
+
+    /// Create a vCPU whose memory occupies `base .. base + mem_size`, as RAM
+    /// does in VM mode.
+    pub fn connect_with_base(socket: &Path, mem_size: u32, base: u32) -> io::Result<Self> {
         let conn = Arc::new(Mutex::new(UnixStream::connect(socket)?));
-        let reply = request(&conn, CREATE, &mem_size.to_le_bytes())?
-            .map_err(|refused| io::Error::other(refused.message))?;
+        let args = [mem_size.to_le_bytes(), base.to_le_bytes()].concat();
+        let reply =
+            request(&conn, CREATE, &args)?.map_err(|refused| io::Error::other(refused.message))?;
         Ok(Self {
             conn,
             id: u32::from_le_bytes(reply[..4].try_into().unwrap()),

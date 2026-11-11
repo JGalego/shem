@@ -51,6 +51,29 @@ enum VcpuKind {
 }
 
 #[derive(Args)]
+struct VcpuArgs {
+    /// Which vCPU runs the guest
+    #[arg(long = "vcpu", value_enum, default_value = "reference")]
+    kind: VcpuKind,
+    /// Unix socket of a running neural vCPU server (python -m shem_neural.server)
+    #[arg(long, value_name = "PATH", env = "SHEM_NEURAL_SOCKET")]
+    neural_socket: Option<PathBuf>,
+}
+
+impl VcpuArgs {
+    fn socket(&self) -> anyhow::Result<PathBuf> {
+        (self.neural_socket.clone())
+            .context("--vcpu neural needs --neural-socket or SHEM_NEURAL_SOCKET")
+    }
+}
+
+/// A neural vCPU with memory at `base`, on the server at `socket`.
+fn neural(socket: &Path, mem: u32, base: u32) -> anyhow::Result<NeuralVcpu> {
+    NeuralVcpu::connect_with_base(socket, mem, base)
+        .with_context(|| format!("connecting to {}", socket.display()))
+}
+
+#[derive(Args)]
 struct RunArgs {
     /// Guest memory size, such as 16M; the default is 16M, or 64M for a VM
     /// image, and a warm image brings its own
@@ -68,12 +91,8 @@ struct RunArgs {
     /// Print how many instructions the guest retired
     #[arg(long)]
     stats: bool,
-    /// Which vCPU runs the guest
-    #[arg(long, value_enum, default_value = "reference")]
-    vcpu: VcpuKind,
-    /// Unix socket of a running neural vCPU server (python -m shem_neural.server)
-    #[arg(long, value_name = "PATH", env = "SHEM_NEURAL_SOCKET")]
-    neural_socket: Option<PathBuf>,
+    #[command(flatten)]
+    vcpu: VcpuArgs,
     /// Host directory to use as an executable's root filesystem
     #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
@@ -144,6 +163,8 @@ struct BootArgs {
     /// Print how many instructions the machine retired
     #[arg(long)]
     stats: bool,
+    #[command(flatten)]
+    vcpu: VcpuArgs,
     /// A raw RV32 kernel image, such as a no-MMU Linux Image, loaded at 0x80000000
     kernel: PathBuf,
 }
@@ -167,22 +188,20 @@ fn main() -> ExitCode {
 }
 
 fn run(args: RunArgs) -> anyhow::Result<u8> {
-    match args.vcpu {
-        VcpuKind::Reference => launch(&args, |mem| Ok(ReferenceVcpu::new(mem))),
+    match args.vcpu.kind {
+        VcpuKind::Reference => launch(&args, |mem, base| Ok(ReferenceVcpu::with_base(mem, base))),
         VcpuKind::Neural => {
-            let socket = (args.neural_socket.clone())
-                .context("--vcpu neural needs --neural-socket or SHEM_NEURAL_SOCKET")?;
-            launch(&args, |mem| {
-                NeuralVcpu::connect(&socket, mem)
-                    .with_context(|| format!("connecting to {}", socket.display()))
-            })
+            let socket = args.vcpu.socket()?;
+            launch(&args, |mem, base| neural(&socket, mem, base))
         }
     }
 }
 
+/// Run an executable or an image. `vcpu` makes a vCPU with the given memory
+/// size and base address.
 fn launch<V: Vcpu + Clone>(
     args: &RunArgs,
-    vcpu: impl FnOnce(u32) -> anyhow::Result<V>,
+    vcpu: impl FnOnce(u32, u32) -> anyhow::Result<V>,
 ) -> anyhow::Result<u8> {
     let stdio = Stdio {
         stdin: Box::new(std::io::stdin()),
@@ -198,7 +217,7 @@ fn launch<V: Vcpu + Clone>(
             .chain(args.args.iter().cloned())
             .collect();
         let mem = args.mem.unwrap_or(image::CONTAINER_MEM);
-        let mut container = Container::from_elf(vcpu(mem)?, &elf, &argv, &args.env, stdio)
+        let mut container = Container::from_elf(vcpu(mem, 0)?, &elf, &argv, &args.env, stdio)
             .with_context(|| format!("loading {}", args.target))?;
         if let Some(root) = &args.root {
             container
@@ -213,11 +232,11 @@ fn launch<V: Vcpu + Clone>(
         let image = load_image(&args.target)?;
         let dir = tempfile::tempdir()?;
         if image.config.kernel.is_some() {
-            return run_vm(args, &image, dir.path());
+            return run_vm(args, &image, dir.path(), |mem| vcpu(mem, vm::RAM_BASE));
         }
         let container = image::start(
             &image,
-            vcpu,
+            |mem| vcpu(mem, 0),
             &args.args,
             &args.env,
             stdio,
@@ -301,16 +320,15 @@ fn build(args: BuildArgs) -> anyhow::Result<u8> {
 
 /// Run a VM image: boot its kernel, or resume its booted machine, with the
 /// console on stdio.
-fn run_vm(args: &RunArgs, image: &Image, root: &Path) -> anyhow::Result<u8> {
-    if matches!(args.vcpu, VcpuKind::Neural) {
-        bail!(
-            "VM images run on the reference vCPU for now: the neural vCPU has no RAM base address yet"
-        );
-    }
+fn run_vm<V: Vcpu>(
+    args: &RunArgs,
+    image: &Image,
+    root: &Path,
+    vcpu: impl FnOnce(u32) -> anyhow::Result<V>,
+) -> anyhow::Result<u8> {
     if !args.args.is_empty() || !args.env.is_empty() {
         bail!("a VM image takes no arguments or environment: KERNEL sets its command line");
     }
-    let vcpu = |mem| Ok(ReferenceVcpu::with_base(mem, vm::RAM_BASE));
     let mem = args.mem.unwrap_or(image::VM_MEM);
     let machine = image::start_vm(image, vcpu, stdio_console(), root, mem)
         .with_context(|| format!("starting {}", args.target))?;
@@ -334,13 +352,25 @@ fn stdio_console() -> Console {
 fn boot(args: BootArgs) -> anyhow::Result<u8> {
     let kernel = std::fs::read(&args.kernel)
         .with_context(|| format!("reading {}", args.kernel.display()))?;
-    let vcpu = ReferenceVcpu::with_base(args.mem, vm::RAM_BASE);
-    let machine = Machine::boot(vcpu, &kernel, &args.append, stdio_console())?;
+    match args.vcpu.kind {
+        VcpuKind::Reference => {
+            let vcpu = ReferenceVcpu::with_base(args.mem, vm::RAM_BASE);
+            boot_on(vcpu, &kernel, &args)
+        }
+        VcpuKind::Neural => {
+            let vcpu = neural(&args.vcpu.socket()?, args.mem, vm::RAM_BASE)?;
+            boot_on(vcpu, &kernel, &args)
+        }
+    }
+}
+
+fn boot_on<V: Vcpu>(vcpu: V, kernel: &[u8], args: &BootArgs) -> anyhow::Result<u8> {
+    let machine = Machine::boot(vcpu, kernel, &args.append, stdio_console())?;
     finish_vm(machine, args.max_steps, args.stats)
 }
 
-fn finish_vm(
-    mut machine: Machine<ReferenceVcpu>,
+fn finish_vm<V: Vcpu>(
+    mut machine: Machine<V>,
     max_steps: Option<u64>,
     stats: bool,
 ) -> anyhow::Result<u8> {

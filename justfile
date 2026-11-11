@@ -57,7 +57,7 @@ guest-tests: toolchain busybox-image
     cargo test --release --test guests -- --ignored
 
 # Test the neural vCPU: its own unit tests, then against the reference vCPU; needs Docker and uv
-neural-tests: toolchain
+neural-tests: toolchain linux-image
     docker build -q --target riscv-tests --output type=local,dest=target/riscv-tests toolchain
     uv run --project neural pytest -q neural/tests
     cargo test --release --test neural -- --ignored

@@ -73,6 +73,7 @@ class State:
     regs: torch.Tensor  # (B, 32, 32): one row of bits per register
     mem: DeltaMemory | PagedMemory | FlatMemory
     instret: torch.Tensor  # (B,)
+    base: torch.Tensor  # (B,): the guest address where memory starts
 
     @classmethod
     def zeros(
@@ -83,10 +84,11 @@ class State:
         pool: PagePool | None = None,
         device: torch.device | str = "cpu",
         flat: bool = False,
+        base: int = 0,
     ) -> "State":
-        """Machines with zeroed registers and memory: a delta-rule state matrix
-        with `dense`, a row of bytes per guest on `device` with `flat`, and
-        otherwise pages from `pool`."""
+        """Machines with zeroed registers and memory at `base`: a delta-rule
+        state matrix with `dense`, a row of bytes per guest on `device` with
+        `flat`, and otherwise pages from `pool`."""
         if dense:
             mem = DeltaMemory(batch, mem_size)
         elif flat:
@@ -94,7 +96,14 @@ class State:
         else:
             mem = PagedMemory(batch, mem_size, pool)
         zeros = lambda *shape: torch.zeros(*shape, dtype=DTYPE, device=device)  # noqa: E731
-        return cls(pc=zeros(batch), pc_low=zeros(batch, 2), regs=zeros(batch, 32, 32), mem=mem, instret=zeros(batch))
+        return cls(
+            pc=zeros(batch),
+            pc_low=zeros(batch, 2),
+            regs=zeros(batch, 32, 32),
+            mem=mem,
+            instret=zeros(batch),
+            base=torch.full((batch,), float(base), dtype=DTYPE, device=device),
+        )
 
     @classmethod
     def stack(cls, states: list["State"]) -> "State":
@@ -106,6 +115,7 @@ class State:
             regs=torch.cat([s.regs for s in states]),
             mem=PagedMemory.stack([s.mem for s in states]),
             instret=torch.cat([s.instret for s in states]),
+            base=torch.cat([s.base for s in states]),
         )
 
     def unstack(self, states: list["State"]) -> None:
@@ -123,6 +133,7 @@ class State:
             self.regs.clone(),
             self.mem.clone(),
             self.instret.clone(),
+            self.base.clone(),
         )
 
 
@@ -163,6 +174,12 @@ class NeuralCpu:
             return (x.long()[..., None] >> torch.arange(n, device=x.device) & 1).to(DTYPE)
         return decompose(x, n)
 
+    @staticmethod
+    def relative(x: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
+        """x - base modulo 2**32: an address's offset into memory. Below the
+        base it wraps to beyond the end, so it faults, as in the reference."""
+        return x - base + TWO32 * clamp01(base - x)
+
     def wrap_bits(self, x: torch.Tensor) -> torch.Tensor:
         """The bits of x mod 2**32, for integers -2**34 < x < 2**34."""
         return self.decompose(x + 2.0**34, 35)[..., :32]
@@ -178,9 +195,10 @@ class NeuralCpu:
         pc = s.pc
         mem_size = float(s.mem.size)
 
-        # Fetch
-        fetch_fault = clamp01(clamp01(pc + 4 - mem_size) + s.pc_low.sum(-1))
-        fetched = s.mem.read(pc, 4)
+        # Fetch, from memory at the base address
+        pc_offset = self.relative(pc, s.base)
+        fetch_fault = clamp01(clamp01(pc_offset + 4 - mem_size) + s.pc_low.sum(-1))
+        fetched = s.mem.read(pc_offset, 4)
         ibits = self.byte_bits(fetched).reshape(batch, 32)
         word = fetched @ self.byte_places
 
@@ -227,8 +245,9 @@ class NeuralCpu:
         load_size = is_ @ w["load_size"]
         store_size = is_ @ w["store_size"]
         size = load_size + store_size
-        memory_fault = clamp01(size) * clamp01(addr + size - mem_size)
-        loaded = s.mem.read(addr, 4)
+        offset = self.relative(addr, s.base)
+        memory_fault = clamp01(size) * clamp01(offset + size - mem_size)
+        loaded = s.mem.read(offset, 4)
         sign_byte = self.byte_bits(loaded[:, 0])[:, 7]
         sign_half = self.byte_bits(loaded[:, 1])[:, 7]
         lbu = loaded[:, 0]
@@ -274,7 +293,7 @@ class NeuralCpu:
         s.regs = s.regs + writes[:, None, None] * rd[:, :, None] * (rd_bits[:, None, :] - s.regs)
         store_bytes = b_bits.reshape(batch, 4, 8) @ self.powers[:8]
         gates = commit[:, None] * clamp01(store_size[:, None] - torch.arange(4, device=self.device))
-        s.mem.write(addr, store_bytes, gates)
+        s.mem.write(offset, store_bytes, gates)
         keep = (1 - commit)[:, None]
         s.pc = commit * self.value(next_bits) + (1 - commit) * pc
         s.pc_low = (1 - keep) * next_bits[:, :2] + keep * s.pc_low
