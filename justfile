@@ -87,11 +87,19 @@ vm-tests: linux-image
 
 # Run an RV32 container through containerd with the shem shim; needs Docker, containerd and sudo
 containerd-test: toolchain
+    #!/bin/sh
+    set -e
     cargo build --release -p containerd-shim-shem
     sudo install -m 0755 target/release/containerd-shim-shem-v1 /usr/local/bin/
     mkdir -p target/oci-hello
     just cc -O2 -o target/oci-hello/hello guests/hello.c
     printf 'FROM scratch\nCOPY hello /hello\nENTRYPOINT ["/hello"]\n' | docker build -q -t shem-hello:latest -f - target/oci-hello
     docker save shem-hello:latest | sudo ctr images import -
-    timeout 120 sudo ctr run --rm --runtime io.containerd.shem.v1 docker.io/library/shem-hello:latest shem-test one two | tee target/oci-hello/out.txt
-    grep -q "sum of squares below 100000" target/oci-hello/out.txt
+    status=0
+    timeout 120 sudo ctr run --rm --runtime io.containerd.shem.v1 docker.io/library/shem-hello:latest shem-test one two > target/oci-hello/out.txt || status=$?
+    cat target/oci-hello/out.txt
+    echo "ctr run exited with status $status (the program exits with its argument count, 3)"
+    if ! grep -q "sum of squares below 100000" target/oci-hello/out.txt; then
+        sudo journalctl -u containerd --no-pager -n 60 || true
+        exit 1
+    fi
