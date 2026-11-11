@@ -74,19 +74,19 @@ riscv32
 
 ## Stages
 
-The last stage is the image. It must be a **shem stage**: `FROM scratch`, or `FROM` the directory of a shem image's OCI layout, relative to the build context. Every other stage is an **ordinary Docker stage**, built by Docker only when a `COPY --from` needs it. The builder adds a small `FROM scratch` export stage that copies just the requested paths, so only those files leave Docker.
+The last stage is the image. With `shem build`, it must start from `scratch`, a Hugging Face model (`hf.co/ORG/NAME[:REVISION]`), or a shem image's OCI layout directory relative to the build context. Other stages supply files through `COPY --from`; ordinary Docker stages are built only when their files are needed.
 
 ## Instructions
 
 | Instruction | In a shem stage |
 |---|---|
-| `FROM` | `scratch`, or a shem image's layout directory, whose layers, config and frozen state the new image builds on |
+| `FROM` | `scratch`, a Hugging Face model ([models.md](models.md)), or a shem image's layout directory |
 | `COPY --from=shem:rv32im src dest` | Copies a compiled layer, which shem compiles at build time: the RV32IM CPU, for a model's tools ([models.md](models.md#compiled-layers-and-tools)) |
 | `COPY [--from=stage] src... dest` | As in Docker: a directory's contents are copied into `dest`; a file goes to `dest`, or into it when `dest` ends in `/` or there are several sources. Each `COPY` is one layer. Sources must stay inside the context. |
 | `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`, `ARG`, `LABEL` | As in Docker, including shell and exec forms, and `$NAME` and `${NAME}` substitution from `ARG` and `ENV` |
 | `WARM` | New; see below |
 | `KERNEL path [command line]` | New: makes a VM image; see [VM images](#vm-images) |
-| `RUN` | Not allowed: at about a thousand instructions per second on a neural vCPU, a compiler would take days. Build in a Docker stage and `COPY --from` it. |
+| `RUN` | Not allowed. Build in a Docker stage and `COPY --from` it. |
 
 Resource limits are `shem run` flags (`--mem`, `--max-steps`), not Shemfile instructions, as in Docker.
 
@@ -96,7 +96,7 @@ Resource limits are `shem run` flags (`--mem`, `--max-steps`), not Shemfile inst
 WARM --until=<condition> [--max-steps=<n>]
 ```
 
-Runs the entrypoint at build time until the condition holds, then freezes the container into a state layer. `shem run` thaws it and carries on from that point instead of starting cold. Docker cannot do this: it has no way to put a running process in an image, short of experimental CRIU checkpointing. In shem a running process is a vCPU state, so it can be a layer.
+Runs the entrypoint at build time until the condition holds, then freezes the container into a state layer. `shem run` resumes from that point instead of starting the process again.
 
 Conditions:
 
@@ -115,9 +115,9 @@ A state layer holds:
 
 Files the guest wrote during `WARM` become an ordinary filesystem layer, with whiteouts for deletions.
 
-**WARM runs on the reference vCPU.** Snapshots are canonical, and the neural vCPU is trace-equivalent to the reference one, so the builder runs `WARM` at about 175 million instructions per second instead of about a thousand, and the snapshot resumes on the model. A test builds a warm image this way and runs it on the neural vCPU. VM images use the same idea: the kernel boots at build time on the CPU, and the image ships the booted state.
+**Program and VM snapshots are built on the reference vCPU.** Their canonical state can resume on either vCPU. Model images instead use `WARM --until=prompt` to save a primed language-model session ([models.md](models.md#sessions-as-layers)).
 
-A warm image takes no arguments or environment at run time, and runs with the memory it was frozen with.
+A warm program image takes no arguments or environment at run time, and runs with the memory it was frozen with.
 
 ### VM images
 
@@ -148,25 +148,16 @@ Layouts in shem's earlier format, with these media types, can still be read:
 
 Layers are tars compressed with zstd, which matters most for state layers: they hold all of a guest's memory, mostly zeros. The booted Linux image is 2 MB, where its RAM alone is 64 MiB. Uncompressed layers, which earlier versions wrote, are still read.
 
-Images in the local store live under `$SHEM_HOME/images/<name>/<tag>`, by default `~/.local/share/shem/images`. Each run unpacks the image's filesystem into a fresh directory and removes it afterwards, like `docker run --rm`.
+Images in the local store live under `$SHEM_HOME/images/<name>/<tag>`, by default `~/.local/share/shem/images`. Program and VM runs unpack a fresh filesystem and remove it afterwards. Model images [cache their unpacked filesystem](models.md#running).
 
 `shem push` and `shem pull` copy images to and from any OCI registry with [ORAS](https://oras.land), which handles any media types, so registries need nothing special; `--plain-http` reaches a registry without TLS, such as a local one. Pushes go by manifest digest, and an image keeps its digest through the round trip. A test pushes a warm image to a registry, pulls it back, and runs it.
 
-Planned: a `application/vnd.shem.weights.v1+safetensors` layer for machine images that carry model weights.
-
 ## Reproducibility
 
-Layers have sorted entries, timestamps of 0 and root ownership, compression is deterministic, and execution is deterministic too: the clock is virtual, the PRNG is seeded and stdin is empty during builds. So building the same Shemfile twice gives the same manifest digest, warm images included. Tests check both. A build cache keyed on those digests, as in BuildKit, is planned.
+Layers have sorted entries, timestamps of 0 and root ownership. Compression is deterministic; guest builds use a virtual clock, a seeded PRNG and empty stdin. With the same resolved base image, source files and build options, builds produce the same manifest digest, warm images included. Pin model revisions and Docker-stage inputs when repeatable builds are required.
 
 ## Copy-on-write
 
-- **Filesystem.** Today each run gets a full copy of the layers. Planned: overlayfs on the host, as Docker uses it.
-- **Guest memory**, from least to most effort:
-  1. **Fork by copying.** What the container does today: `fork` clones the vCPU's state. Full copies cost memory, not speed.
-  2. **Paged state.** Group state rows into pages, give each container a page table, count references, and copy a page only on the first write to a shared one. This is Linux `fork()` and vLLM's block sharing. A thousand containers resumed from one snapshot then share almost all their memory. Each step reads and writes one row per head, so routing those accesses through a page table fits naturally.
-  3. **Diff-only layers.** Every write goes to a known row, so a state layer could store only the rows that changed since its parent.
-
-## Later
-
-- A BuildKit frontend (`# syntax=ghcr.io/shem/shemfile:1`), so `docker buildx build` does the parsing, caching and pushing.
-- How much host process state should a state layer carry before it becomes CRIU by another name?
+- **Filesystems.** Program and VM runs unpack all layers; there is no overlayfs backing.
+- **Reference memory.** `fork` copies the guest's memory.
+- **Neural memory.** The server shares 4 KiB pages between forks and restored snapshots, copying a page on its first write. The dense executor and GPU harness do not share pages ([neural.md](neural.md#density)).

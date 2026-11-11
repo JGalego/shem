@@ -285,12 +285,9 @@ pub const GUEST_DEV: u64 = 0x801;
 pub const STATX_SIZE: usize = 256;
 
 impl Stat {
-    /// A host file's status as the guest sees it, with the guest inode number
-    /// `ino`. Only what the guest controls comes from the host: the type,
-    /// permissions, links, size, and the access and modification times, which
-    /// the host keeps on the virtual clock. The device and block counts are
-    /// fixed or computed, and the change time is the modification time, since
-    /// the host cannot set it, so stat results do not depend on the host.
+    /// Translate host metadata with an assigned guest inode and fixed device
+    /// and block accounting. Use mtime for ctime, which the host cannot set
+    /// to the guest's virtual time.
     pub fn from_metadata(meta: &Metadata, ino: u64) -> Self {
         Self {
             mode: meta.mode(),

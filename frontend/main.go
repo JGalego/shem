@@ -1,15 +1,13 @@
 // shem's BuildKit frontend: `docker build` for Shemfiles.
 //
-//	# syntax=ghcr.io/jgalego/shem/dockerfile:1
+//	# syntax=ghcr.io/jgalego/shem/dockerfile:latest
 //	FROM hf.co/Qwen/Qwen3.5-0.8B
 //	ENTRYPOINT ["shem:generate", "--system", "You are a golem."]
 //	WARM --until=prompt
 //
-// BuildKit runs this frontend for any Dockerfile whose first line names it.
-// It imports the models the Shemfile builds on, transpiles the Shemfile into
-// a Dockerfile (see transpile.go), and has BuildKit's own Dockerfile frontend
-// build that, with the imports as named contexts. The image is for
-// linux/riscv32 unless the build asks for another platform.
+// Imports become named contexts; transpile.go lowers shem instructions to a
+// Dockerfile built by BuildKit's standard frontend. The default platform is
+// linux/riscv32.
 package main
 
 import (
@@ -138,10 +136,8 @@ func readShemfile(ctx context.Context, c client.Client, filename string) ([]byte
 	return ref.ReadFile(ctx, client.ReadRequest{Filename: filename})
 }
 
-// compileLayer compiles the layer `name` in the shem-neural image, on the
-// build platform, and returns a state holding just its files: the weights,
-// their description and the model card. Compiling is deterministic, so the
-// layer is the same from one build to the next.
+// compileLayer builds `name` in shem-neural on the build platform and returns
+// its weights, config and model card as a named context.
 func compileLayer(ctx context.Context, c client.Client, name, neuralImage string, platform ocispecs.Platform) (*pb.Definition, error) {
 	out := path.Join("/out/compiled", name)
 	compiled := llb.Image(neuralImage, llb.Platform(platform), llb.WithMetaResolver(c)).Run(
@@ -159,10 +155,9 @@ func compileLayer(ctx context.Context, c client.Client, name, neuralImage string
 	return def.ToPB(), nil
 }
 
-// importModel runs the importer for `imp` in the shem-neural image, on the
-// build platform, and returns its result, the files it wrote (relative to the
-// model's directory) and the licence the model card declares. A Hugging Face token, for gated models, comes from
-// the build's secret HF_TOKEN, and downloads are cached between builds.
+// importModel runs in shem-neural on the build platform and returns the model
+// files and declared licence. Downloads are cached; gated models use the
+// optional HF_TOKEN build secret.
 func importModel(ctx context.Context, c client.Client, imp Import, neuralImage string, platform ocispecs.Platform) (*pb.Definition, Imported, error) {
 	var model Imported
 	args := []string{"shem-neural-import", imp.Repo, importDir}

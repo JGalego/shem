@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -76,19 +77,12 @@ func TestModelsBecomeOneLayerPerBlock(t *testing.T) {
 func TestManyBlocksShareLayers(t *testing.T) {
 	var files []string
 	for i := range 300 {
-		files = append(files, "blocks/"+strings.Repeat("0", 3-len(itoa(i)))+itoa(i)+"-mlp.safetensors")
+		files = append(files, fmt.Sprintf("blocks/%03d-mlp.safetensors", i))
 	}
 	out := transpile(t, "FROM hf.co/big/model\n", map[string]Imported{"shem-import-0": {Files: files}})
 	if n := strings.Count(out, "COPY"); n > maxModelLayers {
 		t.Errorf("%d layers, more than %d", n, maxModelLayers)
 	}
-}
-
-func itoa(i int) string {
-	if i < 10 {
-		return string(rune('0' + i))
-	}
-	return itoa(i/10) + string(rune('0'+i%10))
 }
 
 func TestWarmPrimesASessionInTheNeuralImage(t *testing.T) {

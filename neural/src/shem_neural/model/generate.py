@@ -4,19 +4,10 @@
     python -m shem_neural.model.generate --system TEXT --warm OUT MODEL_DIR
     python -m shem_neural.model.generate --session DIR MODEL_DIR [PROMPT...]
 
-The prompt is the arguments, or stdin when there are none. The reply streams
-to stdout. Decoding is greedy, so a prompt always gets the same reply.
-
-`--warm` primes a session with the system prompt and saves it: every block's
-state after reading it, which is what `WARM --until=prompt` puts in a state
-layer. `--session` continues a saved session instead of starting afresh.
-
-A session remembers its conversation, so it can take turn after turn: the
-model server keeps one per container for `docker run -i`, `docker exec` and
-`docker commit`.
-
-`--tools DIR` offers the programs in DIR to the model; it calls them, and the
-host runs them exactly on the model's compiled CPU layer (see `tools`).
+The prompt comes from arguments or stdin; greedy decoding streams to stdout.
+`--warm` saves a system-prompt session; `--session` resumes one. The model
+server keeps sessions across turns and saves them for `docker commit`.
+`--tools DIR` offers programs run on the image's compiled CPU (see `tools`).
 """
 
 import argparse

@@ -1,6 +1,5 @@
-/* Multiply two whole numbers of any length exactly, as decimal digits:
- * what a language model cannot do reliably, and a CPU always does.
- * Plain write(2) instead of printf keeps it to a few thousand instructions. */
+/* Multiply unsigned decimal integers of up to MAX_DIGITS digits.
+ * Use write instead of printf to keep the guest instruction count low. */
 #include <string.h>
 #include <unistd.h>
 

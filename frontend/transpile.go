@@ -11,20 +11,9 @@ import (
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 )
 
-// The transpiler turns a Shemfile, Dockerfile syntax with shem's additions,
-// into a Dockerfile the standard frontend builds:
-//
-//   - FROM hf.co/ORG/NAME[:REVISION] becomes FROM scratch, then one COPY per
-//     weights file from the model's import (a named context the frontend
-//     fills by running the importer), so each block is its own layer;
-//   - WARM --until=prompt becomes a stage that runs the model's driver in the
-//     shem-neural image and copies the primed session into /.shem;
-//   - KERNEL becomes the labels a VM image carries;
-//   - COPY --from=shem:NAME copies a compiled layer (a named context the
-//     frontend fills by compiling it), such as shem:rv32im, the RV32IM CPU;
-//   - other stages are Docker stages, built on the build platform.
-//
-// The last stage is the image, built for linux/riscv32.
+// Lower Shemfiles to Dockerfiles: model imports and compiled layers use named
+// contexts, WARM adds a priming stage, and KERNEL becomes config labels.
+// Ordinary Docker stages run on the build platform.
 
 const (
 	hfPrefix       = "hf.co/"

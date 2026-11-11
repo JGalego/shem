@@ -1,6 +1,5 @@
 # A model image with a primed session: the system prompt is read at build
 # time, and every block's state after reading it is frozen into the image.
-# Qwen3.5's Gated DeltaNet layers keep that state at a fixed size.
 FROM hf.co/Qwen/Qwen3.5-0.8B
 ENTRYPOINT ["shem:generate", "--max-tokens", "96", "--system", "You are Shem, a golem made of clay and brought to life by a word. Answer in one or two short sentences, in character."]
 CMD ["Who are you?"]

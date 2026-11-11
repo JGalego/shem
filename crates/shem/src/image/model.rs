@@ -1,15 +1,8 @@
-//! Model images: a language model as layers, and the drivers that run it.
+//! Import language models, group their files into layers and run their drivers.
 //!
-//! `FROM hf.co/ORG/NAME[:REVISION]` imports a Hugging Face checkpoint into
-//! `/model` with the neural package's importer (`shem_neural.model.importers`):
-//! a manifest, `shem.json`, that lists the model's blocks by type, and one
-//! weights file per block. Each weights file becomes its own layer, so images
-//! built on the same model share those blobs in stores and registries.
-//!
-//! An entrypoint that starts with `shem:` names a driver, which the host runs
-//! instead of a guest program, like a shell builtin. `shem:generate` runs a
-//! session of the image's model, with the rest of the entrypoint as its
-//! options and the arguments, or CMD, as the prompt.
+//! `hf.co/ORG/NAME[:REVISION]` bases are imported into `/model` by the neural
+//! package. A `shem:` entrypoint runs a host-side driver rather than a guest
+//! executable. See `docs/models.md`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

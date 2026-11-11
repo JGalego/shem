@@ -1,25 +1,11 @@
-//! VM mode: a whole guest operating system on a vCPU, with the host as the
-//! machine around it.
+//! A mini-rv32ima-compatible no-MMU machine around an RV32IM vCPU.
 //!
-//! The vCPU still implements only RV32IM, as in container mode. Everything
-//! else is the host's, done when the vCPU exits (design rule 1):
+//! The host handles privileged instructions, atomics, traps, a virtual timer,
+//! UART and syscon. Unsupported instructions exit to host emulation; memory
+//! faults outside RAM reach the device handlers.
 //!
-//! - CSR instructions, `mret` and `wfi` exit as illegal instructions, and the
-//!   host carries them out against machine-mode CSRs it keeps;
-//! - `ecall`, `ebreak`, illegal instructions and faults become traps, which the
-//!   host delivers to the guest's trap vector, as hardware would;
-//! - the timer is virtual, and the host raises its interrupt between slices;
-//! - loads and stores outside RAM are device accesses: the host decodes the
-//!   instruction and emulates the device, as KVM leaves MMIO to userspace;
-//! - atomics are emulated, as in container mode.
-//!
-//! The machine is the one mini-rv32ima defines, so its no-MMU Linux images
-//! boot unchanged: RAM at 0x80000000, a 16550 UART at 0x10000000, a CLINT timer
-//! at 0x11000000, and a syscon at 0x11100000 for poweroff and reboot.
-//!
-//! A machine can be frozen and thawed, as a container can: the vCPU's
-//! canonical state, and the host's half of the hardware. So an image can ship a
-//! kernel that has already booted.
+//! Snapshots include canonical vCPU state and host-side device state, so VM
+//! images can resume a booted kernel. See `docs/vm.md`.
 
 use std::collections::VecDeque;
 use std::io::Write;

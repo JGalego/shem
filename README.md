@@ -7,54 +7,41 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Status](https://img.shields.io/badge/status-experimental-orange)](docs/architecture.md#roadmap)
 
-shem treats the host as a hypervisor and a model as the machine. The model supplies a CPU, compiled into its weights, and RAM, which is its recurrent state, as in [Qwenputer](https://divagr.com/blog/qwenputer). The host supplies everything else: system calls, devices, scheduling and storage. Images are built from a [Shemfile](docs/shemfile.md) as OCI images, like Docker images, and can carry a running guest, frozen at build time.
+shem treats the host as a hypervisor and a model as the machine. The model supplies a CPU, compiled into its weights, and RAM, which is its recurrent state, as in [Qwenputer](https://divagr.com/blog/qwenputer). The host supplies everything else: system calls, devices, scheduling and storage. [Shemfiles](docs/shemfile.md) build OCI images that can include a frozen process, a booted kernel or a language-model session.
 
 > 📜 **Why shem?** The name comes from the golem legend: a clay figure comes to life when a *shem*, a slip of paper with words on it, is placed in its mouth. Here the weights are the clay and the program is the shem.
 
 ## What works
 
-Early, but every part of the design exists, from the reference vCPU to a model running guests.
+The project is experimental. Current features:
 
-- **Model images** (`shem build`, `shem run`). `FROM hf.co/Qwen/Qwen3-0.6B` turns a Hugging Face model into an image, one layer per block, described by a model-agnostic manifest of typed blocks: attention, Gated DeltaNet and MLP. `shem run` starts a session with a prompt, and images push to and pull from OCI registries. `docker build` builds them too, through shem's BuildKit frontend. Qwen3-0.6B and Qwen3.5-0.8B, with its Gated DeltaNet layers, match their transformers implementations. Containers of them are live sessions under `docker run -i`, `docker exec` and `docker commit`, on a CPU or a GPU. A model can carry the RV32IM CPU as a compiled layer and call the image's programs as tools, which the host runs exactly on that layer ([docs/models.md](docs/models.md)).
-- **Containers** (`shem run`). The host is the guest's kernel: static RV32 Linux programs run with files from a host directory as their root, processes (`fork`, `execve`, `wait`, pipes, signal handlers), threads, shared file mappings, a real terminal under `shem run`, a virtual clock, and atomics emulated so the vCPU stays RV32IM. C programs linked against musl and a static [🧰 BusyBox](https://busybox.net) run, `sh` pipelines and job control included, and so do `ps`, `df` and `free`, on a `/proc` the host makes up. `--trace` prints each system call.
-- **Images** (`shem build`). A [Shemfile](docs/shemfile.md) becomes a reproducible OCI image. `WARM` freezes a running guest into the image at build time, so `shem run` resumes it where the build left off. `shem push` and `shem pull` move images through OCI registries.
-- **VM mode** (`shem boot`). The host is the machine around a guest kernel, emulating the privileged architecture, a timer, a UART and a syscon: a no-MMU [🐧 Linux](https://kernel.org) 6.8 boots to a shell in two seconds. A VM image can ship Linux already booted, so `shem run` starts at its prompt, on either vCPU ([docs/vm.md](docs/vm.md)).
-- **Kubernetes**. A RuntimeClass runs shem images in Pods ([docs/kubernetes.md](docs/kubernetes.md)).
-- **[🐳 Docker](https://www.docker.com) and [📦 containerd](https://containerd.io)**. `docker run --runtime io.containerd.shem.v1` and `ctr run` run RV32 programs from ordinary OCI images, built with `docker build --platform linux/riscv32`, on shem ([docs/containerd.md](docs/containerd.md)).
-- **The neural vCPU**. An RV32IM CPU compiled into network weights and run with [🔥 PyTorch](https://pytorch.org), one instruction per forward pass, with memory in delta-rule state. It matches the reference vCPU exactly on the official riscv-tests, random programs and a Linux kernel running a shell command, resumes snapshots the reference took, batches every running guest into one forward pass, and shares memory pages between them. On GPUs it is bit-exact against the CPU and runs up to 7.4 million instructions per second across 32,768 guests on an A100, measured with [🤗 Hugging Face Jobs](https://huggingface.co/docs/huggingface_hub/guides/jobs) ([docs/neural.md](docs/neural.md)).
-- **The reference vCPU**. An RV32IM interpreter in [🦀 Rust](https://www.rust-lang.org) that defines correct behaviour for the neural one, passes the official riscv-tests, and runs about 175 million instructions per second.
+- **Model images.** Import Qwen3-0.6B or Qwen3.5-0.8B from Hugging Face, run text-generation sessions on a CPU or GPU, and save primed sessions with `WARM`. Models can call RV32 programs as tools on a compiled CPU layer ([models](docs/models.md)).
+- **Containers.** Run static musl programs and [🧰 BusyBox](https://busybox.net) with a root filesystem, processes, threads, pipes, signals, file mappings and a virtual clock. `shem run` supports host terminals; `--trace` prints system calls.
+- **Images.** Build OCI images with `shem build` or the BuildKit frontend. `WARM` saves guest state at build time; `shem run` resumes it. Push and pull images through OCI registries ([Shemfile](docs/shemfile.md)).
+- **VMs.** Boot no-MMU [🐧 Linux](https://kernel.org) 6.8 with `shem boot`, or resume a booted VM image on either vCPU ([VM mode](docs/vm.md)).
+- **[🐳 Docker](https://www.docker.com), [📦 containerd](https://containerd.io) and Kubernetes.** Run images through `io.containerd.shem.v1`, including live model sessions with `docker exec` and `docker commit` ([containerd](docs/containerd.md), [Kubernetes](docs/kubernetes.md)).
+- **Neural vCPU.** Execute RV32IM instructions with [🔥 PyTorch](https://pytorch.org), one instruction per forward pass. Tests compare it with the reference interpreter. The server batches compatible guests and shares memory pages; GPU benchmarks use [🤗 Hugging Face Jobs](https://huggingface.co/docs/huggingface_hub/guides/jobs) ([design and benchmarks](docs/neural.md)).
+- **Reference vCPU.** A [🦀 Rust](https://www.rust-lang.org) RV32IM interpreter used for differential testing and build-time snapshots. It passes the official riscv-tests, with atomics emulated by the host.
 
 See the [roadmap](docs/architecture.md#roadmap) for what is next.
 
 ## Getting started
 
-Build an image from a language model, run it, and share it through a registry. The base image is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B). You need [🦀 Rust](https://www.rust-lang.org) 1.88 or later and [⚡ uv](https://docs.astral.sh/uv/). Pushing needs [🗄️ ORAS](https://oras.land) and a registry login.
-
-Install shem.
+You need [🦀 Rust](https://www.rust-lang.org) 1.88 or later and [⚡ uv](https://docs.astral.sh/uv/). This example downloads [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B).
 
 ```sh
 cargo install --path crates/shem
-```
-
-Build an image from the model's Shemfile.
-
-```sh
 shem build -t qwen3 examples/qwen3
-```
-
-Run a session with a prompt.
-
-```sh
 shem run qwen3 "What is a golem?"
 ```
 
-Push the image to a registry.
+To share the image, install [🗄️ ORAS](https://oras.land) and log in to your registry:
 
 ```sh
 shem push qwen3 ghcr.io/<you>/qwen3:0.6b
 ```
 
-Run it from the registry anywhere.
+On another machine with shem installed:
 
 ```sh
 shem run ghcr.io/<you>/qwen3:0.6b "Say hi in Portuguese"
@@ -126,13 +113,13 @@ docs/
 
 ### Stack
 
-- [🦀 Rust](https://www.rust-lang.org) for the host: the reference vCPU, the Linux system calls, images, VM mode, the CLI and the containerd shim ([`crates/`](crates/)).
-- [🐍 Python](https://www.python.org) and [🔥 PyTorch](https://pytorch.org) for the neural vCPU: the weight compiler, the network and its server ([`neural/`](neural/)).
-- [⚡ uv](https://docs.astral.sh/uv/) for the Python environment and the GPU jobs.
-- [🐳 Docker](https://www.docker.com) for the guest toolchain image and the ordinary stages of a Shemfile ([`toolchain/`](toolchain/)).
-- [🦎 Zig](https://ziglang.org) to compile guest programs for RV32 against musl.
-- [📦 containerd](https://containerd.io) to run shem containers under Docker and containerd.
-- [🐹 Go](https://go.dev) for the BuildKit frontend, the language BuildKit's frontend API is written in ([`frontend/`](frontend/)).
+- [🦀 Rust](https://www.rust-lang.org) for the host runtime, reference vCPU, CLI and containerd shim ([`crates/`](crates/)).
+- [🐍 Python](https://www.python.org) and [🔥 PyTorch](https://pytorch.org) for the neural vCPU and model runtime ([`neural/`](neural/)).
+- [⚡ uv](https://docs.astral.sh/uv/) for Python environments and GPU jobs.
+- [🐳 Docker](https://www.docker.com) for guest toolchain images and ordinary Shemfile stages ([`toolchain/`](toolchain/)).
+- [🦎 Zig](https://ziglang.org) to compile RV32 guest programs against musl.
+- [📦 containerd](https://containerd.io) for Docker and Kubernetes integration.
+- [🐹 Go](https://go.dev) for the BuildKit frontend ([`frontend/`](frontend/)).
 
 ### Set up
 
@@ -144,31 +131,15 @@ pre-commit install --hook-type pre-commit --hook-type pre-push
 
 ### Check your changes
 
-Format the Rust code.
-
 ```sh
-cargo fmt --all
-```
-
-Lint it.
-
-```sh
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-```
-
-Run the Rust tests.
-
-```sh
 cargo test --workspace
-```
-
-Run the neural vCPU's tests.
-
-```sh
 uv run --project neural pytest neural/tests
+(cd frontend && go vet ./... && go test ./...)
 ```
 
-Check the dependencies' licences and security advisories.
+With [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) installed, check dependency licences and advisories:
 
 ```sh
 cargo deny check
@@ -186,8 +157,6 @@ The slower suites are ignored tests that need inputs built first: guest programs
 | An instruction | The reference vCPU in [`reference.rs`](crates/shem/src/reference.rs), the ISA table in [`isa.py`](neural/src/shem_neural/isa.py), and the network in [`cpu.py`](neural/src/shem_neural/cpu.py) | [`tests/reference.rs`](crates/shem/tests/reference.rs), [`neural/tests`](neural/tests/) and [`tests/neural.rs`](crates/shem/tests/neural.rs) |
 | A vCPU | The `Vcpu` trait in [`vcpu.rs`](crates/shem/src/vcpu.rs), with snapshots in the canonical format | The differential tests in [`tests/neural.rs`](crates/shem/tests/neural.rs) show how |
 
-[docs/architecture.md](docs/architecture.md) explains the design, and its [roadmap](docs/architecture.md#roadmap) lists what is next.
-
 ### Ground rules
 
 - **The reference vCPU defines correct.** The neural vCPU must match it instruction for instruction, and the dense network and the fused executor must match each other. Tests check both.
@@ -197,7 +166,7 @@ The slower suites are ignored tests that need inputs built first: guest programs
 
 ### Release
 
-A release publishes the `shem` and `containerd-shim-shem` crates on crates.io, the `shem-neural` package on PyPI, binaries for Linux (x86_64 and arm64) and macOS (arm64) with build provenance on the GitHub release, the guest toolchain and `shem-neural` runtime images on GHCR with SBOMs and provenance, every example as a shem image on GHCR (`ghcr.io/jgalego/shem/qwen3`, `…/golem`, `…/linux` and so on), and the compiled CPU's weights with a model card on the Hugging Face Hub ([jgalego/shem-rv32im](https://huggingface.co/jgalego/shem-rv32im)), with release notes from the commit messages ([`release.yml`](.github/workflows/release.yml)). CI packages everything on every push, so a release does not fail on packaging.
+The [release workflow](.github/workflows/release.yml) publishes Rust crates, the Python package, Linux and macOS binaries, toolchain and example images on GHCR, and [compiled CPU weights](https://huggingface.co/jgalego/shem-rv32im) on Hugging Face. It generates release notes from commit messages and publishes SBOMs and build provenance. CI dry-runs Rust publication and builds the Python package.
 
 Set the same version in [`Cargo.toml`](Cargo.toml) and [`neural/pyproject.toml`](neural/pyproject.toml).
 

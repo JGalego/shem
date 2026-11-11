@@ -1,10 +1,6 @@
-//! `/proc`: a filesystem the host makes up from the container's state.
+//! Synthetic `/proc` nodes from the process table and virtual clock.
 //!
-//! Nothing is stored. Each open, stat or readlink of a path under `/proc`
-//! looks it up in a snapshot of the container's processes and the virtual
-//! clock, and a file's contents are generated when it is opened, as Linux
-//! generates them when they are read. So `ps`, `uptime`, `free` and `df` work,
-//! and like everything else the guest sees, their output is deterministic.
+//! Nodes are generated on lookup; file contents are captured when opened.
 
 use super::abi::*;
 use super::{EPOCH_NS, NS_PER_SEC};

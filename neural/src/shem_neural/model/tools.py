@@ -1,19 +1,11 @@
-"""Tools: programs a model calls, run exactly on its compiled CPU layer.
+"""Run model tool calls as programs on the image's compiled RV32IM CPU.
 
-A model image can carry compiled layers: blocks whose weights are compiled
-from a specification rather than trained. `COPY --from=shem:rv32im /
-/model/compiled/rv32im/` adds the RV32IM CPU of the neural vCPU, and
-`shem:generate --tools DIR` offers the image's programs in DIR to the model.
-When the model calls one, the host routes the call to the compiled layer: it
-runs the program on a neural vCPU whose weights are that layer's, with the
-host servicing its system calls in the image's root filesystem (`shem run
---vcpu neural`), and hands the output back to the model as the tool's reply.
-Language goes through the model's trained blocks; exact work goes through the
-compiled ones, and the host is the router between them.
+`shem:generate --tools DIR` offers executable files as tools. Calls use
+`shem run --vcpu neural` with the image's compiled weights and root filesystem;
+program output becomes the model's tool reply.
 
-A program's interface is `NAME.json` next to it, as a function's JSON schema
-(`description` and `parameters`), whose parameters become the program's
-arguments in order; or, by default, an `args` list and `stdin`.
+`NAME.json` supplies a function schema whose parameters become arguments in
+order. Without it, the interface is an `args` list and `stdin`.
 """
 
 import json

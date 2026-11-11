@@ -22,7 +22,7 @@ Linux riscv32
 
 ## The host is the machine
 
-In container mode the host is the guest's kernel. In VM mode it is the hardware around the guest's own kernel ([`vm.rs`](../crates/shem/src/vm.rs)). The vCPU is the same RV32IM vCPU either way; everything else is the host's, done when the vCPU exits, which is design rule 1 in [architecture.md](architecture.md) taken to its end:
+In container mode the host implements the guest's system calls. In VM mode it emulates the hardware around the guest's kernel ([`vm.rs`](../crates/shem/src/vm.rs)). Both modes use an RV32IM vCPU:
 
 | The guest does | The vCPU | The host |
 |---|---|---|

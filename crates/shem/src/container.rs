@@ -1,14 +1,9 @@
-//! Container mode: a set of guest processes, each on its own vCPU, with the host
-//! as their kernel.
+//! Container scheduling and process lifecycle.
 //!
-//! The scheduler runs each runnable thread for a slice of instructions in
-//! turn, which is all the preemption a guest needs (design rule 3). A thread
-//! whose system call cannot finish yet, such as a read from an empty pipe, is
-//! parked with its pc still on the `ecall`, and the call is retried on its next
-//! turn. `fork` copies the vCPU (design rule 4). The threads of a process share
-//! its vCPU, and so its memory: each keeps its registers aside while another
-//! runs, so threads work on any vCPU. The container ends when its first
-//! process, init, exits.
+//! Each process owns a vCPU; its threads share memory and swap register sets.
+//! Runnable threads get instruction slices. A blocked system call keeps its pc
+//! on the `ecall` for retry on the next turn. `fork` clones vCPU state, and
+//! the container ends when init exits.
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap};

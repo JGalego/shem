@@ -1,7 +1,4 @@
-# A model that calls programs. Qwen3-0.6B does the language; the RV32IM CPU,
-# compiled into a layer of its own, does the arithmetic. When the model calls
-# mul, the host runs the program exactly on that compiled layer and hands the
-# answer back to the model.
+# A model with an arithmetic tool running on a compiled RV32IM layer.
 FROM --platform=$BUILDPLATFORM alpine:3.22 AS tools
 RUN apk add --no-cache zig
 WORKDIR /src

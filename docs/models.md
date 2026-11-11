@@ -1,6 +1,6 @@
 # Model images
 
-A model image is a language model packaged the way a container image packages a filesystem: the model is the base image, its blocks are layers, and `shem run` starts a session of it the way `docker run` starts a container. Images push to and pull from any OCI registry.
+A model image packages a language model's weights, tokenizer and optional session state in OCI layers. `shem run` starts or resumes a text-generation session; `shem push` and `shem pull` transfer the image through a registry.
 
 ```sh
 shem build -t qwen3 examples/qwen3          # Qwen3-0.6B from Hugging Face, one layer per block
@@ -28,7 +28,7 @@ ENTRYPOINT and CMD keep their Docker meanings: the entrypoint is what runs, and 
 | A program (`FROM scratch`) | A program in the image, run on the vCPU | Its default arguments | Replace the arguments |
 | A model | A driver: `["shem:generate", "--max-tokens", "128"]` | The default prompt | Your prompt |
 
-A `shem:` entrypoint names a driver, which the host runs, like a shell builtin; the prefix keeps it from ever being mistaken for a file in the image. `shem:generate` options: `--max-tokens N` (default 256) and `--system TEXT`. Decoding is greedy, so a prompt always gets the same reply.
+A `shem:` entrypoint names a host-side driver rather than a guest executable. `shem:generate` options include `--max-tokens N` (default 256) and `--system TEXT`. Decoding is greedy; results are repeatable for the same model, session, prompt and device.
 
 ## Sessions as layers
 
@@ -43,7 +43,7 @@ WARM --until=prompt
 
 The builder runs the model over the conversation up to where the user's prompt goes, here the system prompt, and saves every block's state in the image's state layer: the attention layers' key and value caches, and the Gated DeltaNet layers' convolution inputs and memory matrices. `shem run` continues that session, so the system prompt is never read again, and the reply is exactly what an unprimed session would give; a test checks this for both models.
 
-What the state costs depends on the blocks. After the same 27-token prompt, Qwen3-0.6B's attention caches take 6 MB and grow with every token, while Qwen3.5-0.8B's state takes 20 MB, almost all of it Gated DeltaNet memories, and stays that size however long the session runs. A long document read at build time is where the fixed size pays off.
+Attention caches grow with the token count. Gated DeltaNet's convolution state and memory matrices are fixed-size. Qwen3.5 combines both block types, so its total session state still grows with its attention caches.
 
 The session is saved as `session.safetensors`, every block's state by block number and name, and `session.json`, the tokens it has read. `shem run` unpacks them into `/.shem`, which is also where `shem save` puts them for `docker load`.
 
@@ -123,7 +123,7 @@ shem: ran mul 123456789 987654321 on the compiled RV32IM layer, 2,881 instructio
 
 - `COPY --from=shem:rv32im` copies a layer shem compiles from the instruction set at build time, with `shem build` and `docker build` alike: the weights, a `config.json` that describes the machine, and a model card. Compiling is deterministic, so every build carries the same weights, and the release publishes them ([jgalego/shem-rv32im](https://huggingface.co/jgalego/shem-rv32im)).
 - `--tools DIR` offers the image's programs in `DIR` to the model, through the chat template's own tool format. A program's interface is `NAME.json` beside it (a function's `description` and `parameters`, which become its arguments in order), or by default a list of `args` and `stdin`.
-- When the model calls a tool, the host routes the call to the compiled layer: it runs the program with `shem run --vcpu neural`, on a neural vCPU whose weights are the image's layer and whose system calls the host services in the image's filesystem, and hands the output back to the model as the tool's reply, up to four times a turn. Language goes through the model's trained blocks and exact work through its compiled ones; the host is the router between them.
+- Tool calls run the program with `shem run --vcpu neural`, using the image's compiled weights and root filesystem. The host returns the program's output as the tool reply. The CPU runs separately from the language model; it does not read or write the model's residual stream.
 - The model must be one that calls tools: Qwen3-0.6B does, where Qwen3.5-0.8B answers the multiplication itself, and gets it wrong. Tool calls are read in either format templates ask for, JSON or `<function=...>` tags.
 
 A test builds the example and checks the exact products of 9- and 11-digit numbers, through `shem run` and `docker run`. A 23-digit product takes the neural vCPU 9,794 instructions, about 10 seconds; the reply is the 45-digit answer, exact.

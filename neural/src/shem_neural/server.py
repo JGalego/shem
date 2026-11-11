@@ -1,18 +1,11 @@
-"""Serve neural vCPUs to the shem host over a Unix socket.
+"""Serve neural vCPUs and model sessions over a Unix socket.
 
-The protocol is the `Vcpu` interface as requests, KVM-style: create a vCPU, run
-it until it exits, read and write its registers and memory, and fork it by
-cloning. `GENERATE` runs a session of a model image's model, streaming the
-reply back, and keeps loaded models for the next session.
+vCPUs run on the CPU, sharing pages by memory size and batching runs by CPU
+weights and memory size. Model sessions stream replies and cache loaded weights
+on the selected model device.
 
-vCPUs share memory pages, by memory size, so forks and guests resumed from the
-same snapshot share what they have not written. Runs from different clients
-are batched: one executor thread steps every vCPU with a `RUN` in flight in the
-same forward pass, and guests join and leave the batch between steps.
-
-Every message is a frame: a little-endian u32 length, then the payload. A
-request payload is an op byte and its arguments; a response payload is a
-status byte (see `Status`) and the result. `docs/neural.md` lists the ops.
+Frames are a little-endian u32 length followed by a payload. Requests start
+with an op byte, responses with a `Status` byte. See `docs/neural.md`.
 
     uv run python -m shem_neural.server --socket /tmp/shem-neural.sock
 """
@@ -191,13 +184,10 @@ class Job:
 
 
 class Batcher:
-    """Steps every vCPU with a `RUN` in flight in one batch: continuous batching.
+    """Batch compatible `RUN` requests on one executor thread.
 
-    The executor thread stacks the running vCPUs' states into one batch and
-    steps it. A guest that exits, or runs out of budget, stops committing and
-    gets its result; when a new run arrives, the batch is unstacked and rebuilt
-    with it. The network computes every guest the same way whatever it runs, so
-    a batch of unrelated guests costs about as much per step as one guest.
+    Exited or budget-exhausted guests stop committing. New arrivals trigger
+    unstacking and rebuilding the batch between steps.
     """
 
     def __init__(self, lock: threading.RLock):

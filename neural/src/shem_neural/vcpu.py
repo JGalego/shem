@@ -1,9 +1,6 @@
-"""The neural vCPU behind the interface the shem host drives (`Vcpu` in
-`crates/shem/src/vcpu.rs`): run until an exit, read and write registers and
-memory, reset, and snapshot or restore in the canonical machine-state format.
+"""Host-facing neural vCPU, snapshot-compatible with the Rust `Vcpu` interface.
 
-Register and memory access touch the state tensors directly, the way the
-architecture has the host read and write DeltaNet rows without decoding tokens.
+Host register and memory access bypass the instruction loop.
 """
 
 import struct

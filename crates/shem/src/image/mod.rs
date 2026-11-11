@@ -1,17 +1,10 @@
-//! Images: a guest filesystem as OCI layers, the configuration to run it, and,
-//! for a warm image, the frozen state of a container started from it. A VM
-//! image names a kernel in its filesystem instead, and its warm state is a
-//! frozen machine that has booted it.
+//! Images in an [OCI image layout], with a guest filesystem, runtime config and optional
+//! frozen process, VM or model-session state.
 //!
-//! An image is stored as a standard [OCI image layout] for `linux/riscv32`, so
-//! registries, Docker and containerd treat it like any other image: shem's own
-//! settings are labels (`dev.shem.*`), and a warm image's state is an ordinary
-//! last layer whose files are all under `/.shem`. In memory, that layer is a
-//! `STATE_TYPE` layer of the files alone. Layouts in shem's earlier format,
-//! with its own config and state media types, can still be read.
-//! Builds are reproducible: layers have sorted entries, fixed timestamps and
-//! root ownership, and execution is deterministic, so building the same
-//! Shemfile twice gives the same digest. See `docs/shemfile.md`.
+//! Layouts use `linux/riscv32`, `dev.shem.*` config labels and a final state
+//! layer under `/.shem`. In memory, state files use a [`STATE_TYPE`] layer
+//! without that directory prefix. Legacy config and state media types remain
+//! readable. See `docs/shemfile.md` for the format and build rules.
 //!
 //! [OCI image layout]: https://github.com/opencontainers/image-spec/blob/main/image-layout.md
 

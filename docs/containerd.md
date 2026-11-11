@@ -1,6 +1,6 @@
 # containerd
 
-`containerd-shim-shem-v1` ([`crates/containerd-shim-shem`](../crates/containerd-shim-shem/)) is a containerd runtime shim. With it, containerd, and Docker on top of it, run containers on shem: the image is an ordinary OCI image, and its entrypoint, a static RV32 Linux executable, runs on a shem vCPU instead of the host CPU. This is the pattern runwasi uses to run WebAssembly.
+`containerd-shim-shem-v1` ([`crates/containerd-shim-shem`](../crates/containerd-shim-shem/)) runs static RV32 Linux executables from OCI images on a shem vCPU. Docker and Kubernetes reach it through containerd. Model images use the same shim with a host-side session driver ([models.md](models.md#sessions-under-docker)).
 
 ## With Docker
 
@@ -39,7 +39,7 @@ containerd finds the shim by name on its `PATH`, so installing the binary is the
 containerd starts the shim and calls its task service over ttrpc. The shim:
 
 1. **create**: mounts the image's root filesystem, which containerd's snapshotter prepared, into the bundle;
-2. **start**: reads the bundle's `config.json` (the OCI runtime spec) for the process's arguments, environment and working directory, and the memory limit, which becomes the guest's memory (64 MiB if none is set), then runs the process as a shem container on the reference vCPU, with its standard streams on containerd's FIFOs;
+2. **start**: reads the bundle's `config.json` (the OCI runtime spec) for the process's arguments, environment and working directory, and the memory limit, which becomes the guest's memory (64 MiB if none is set), then runs the process on the selected vCPU, with its standard streams on containerd's FIFOs;
 3. **wait**, **state**: report the exit status when the container's init exits; the shim also publishes the task's create, start, exit and delete events to containerd, which is how Docker learns that a container has exited;
 4. **kill**: stops the guest at the next slice of instructions, with the status a shell reports for the signal;
 5. **delete**: unmounts the root filesystem.

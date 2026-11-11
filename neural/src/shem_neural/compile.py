@@ -1,9 +1,6 @@
-"""The weight compiler: turn the ISA description into the network's tensors.
+"""Compile the RV32IM ISA table into lookup and routing weights.
 
-Nothing here is learned. Each tensor is a lookup or routing table derived from
-`isa.INSTRUCTIONS`, and `cpu.NeuralCpu` uses them as the weights of its linear
-layers. `compile_weights` builds them, and `save` and `load` store them as
-safetensors, the format a shem machine image carries weights in.
+Each tensor is derived from `isa.INSTRUCTIONS`; nothing is trained.
 """
 
 from pathlib import Path

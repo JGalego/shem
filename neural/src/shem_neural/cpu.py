@@ -1,31 +1,16 @@
-"""The network: one forward pass executes one instruction for every guest in
-the batch.
+"""RV32IM network: one forward pass executes one instruction per guest.
 
-It is built only from operations a compiled transformer uses: products with
-the compiled weight tensors (linear layers and one-hot attention reads),
-element-wise sums and products (gating), and clamps, which are
-piecewise-linear like ReLU. There is no data-dependent control flow in the
-arithmetic. Every unit computes its result for every guest, and the decoded
-instruction selects one, so guests running different instructions cost the
-same as guests running the same one. That is what lets one batch carry many
-unrelated guests.
+The dense executor uses compiled linear maps, one-hot attention, gating and
+clamps. Registers hold bit vectors and memory holds bytes; arithmetic uses
+integer values represented exactly in float64. `decompose` converts values
+back to bits through threshold layers.
 
-Values are integers held exactly in float64. A 32-bit word is stored as bits
-in registers and as four bytes in memory. Arithmetic is done on integer
-values (linear in the bits) and turned back into bits by a stack of threshold
-layers, `decompose`.
+The fused executor replaces those layers with equivalent indexing and integer
+operations. It skips multiply/divide units when no guest needs them, unless
+`static` is set for graph capture.
 
-The register file and memory are delta-rule states with one-hot keys (see
-`memory.py`). Every write is gated by `commit`, which is 0 when the
-instruction exits to the host, so an exiting instruction changes nothing,
-matching the reference vCPU.
-
-Like memory, the deepest units have two executors. The dense one is the
-network as described. The fused one computes the same function with integer
-and indexing operations: bit decomposition by shifts instead of 35 threshold
-layers, table lookups by index instead of one-hot products, and division by
-integer division instead of 32 unrolled layers. Tests check that the two agree
-unit by unit and over whole programs; the fused one is several times faster.
+Register and memory writes use the delta rule, gated by `commit`. An exiting
+instruction commits no state changes, matching the reference vCPU.
 """
 
 from dataclasses import dataclass

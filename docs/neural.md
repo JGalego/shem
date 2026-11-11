@@ -15,7 +15,8 @@ It follows the idea behind [Qwenputer](https://divagr.com/blog/qwenputer), compi
 | `imm_bits` | 5 × 32 × 32 | Selection matrices from instruction bits to immediate bits, one per format, sign extension included |
 | `format_route`, `result_route`, `next_pc_route`, `branch_route`, `exit_route` | 48 × n | Routing tables: which format, result, next pc, comparison and exit each instruction uses |
 | `uses_imm`, `load_size`, `store_size` | 48 | Per-instruction flags and sizes |
-| `sll`, `srl`, `sra_fill` | 32 × 32 × 32 | One shift matrix per shift amount; the shifter is attention over them |
+| `sll`, `srl` | 32 × 32 × 32 | One shift matrix per shift amount; the shifter is attention over them |
+| `sra_fill` | 32 × 32 | Sign-bit fill for each arithmetic-right-shift amount |
 | `byte_bits`, `powers` | 256 × 8, 32 | Byte-to-bits lookup table, and the weights that turn bits into a value |
 
 The weights can be saved as safetensors, the format a machine image carries them in (see [shemfile.md](shemfile.md)).
@@ -44,11 +45,11 @@ Both the register file and memory are written with the delta rule, `S ← S + β
 6. **Routing.** The instruction one-hot times the routing tables picks the result for `rd`, the comparison that decides a branch, and the next pc.
 7. **Writeback.** Delta-rule writes to the register file and memory, and the pc update, all gated by `commit`, which is 0 when the instruction exits. An exiting instruction therefore changes nothing, as on the reference vCPU.
 
-There is no data-dependent control flow in the arithmetic: the decoded instruction selects among results that were all computed. So guests running different instructions cost the same as guests running the same one, which is what lets one batch carry unrelated guests (design rule 2 in [architecture.md](architecture.md)). A test runs three different programs as one batch and checks that each ends exactly as it does alone.
+Decoded instructions route results independently for each guest, so a batch can run unrelated programs without a separate host instruction handler for each. A test runs three different programs in one batch and checks that each ends in the same state as a separate run.
 
 ## The operations it uses
 
-Only operations a compiled transformer has: products with the compiled weights (linear layers and one-hot attention), element-wise sums and products (gating, as in gated MLPs), and clamps, which are piecewise-linear like ReLU. State changes only through gated delta-rule writes.
+The dense executor uses products with compiled weights (linear layers and one-hot attention), element-wise sums and products (gating), and clamps, which are piecewise-linear like ReLU. State changes only through gated delta-rule writes.
 
 Values are integers held exactly in float64. Qwenputer runs in bf16, which forces arithmetic on small values; float64 lets a 32-bit word be one exact value, which keeps the network simple. A bf16 version would work on bytes instead of words.
 
@@ -94,11 +95,11 @@ Two things let one executor hold and run many guests.
 
 A test clones a vCPU 20 times and restores its snapshot into 20 more, and the pool holds no extra pages.
 
-**Continuous batching** ([`server.py`](../neural/src/shem_neural/server.py)). One executor thread steps every vCPU with a `RUN` in flight in the same forward pass. Their states stack cheaply, since registers and page tables are small and pages stay in the pool. A guest that exits or runs out of budget stops committing and gets its result; when another `RUN` arrives, the batch is rebuilt to include it. So independent containers, for example several `shem run --vcpu neural` processes, share forward passes without knowing about each other. A test runs six clients concurrently and checks every result, and that they shared a batch.
+**Continuous batching** ([`server.py`](../neural/src/shem_neural/server.py)). One executor thread groups vCPUs with a `RUN` in flight by CPU weights and memory size, then steps each group in one forward pass. Registers and page tables are stacked; memory pages stay in the pool. A guest that exits or runs out of budget stops committing and gets its result. New runs join between steps. A test runs six clients concurrently and checks their results and that they shared a batch.
 
 ## Speed
 
-On one CPU core, the fused executor runs about 900 instructions per second for one guest. That is the same order as Qwenputer's published speed on a GPU. A forward pass is a few hundred small tensor operations, so the time goes to per-operation overhead rather than arithmetic, and a batch of guests costs little more per step than one. [`bench.py`](../neural/bench.py), with every guest running a different loop:
+Recorded CPU results from [`bench.py`](../neural/bench.py), using one core and a sum loop with a different bound for each guest:
 
 | Guests | Instructions/s, total | Per guest | Memory pages |
 |---|---|---|---|
@@ -108,7 +109,7 @@ On one CPU core, the fused executor runs about 900 instructions per second for o
 | 64 | 27,985 | 437 | 65 |
 | 128 | 29,318 | 229 | 129 |
 
-Throughput grows almost linearly to 32 guests and keeps growing to 64, where one core runs 32 times as many instructions per second as with a single guest. This is design rule 2 measured: diverging guests do not slow each other down. The pages column counts the pool, the zero page included: each guest here holds one private page, 4 KiB, where a float64 delta-rule state for 1 MiB of memory would take 8 MiB.
+At 64 guests, aggregate throughput is about 32 times the single-guest result, but per-guest throughput has fallen from 881 to 437 instructions/s. Batching improves throughput, not individual guest latency. The pages column includes the shared zero page and one private 4 KiB page per guest; a dense float64 state for 1 MiB of guest RAM takes 8 MiB.
 
 ## The protocol
 

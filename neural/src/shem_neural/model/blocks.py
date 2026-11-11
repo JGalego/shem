@@ -1,23 +1,14 @@
-"""Block types, registered by name, and the model they make up.
+"""Residual blocks and model loading.
 
-Every block reads the residual stream and adds its output to it, with its own
-pre-norm. A block that remembers anything keeps it in a state the caller
-owns, one per block per session: the host's to inspect, snapshot and restore.
+Blocks use pre-norm and add their output to the residual stream. State is
+caller-owned, one entry per block per session:
 
-- `attention`: grouped-query attention with rotary positions on all or part
-  of each head, optional RMSNorm on queries and keys, and an optional sigmoid
-  gate on its output. Its state is the key and value cache.
-- `gated_deltanet`: the Gated DeltaNet token mixer, a causal depthwise
-  convolution and then a per-head matrix memory written with the gated delta
-  rule. Its state is the convolution's last inputs and the memory matrices,
-  a fixed size however long the session.
-- `mlp`: a SwiGLU feed-forward block, with no state.
+- `attention`: key/value caches, growing with the token count.
+- `gated_deltanet`: fixed-size convolution history and matrix memory.
+- `mlp`: stateless SwiGLU.
 
-RMSNorms take an `offset` added to their weights: 0 for the usual norm, 1
-for zero-centred weights. Weights load in their stored type and compute in
-`dtype`, float32 by default, on the CPU or a GPU (`device`, where `auto`
-picks a GPU if there is one). TF32 is off on GPUs, so a prompt gets the same
-reply each time on the same device.
+RMSNorm's weight offset is 0 for ordinary weights and 1 for zero-centred
+weights. Computation defaults to float32; CUDA execution disables TF32.
 """
 
 from pathlib import Path

@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from shem_neural.memory import PAGE_SIZE, ZERO_PAGE, DeltaMemory, FlatMemory, PagedMemory, PagePool
@@ -44,6 +45,19 @@ def test_clones_share_pages_until_written():
     child.release()
     parent.release()
     assert pool.in_use == 1, "every page went back to the pool"
+
+
+@pytest.mark.parametrize("memory_type", [DeltaMemory, PagedMemory, FlatMemory])
+def test_clones_keep_independent_contents(memory_type):
+    parent = memory_type(1, PAGE_SIZE)
+    parent.set_bytes(0, 100, b"parent")
+    child = parent.clone()
+    assert child.get_bytes(0, 100, 6) == b"parent"
+    child.set_bytes(0, 100, b"child!")
+    assert parent.get_bytes(0, 100, 6) == b"parent"
+    assert child.get_bytes(0, 100, 6) == b"child!"
+    child.release()
+    parent.release()
 
 
 def test_restored_pages_are_interned_by_content():

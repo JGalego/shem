@@ -1,5 +1,5 @@
 # shem's BuildKit frontend, which `docker build` runs for a Shemfile whose
-# first line is `# syntax=ghcr.io/jgalego/shem/dockerfile:1`.
+# first line is `# syntax=ghcr.io/jgalego/shem/dockerfile:latest`.
 #   docker build -t shem-dockerfile frontend
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETOS TARGETARCH VERSION=latest

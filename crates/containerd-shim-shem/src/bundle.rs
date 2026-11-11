@@ -1,19 +1,8 @@
-//! OCI runtime bundles: what containerd hands a shim to run.
+//! Load OCI runtime bundles and run their processes on shem.
 //!
-//! A bundle is a directory holding `config.json`, the [runtime spec], and the
-//! container's root filesystem. This module reads the parts shem uses (the
-//! process's arguments, environment and working directory, the root, the
-//! memory limit, and annotations that choose the vCPU) and runs the process as
-//! a shem container.
-//!
-//! The annotation `dev.shem.vcpu=neural` runs the container inside the model,
-//! on a neural vCPU server (`python -m shem_neural.server`) at the socket that
-//! `dev.shem.neural-socket` names, by default `/tmp/shem-neural.sock`.
-//!
-//! A model image's command starts with a driver, `shem:generate`, rather
-//! than a program. The shim hands it to the same server, which loads the
-//! model from the container's root filesystem, keeps it for the next
-//! container, and streams the reply to the container's stdout.
+//! `config.json` supplies the [runtime spec]. `dev.shem.vcpu=neural` selects
+//! the neural server, with `dev.shem.neural-socket` overriding its socket.
+//! Commands starting with `shem:` use the model-session driver instead.
 //!
 //! [runtime spec]: https://github.com/opencontainers/runtime-spec/blob/main/config.md
 

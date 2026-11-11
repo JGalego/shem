@@ -1,29 +1,15 @@
-"""Guest RAM, in two forms that compute the same thing.
+"""Guest RAM with dense, paged and flat backing.
 
-`DeltaMemory` is memory as a model holds it: a delta-rule state matrix with one
-row per byte. Writing value `v` with a one-hot key `k` and gate `beta` is the
-delta rule, `S <- S + beta (v - S k) k^T`, which replaces the keyed row exactly
-when beta is 1 and leaves it alone when beta is 0. Reading with a one-hot query
-`q` is `S q`, which returns the row. This is how Gated DeltaNet layers hold
-memory in Qwenputer. The dense executor uses it as is.
+`DeltaMemory` holds float64 bytes in delta-rule state:
+`S <- S + beta (v - S k) k^T`. One-hot keys select a byte; beta 1 replaces it
+and beta 0 leaves it unchanged.
 
-`PagedMemory` is what the fused executor uses: the same rows, stored as bytes in
-4 KiB pages from a `PagePool` shared by every guest, with a page table per
-guest. A gated write with beta 1 is a store and beta 0 is nothing, exactly as
-in the delta rule, but pages make guests cheap to hold:
+`PagedMemory` uses shared 4 KiB pages with copy-on-write. Fresh memory maps the
+zero page; whole pages written by the host are interned by content, allowing
+restored snapshots to share pages.
 
-- a fresh guest maps the zero page everywhere, so untouched memory is free;
-- `clone`, for `fork`, copies the page table, and a shared page is copied only
-  when one of its holders first writes to it (copy-on-write);
-- whole pages written by the host, such as a snapshot being restored, are
-  interned by content, so guests resumed from the same snapshot share them,
-  like Linux's KSM.
-
-`FlatMemory` is for GPUs: each guest's bytes in their own row on the device,
-with no sharing and no host-side bookkeeping, so a whole step can be compiled
-into a few kernels.
-
-Tests check that the forms give identical runs.
+`FlatMemory` holds a byte array per guest on the device, without page sharing
+or host bookkeeping, for GPU compilation and graph capture.
 """
 
 import hashlib
@@ -37,9 +23,8 @@ ZERO_PAGE = 0
 
 
 class DeltaMemory:
-    def __init__(self, batch: int, size: int, dense: bool = True):
+    def __init__(self, batch: int, size: int):
         self.size = size
-        self.dense = dense
         self.state = torch.zeros(batch, size, dtype=DTYPE)
 
     def _key(self, addr: torch.Tensor) -> torch.Tensor:
@@ -70,7 +55,7 @@ class DeltaMemory:
         self.state[row, addr : addr + len(data)] = torch.tensor(list(data), dtype=DTYPE)
 
     def clone(self) -> "DeltaMemory":
-        copy = DeltaMemory(self.state.shape[0], self.size, self.dense)
+        copy = DeltaMemory(self.state.shape[0], self.size)
         copy.state = self.state.clone()
         return copy
 
@@ -85,14 +70,13 @@ class FlatMemory:
 
     def __init__(self, batch: int, size: int, device: torch.device | str = "cpu"):
         self.size = size
-        self.dense = False
         self.bytes = torch.zeros(batch, size + 1, dtype=torch.uint8, device=device)
 
     @classmethod
     def of(cls, data: torch.Tensor) -> "FlatMemory":
         """A view of existing (B, size + 1) bytes, which writes update in place."""
         memory = cls.__new__(cls)
-        memory.size, memory.dense, memory.bytes = data.shape[1] - 1, False, data
+        memory.size, memory.bytes = data.shape[1] - 1, data
         return memory
 
     def _keys(self, addr: torch.Tensor, count: int) -> torch.Tensor:
@@ -194,7 +178,6 @@ class PagedMemory:
         if size % PAGE_SIZE:
             raise ValueError(f"memory size must be a multiple of {PAGE_SIZE} bytes")
         self.size = size
-        self.dense = False
         self.pool = pool or PagePool()
         self.table = torch.full((batch, size // PAGE_SIZE), ZERO_PAGE, dtype=torch.long)
 
@@ -251,7 +234,7 @@ class PagedMemory:
     def clone(self) -> "PagedMemory":
         """A copy that shares every page until one side writes it."""
         copy = PagedMemory.__new__(PagedMemory)
-        copy.size, copy.dense, copy.pool = self.size, False, self.pool
+        copy.size, copy.pool = self.size, self.pool
         copy.table = self.table.clone()
         for page in self.table.flatten().tolist():
             self.pool.incref(page)
@@ -268,6 +251,6 @@ class PagedMemory:
         """One memory for a batch, taking over the guests' page tables."""
         batch = PagedMemory.__new__(PagedMemory)
         first = memories[0]
-        batch.size, batch.dense, batch.pool = first.size, False, first.pool
+        batch.size, batch.pool = first.size, first.pool
         batch.table = torch.cat([m.table for m in memories])
         return batch

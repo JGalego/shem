@@ -1,9 +1,4 @@
-"""Text in and out: the model's tokenizer, and its chat template.
-
-The chat template is the model's own Jinja template, rendered the way
-transformers renders it, so a session is formatted exactly as the model was
-trained to see it.
-"""
+"""Render checkpoint chat templates and encode or decode their tokens."""
 
 import json
 from datetime import datetime

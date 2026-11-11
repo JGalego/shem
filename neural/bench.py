@@ -24,7 +24,7 @@ def main() -> None:
     torch.set_num_threads(1)
     cpu = NeuralCpu(compile_weights())
     pool = PagePool()
-    # Each guest sums to a different n, so they run different instruction streams.
+    # Each guest uses a different loop bound.
     print(f"{'guests':>6} {'instr/s total':>14} {'instr/s per guest':>18} {'pages':>6}")
     for batch in (1, 2, 4, 8, 16, 32, 64, 128):
         state = State.zeros(batch, MEM, pool=pool)

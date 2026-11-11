@@ -1,14 +1,8 @@
-//! Model sessions in containers: the shim's side of the model server's
-//! session protocol (`shem_neural.server`).
+//! The shim's client for model sessions on `shem_neural.server`.
 //!
-//! A model container's main process is a live session on the model server,
-//! under the container's ID. It answers the command line's prompt, then each
-//! line of stdin as a turn (`docker run -i`; with `-t` the shim echoes what
-//! is typed and handles backspace, since the guest has no terminal), and with
-//! `--keep` stays open until the container stops. `docker exec c
-//! shem:generate TEXT` is another turn of the same session, and `docker
-//! commit` pauses the container, which saves the session, conversation and
-//! every block's state, into `/.shem`, where the committed image resumes it.
+//! Sessions are keyed by container ID. Stdin lines and `docker exec` add turns;
+//! pausing for `docker commit` saves the conversation and block state under
+//! `/.shem`. Terminal echo is handled here because there is no guest terminal.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

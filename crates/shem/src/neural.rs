@@ -1,8 +1,7 @@
 //! A vCPU run by the neural executor (`neural/`), reached over a Unix socket.
 //!
-//! Each [`Vcpu`] call is one request, KVM-style. Cloning a `NeuralVcpu` asks the
-//! server to copy the vCPU's state, which is how `fork` works on a model
-//! (design rule 4). See `docs/neural.md` for the protocol.
+//! Each [`Vcpu`] call is a request; cloning asks the server to clone vCPU state.
+//! See `docs/neural.md` for the protocol.
 //!
 //! The `Vcpu` trait has no room for transport errors, so a broken connection to
 //! the server panics with the reason.
