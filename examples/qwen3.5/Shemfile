@@ -1,0 +1,5 @@
+# Qwen3.5-0.8B as an image: three Gated DeltaNet layers to every attention
+# layer, each block its own image layer.
+FROM hf.co/Qwen/Qwen3.5-0.8B
+ENTRYPOINT ["shem:generate", "--max-tokens", "128"]
+CMD ["Introduce yourself in one sentence."]

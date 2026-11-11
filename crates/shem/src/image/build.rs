@@ -15,7 +15,7 @@ use std::process::Command;
 use anyhow::{Context, bail};
 
 use super::shemfile::{self, Instruction, Stage, Until};
-use super::{Config, Image, Layer, ROOTFS_TYPE, STATE_TYPE, find_program, layer};
+use super::{Config, Image, Layer, ROOTFS_TYPE, STATE_TYPE, find_program, layer, model};
 use crate::container::{Container, Frozen, Pause, Stop};
 use crate::linux::{RootFs, Stdio};
 use crate::reference::ReferenceVcpu;
@@ -65,15 +65,26 @@ pub fn build(options: &BuildOptions) -> anyhow::Result<Image> {
     Ok(builder.image)
 }
 
-/// The base a shem stage starts from: nothing, or an image's layout directory.
+/// The base a shem stage starts from: nothing, an image's layout directory,
+/// or a Hugging Face model.
 enum Base {
     Scratch,
     Image(PathBuf),
+    Model {
+        repo: String,
+        revision: Option<String>,
+    },
 }
 
 fn shem_base(stage: &Stage, context: &Path) -> Option<Base> {
     if stage.from == "scratch" {
         return Some(Base::Scratch);
+    }
+    if let Some((repo, revision)) = model::hf_reference(&stage.from) {
+        return Some(Base::Model {
+            repo: repo.into(),
+            revision: revision.map(String::from),
+        });
     }
     let dir = context.join(&stage.from);
     dir.join("oci-layout").is_file().then_some(Base::Image(dir))
@@ -99,6 +110,22 @@ impl Builder<'_> {
                     machine: "rv32im".into(),
                     ..Config::default()
                 };
+            }
+            Base::Model { repo, revision } => {
+                self.image.config = Config {
+                    machine: "rv32im".into(),
+                    entrypoint: vec!["shem:generate".into()],
+                    model: Some(format!("/{}", model::MODEL_DIR)),
+                    ..Config::default()
+                };
+                model::import(
+                    &repo,
+                    revision.as_deref(),
+                    &self.root.join(model::MODEL_DIR),
+                )?;
+                for group in model::layer_groups(&self.root)? {
+                    self.add_layer(&group, &[])?;
+                }
             }
             Base::Image(dir) => {
                 self.image = Image::read_layout(&dir)?;
@@ -168,6 +195,9 @@ impl Builder<'_> {
                     self.vars.insert(name.clone(), value.clone());
                 }
                 Ok(())
+            }
+            Instruction::Warm { .. } if self.image.config.model.is_some() => {
+                bail!("WARM in a model image is not supported yet")
             }
             Instruction::Warm { until, max_steps } => {
                 let max_steps = max_steps.unwrap_or(WARM_MAX_STEPS);

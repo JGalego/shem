@@ -1,0 +1,57 @@
+"""Text in and out: the model's tokenizer, and its chat template.
+
+The chat template is the model's own Jinja template, rendered the way
+transformers renders it, so a session is formatted exactly as the model was
+trained to see it.
+"""
+
+import json
+from datetime import datetime
+from pathlib import Path
+
+from jinja2.sandbox import ImmutableSandboxedEnvironment
+from tokenizers import Tokenizer as HfTokenizer
+
+
+def _raise(message: str):
+    raise ValueError(message)
+
+
+class Tokenizer:
+    def __init__(self, directory: Path, spec: dict):
+        directory = Path(directory)
+        self.inner = HfTokenizer.from_file(str(directory / spec["file"]))
+        env = ImmutableSandboxedEnvironment(
+            trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"]
+        )
+        env.filters["tojson"] = lambda value, indent=None, **_: json.dumps(value, ensure_ascii=False, indent=indent)
+        env.globals["raise_exception"] = _raise
+        env.globals["strftime_now"] = lambda fmt: datetime(2026, 1, 1).strftime(fmt)  # the guest's virtual clock
+        self.template = env.from_string((directory / spec["chat_template"]).read_text())
+        self.eos = set(spec["eos"])
+
+    def chat(self, messages: list[dict], thinking: bool = False) -> list[int]:
+        """The tokens of `messages`, ready for the assistant's reply."""
+        text = self.template.render(messages=messages, add_generation_prompt=True, enable_thinking=thinking)
+        return self.inner.encode(text, add_special_tokens=False).ids
+
+    def decode(self, ids: list[int]) -> str:
+        return self.inner.decode(ids, skip_special_tokens=True)
+
+
+class Detokenizer:
+    """Turns a stream of tokens into a stream of text, holding back the end
+    of a character split across tokens until it is complete."""
+
+    def __init__(self, tokenizer: Tokenizer):
+        self.tokenizer = tokenizer
+        self.ids: list[int] = []
+        self.sent = 0
+
+    def push(self, token: int) -> str:
+        self.ids.append(token)
+        text = self.tokenizer.decode(self.ids)
+        if text.endswith("�"):
+            return ""
+        new, self.sent = text[self.sent :], len(text)
+        return new
