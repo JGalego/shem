@@ -8,7 +8,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use common::SharedBuf;
-use shem::linux::{Action, Exec, Linux, Process, Report, Stdio, Termination, Wait};
+use shem::linux::{Action, Exec, Linux, ProcEntry, Process, Report, Stdio, Termination, Wait};
 use shem::reference::ReferenceVcpu;
 use shem::vcpu::{A0, A7, Vcpu};
 use tempfile::TempDir;
@@ -34,6 +34,8 @@ const EXIT_GROUP: u32 = 94;
 const KILL: u32 = 129;
 const RT_SIGACTION: u32 = 134;
 const UNAME: u32 = 160;
+const STATFS64: u32 = 43;
+const SYSINFO: u32 = 179;
 const CLONE: u32 = 220;
 const MMAP: u32 = 222;
 const EXECVE: u32 = 221;
@@ -93,6 +95,8 @@ struct Guest {
     root: TempDir,
     scratch: u32,
     retired: u64,
+    /// The process table the container would hand `/proc`.
+    procs: Vec<ProcEntry>,
 }
 
 impl Guest {
@@ -117,6 +121,7 @@ impl Guest {
             root: tempfile::tempdir().unwrap(),
             scratch: 0x8_0000,
             retired: 0,
+            procs: Vec::new(),
         }
     }
 
@@ -151,6 +156,7 @@ impl Guest {
         for (i, &arg) in args.iter().enumerate() {
             self.vcpu.set_reg(A0 + i, arg);
         }
+        self.linux.processes = self.procs.clone();
         self.linux
             .handle(&mut self.process, &mut self.vcpu, self.retired)
     }
@@ -250,10 +256,28 @@ fn getdents64_lists_entries_sorted_with_types() {
     fs::write(g.host("a"), b"").unwrap();
     fs::create_dir(g.host("c")).unwrap();
     let fd = g.open("/", O_RDONLY | O_DIRECTORY) as u32;
+    let entries = list(&mut g, fd);
+    // /proc is listed even though the rootfs has no such directory
+    let expected = [
+        (".", 4),
+        ("..", 4),
+        ("a", 8),
+        ("b", 8),
+        ("c", 4),
+        ("proc", 4),
+    ];
+    let expected: Vec<(String, u8)> = expected.iter().map(|&(n, t)| (n.into(), t)).collect();
+    assert_eq!(entries, expected);
+    let buf = g.buf(8);
+    assert_eq!(g.call(GETDENTS64, &[fd, buf, 4096]), 0);
+    assert_eq!(g.call(GETDENTS64, &[fd, buf, 8]), 0);
+}
+
+/// The names and types a directory open on `fd` lists, from one getdents64.
+fn list(g: &mut Guest, fd: u32) -> Vec<(String, u8)> {
     let buf = g.buf(4096);
     let n = g.call(GETDENTS64, &[fd, buf, 4096]);
     let bytes = g.get(buf, n as usize);
-
     let mut entries = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
@@ -263,11 +287,92 @@ fn getdents64_lists_entries_sorted_with_types() {
         entries.push((String::from_utf8(name.to_vec()).unwrap(), bytes[at + 18]));
         at += len;
     }
-    let expected = [(".", 4), ("..", 4), ("a", 8), ("b", 8), ("c", 4)];
-    let expected: Vec<(String, u8)> = expected.iter().map(|&(n, t)| (n.into(), t)).collect();
-    assert_eq!(entries, expected);
-    assert_eq!(g.call(GETDENTS64, &[fd, buf, 4096]), 0);
-    assert_eq!(g.call(GETDENTS64, &[fd, buf, 8]), 0);
+    entries
+}
+
+#[test]
+fn proc_shows_the_processes_and_the_virtual_clock() {
+    let mut g = Guest::new();
+    g.process.set_command(&["/bin/sh", "-c", "ps"], b"/bin/sh");
+    let init = g.process.proc_entry(b'R');
+    let child = ProcEntry {
+        pid: 2,
+        ppid: 1,
+        state: b'S',
+        cmdline: b"sleep\x0010\x00".to_vec(),
+        exe: b"/bin/sleep".to_vec(),
+        cpu_ns: 2_000_000_000,
+        started_ns: 1_000_000_000,
+        ..init.clone()
+    };
+    g.procs = vec![init, child];
+    g.retired = 3_250_000_000;
+
+    let fd = g.open("/proc", O_RDONLY | O_DIRECTORY) as u32;
+    let names: Vec<String> = list(&mut g, fd).into_iter().map(|(name, _)| name).collect();
+    for name in [
+        "1", "2", "self", "uptime", "meminfo", "mounts", "cpuinfo", "stat",
+    ] {
+        assert!(names.iter().any(|n| n == name), "{name} in {names:?}");
+    }
+    let read = |g: &mut Guest, path: &str| {
+        let fd = g.open(path, O_RDONLY);
+        assert!(fd >= 0, "{path}: {fd}");
+        String::from_utf8(g.read(fd, 4096)).unwrap()
+    };
+    assert_eq!(read(&mut g, "/proc/uptime"), "3.25 0.00\n");
+    assert_eq!(read(&mut g, "/proc/self/cmdline"), "/bin/sh\0-c\0ps\0");
+    assert!(
+        read(&mut g, "/proc/2/stat")
+            .starts_with("2 (sleep) S 1 1 1 0 -1 4194304 0 0 0 0 200 0 0 0 20 0 1 0 100 ")
+    );
+    assert!(read(&mut g, "/proc/2/status").contains("Name:\tsleep\nState:\tS (sleeping)\n"));
+    assert!(
+        read(&mut g, "/proc/meminfo").starts_with(&format!("MemTotal:{:>16} kB\n", MEM / 1024))
+    );
+    assert!(read(&mut g, "/proc/mounts").starts_with("shem / shem rw"));
+
+    let readlink = |g: &mut Guest, path: &str| {
+        let (path, buf) = (g.cstr(path), g.buf(64));
+        let n = g.call(READLINKAT, &[AT_FDCWD, path, buf, 64]);
+        String::from_utf8(g.get(buf, n.max(0) as usize)).unwrap()
+    };
+    assert_eq!(readlink(&mut g, "/proc/self"), "1");
+    assert_eq!(readlink(&mut g, "/proc/2/exe"), "/bin/sleep");
+
+    let (result, st) = g.statx(AT_FDCWD, "/proc/2", 0);
+    assert_eq!(
+        (result, word(&st, 28) & 0o170000),
+        (0, 0o040000),
+        "a directory"
+    );
+    let (_, st) = g.statx(AT_FDCWD, "/proc/uptime", 0);
+    assert_eq!(word(&st, 28) & 0o177777, 0o100444, "a read-only file");
+    assert_eq!(g.open("/proc/uptime", O_WRONLY), EACCES);
+    assert_eq!(g.open("/proc/3/stat", O_RDONLY), ENOENT);
+
+    let info = g.buf(64);
+    assert_eq!(g.call(SYSINFO, &[info]), 0);
+    let info = g.get(info, 64);
+    assert_eq!(
+        (word(&info, 0), word(&info, 16)),
+        (3, MEM),
+        "uptime and RAM"
+    );
+    assert_eq!(u16::from_le_bytes([info[40], info[41]]), 2, "processes");
+
+    let (root, proc_dir, buf) = (g.cstr("/"), g.cstr("/proc"), g.buf(88));
+    assert_eq!(g.call(STATFS64, &[root, 88, buf]), 0);
+    assert_eq!(
+        (word(&g.get(buf, 88), 0), word(&g.get(buf, 88), 4)),
+        (0x5348_454d, 4096)
+    );
+    assert_eq!(g.call(STATFS64, &[proc_dir, 88, buf]), 0);
+    assert_eq!(word(&g.get(buf, 88), 0), 0x9fa0);
+
+    let path = g.cstr("/proc/self");
+    assert_eq!(g.call(CHDIR, &[path]), 0);
+    assert!(read(&mut g, "stat").starts_with("1 (sh) R 0 1 1 "));
 }
 
 #[test]
@@ -313,7 +418,11 @@ fn file_metadata_follows_the_virtual_clock_not_the_host() {
     assert_eq!(time(&st, 112), (EPOCH_S, 5_000), "modified: when written");
     assert_eq!(time(&st, 96), (EPOCH_S, 5_000), "changed: as modified");
     let (_, root) = g.statx(AT_FDCWD, "/", 0);
-    assert_eq!(time(&root, 112), (EPOCH_S, 1_000), "the directory, when the file appeared");
+    assert_eq!(
+        time(&root, 112),
+        (EPOCH_S, 1_000),
+        "the directory, when the file appeared"
+    );
 
     // Inode numbers count up as files are first seen; the device and the
     // block count are fixed or computed
@@ -326,7 +435,11 @@ fn file_metadata_follows_the_virtual_clock_not_the_host() {
     let path = g.cstr("/new");
     assert_eq!(g.call(UNLINKAT, &[AT_FDCWD, path, 0]), 0);
     let (_, root) = g.statx(AT_FDCWD, "/", 0);
-    assert_eq!(time(&root, 112), (EPOCH_S, 9_000), "the directory, when the file went");
+    assert_eq!(
+        time(&root, 112),
+        (EPOCH_S, 9_000),
+        "the directory, when the file went"
+    );
 }
 
 #[test]
@@ -412,7 +525,11 @@ fn files_map_as_private_copies() {
     assert_eq!(g.get(at, 6000 - 4096), &data[4096..]);
     assert_eq!(g.get(at + 6000 - 4096, 16), [0; 16]);
     g.vcpu.write_mem(at, b"changed").unwrap();
-    assert_eq!(fs::read(g.host("data")).unwrap(), data, "writes stay private");
+    assert_eq!(
+        fs::read(g.host("data")).unwrap(),
+        data,
+        "writes stay private"
+    );
 
     let shared = g.call(MMAP, &[0, 4096, PROT_READ, MAP_SHARED, fd, 0]) as u32;
     assert_eq!(g.get(shared, 4096), &data[..4096]);
@@ -420,8 +537,15 @@ fn files_map_as_private_copies() {
     assert_eq!(g.call(MMAP, &writable), ENODEV);
 
     let write_only = g.open("/data", O_WRONLY) as u32;
-    assert_eq!(g.call(MMAP, &[0, 4096, PROT_READ, MAP_PRIVATE, write_only, 0]), EACCES);
-    assert_eq!(g.call(MMAP, &[0, 4096, PROT_READ, MAP_PRIVATE, 0, 0]), ENODEV, "stdin");
+    assert_eq!(
+        g.call(MMAP, &[0, 4096, PROT_READ, MAP_PRIVATE, write_only, 0]),
+        EACCES
+    );
+    assert_eq!(
+        g.call(MMAP, &[0, 4096, PROT_READ, MAP_PRIVATE, 0, 0]),
+        ENODEV,
+        "stdin"
+    );
 }
 
 #[test]
@@ -605,6 +729,7 @@ fn execve_reads_the_program_and_follows_shebang_lines() {
     let (script, argv) = (g.cstr("/bin/script"), g.strings(&["script", "arg1"]));
     let envp = g.strings(&["HOME=/"]);
     let expected = Exec {
+        path: b"/bin/prog".to_vec(), // the interpreter runs
         elf: program,
         argv: ["/bin/prog", "-x", "/bin/script", "arg1"]
             .map(|a| a.as_bytes().to_vec())

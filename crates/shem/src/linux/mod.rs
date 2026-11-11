@@ -16,6 +16,7 @@
 
 mod abi;
 mod files;
+mod proc;
 mod rootfs;
 mod signal;
 
@@ -29,6 +30,7 @@ use serde::{Deserialize, Serialize};
 pub use abi::Errno;
 use abi::*;
 use files::{FdTable, MAX_FDS};
+pub use proc::ProcEntry;
 pub use rootfs::{Resolved, RootFs};
 pub use signal::{Delivery, FrozenSignals, SigAction, Signals};
 
@@ -81,6 +83,8 @@ impl Termination {
 /// A program to replace the calling process's image, read by `execve`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exec {
+    /// The program's guest path: the interpreter's, for a script.
+    pub path: Vec<u8>,
     pub elf: Vec<u8>,
     pub argv: Vec<Vec<u8>>,
     pub envp: Vec<Vec<u8>>,
@@ -146,6 +150,12 @@ pub struct FrozenProcess {
     pub umask: u32,
     pub mm: AddressSpace,
     pub signals: FrozenSignals,
+    #[serde(default)]
+    pub cmdline: Vec<u8>,
+    #[serde(default)]
+    pub exe: Vec<u8>,
+    #[serde(default)]
+    pub cpu_ns: u64,
 }
 
 /// Why a process cannot be frozen.
@@ -166,6 +176,9 @@ pub struct Linux {
     random: u64,
     /// System calls the guest made that are not implemented, and how many times.
     pub unsupported: BTreeMap<u32, u64>,
+    /// The container's processes, for `/proc`, which the container fills in
+    /// before a system call that might look (see `needs_processes`).
+    pub processes: Vec<ProcEntry>,
 }
 
 /// What each process owns.
@@ -183,6 +196,14 @@ pub struct Process {
     /// The virtual time of the system call being serviced, in nanoseconds
     /// since the epoch, for the timestamps of files the call changes.
     now: u64,
+    /// The arguments of the running program, each followed by a NUL.
+    pub cmdline: Vec<u8>,
+    /// The running program's guest path.
+    pub exe: Vec<u8>,
+    /// Instructions retired, which on the virtual clock is CPU time in ns.
+    pub cpu_ns: u64,
+    /// When the process started, in ns since boot.
+    pub started_ns: u64,
 }
 
 impl Default for Linux {
@@ -197,6 +218,7 @@ impl Linux {
             slept_ns: 0,
             random: RANDOM_SEED,
             unsupported: BTreeMap::new(),
+            processes: Vec::new(),
         }
     }
 
@@ -212,7 +234,23 @@ impl Linux {
             slept_ns: frozen.slept_ns,
             random: frozen.random,
             unsupported: BTreeMap::new(),
+            processes: Vec::new(),
         }
+    }
+
+    /// Whether the system call `nr` might look at `/proc` or the process
+    /// table, so the container should fill in `processes` first.
+    pub fn needs_processes(nr: u32) -> bool {
+        matches!(
+            nr,
+            nr::OPENAT
+                | nr::STATX
+                | nr::FACCESSAT
+                | nr::FACCESSAT2
+                | nr::READLINKAT
+                | nr::CHDIR
+                | nr::SYSINFO
+        )
     }
 
     /// Service the system call `process` just made. `retired` counts the
@@ -222,6 +260,14 @@ impl Linux {
         let a: [u32; 6] = std::array::from_fn(|i| vcpu.reg(A0 + i));
         let p = process;
         p.now = EPOCH_NS + retired + self.slept_ns;
+        let processes = std::mem::take(&mut self.processes);
+        let s = &proc::Snapshot {
+            processes: &processes,
+            me: p.pid,
+            uptime_ns: retired + self.slept_ns,
+            idle_ns: self.slept_ns,
+            mem_total: vcpu.mem_size() as u64,
+        };
         let result = match nr {
             nr::EXIT | nr::EXIT_GROUP => return Action::Exit(Termination::Exited(a[0] as u8)),
             nr::CLONE => match clone(a[0]) {
@@ -267,19 +313,25 @@ impl Linux {
             nr::WRITE => p.write(vcpu, a[0], a[1], a[2]),
             nr::READV => p.readv(vcpu, a[0], a[1], a[2]),
             nr::WRITEV => p.writev(vcpu, a[0], a[1], a[2]),
-            nr::OPENAT => p.openat(vcpu, a[0], a[1], a[2], a[3]),
+            nr::OPENAT => p.openat(vcpu, a[0], a[1], a[2], a[3], s),
             nr::CLOSE => p.close(a[0]),
             nr::PIPE2 => p.pipe2(vcpu, a[0], a[1]),
             nr::LLSEEK => p.llseek(vcpu, a[0], (a[1], a[2]), a[3], a[4]),
             nr::GETDENTS64 => p.getdents64(vcpu, a[0], a[1], a[2]),
-            nr::STATX => p.statx(vcpu, a[0], a[1], a[2], a[4]),
-            nr::FACCESSAT | nr::FACCESSAT2 => p.faccessat(vcpu, a[0], a[1], a[2]),
+            nr::STATX => p.statx(vcpu, a[0], a[1], a[2], a[4], s),
+            nr::FACCESSAT | nr::FACCESSAT2 => p.faccessat(vcpu, a[0], a[1], a[2], s),
             nr::GETCWD => p.getcwd(vcpu, a[0], a[1]),
-            nr::CHDIR => p.chdir(vcpu, a[0]),
+            nr::CHDIR => p.chdir(vcpu, a[0], s),
+            nr::STATFS64 => p.statfs64(vcpu, a[0], a[1], a[2]),
+            nr::FSTATFS64 => p.fstatfs64(vcpu, a[0], a[1], a[2]),
+            nr::SYSINFO => vcpu
+                .write_mem(a[0], &proc::sysinfo(s))
+                .map(|()| 0)
+                .map_err(Errno::from),
             nr::MKDIRAT => p.mkdirat(vcpu, a[0], a[1], a[2]),
             nr::UNLINKAT => p.unlinkat(vcpu, a[0], a[1], a[2]),
             nr::SYMLINKAT => p.symlinkat(vcpu, a[0], a[1], a[2]),
-            nr::READLINKAT => p.readlinkat(vcpu, a[0], a[1], a[2], a[3]),
+            nr::READLINKAT => p.readlinkat(vcpu, a[0], a[1], a[2], a[3], s),
             nr::RENAMEAT2 => p.renameat2(vcpu, (a[0], a[1]), (a[2], a[3]), a[4]),
             nr::SENDFILE64 => p.sendfile(vcpu, a[0], a[1], a[2], a[3]),
             nr::UTIMENSAT_TIME64 => p.utimensat(vcpu, a[0], a[1], a[2], a[3]),
@@ -440,6 +492,36 @@ impl Process {
             signals: Signals::default(),
             mm: AddressSpace::new(brk, top),
             now: 0,
+            cmdline: Vec::new(),
+            exe: Vec::new(),
+            cpu_ns: 0,
+            started_ns: 0,
+        }
+    }
+
+    /// Record the program the process now runs: its arguments and its path.
+    pub fn set_command(&mut self, argv: &[impl AsRef<[u8]>], exe: &[u8]) {
+        self.cmdline = argv
+            .iter()
+            .flat_map(|a| [a.as_ref(), b"\0"].concat())
+            .collect();
+        self.exe = exe.to_vec();
+    }
+
+    /// What `/proc` shows of this process, whose scheduling state is `state`.
+    pub fn proc_entry(&self, state: u8) -> ProcEntry {
+        ProcEntry {
+            pid: self.pid,
+            ppid: self.ppid,
+            pgid: self.pgid,
+            sid: self.sid,
+            state,
+            cmdline: self.cmdline.clone(),
+            exe: self.exe.clone(),
+            cwd: self.cwd.clone(),
+            vsize: self.mm.in_use() + STACK_SIZE as u64,
+            cpu_ns: self.cpu_ns,
+            started_ns: self.started_ns,
         }
     }
 
@@ -453,6 +535,9 @@ impl Process {
             umask: self.umask,
             mm: self.mm.clone(),
             signals: self.signals.freeze(),
+            cmdline: self.cmdline.clone(),
+            exe: self.exe.clone(),
+            cpu_ns: self.cpu_ns,
         })
     }
 
@@ -463,6 +548,9 @@ impl Process {
         process.umask = frozen.umask;
         process.mm = frozen.mm.clone();
         process.signals = Signals::thaw(&frozen.signals);
+        process.cmdline = frozen.cmdline.clone();
+        process.exe = frozen.exe.clone();
+        process.cpu_ns = frozen.cpu_ns;
         process
     }
 
@@ -503,6 +591,10 @@ impl Process {
             signals: self.signals.fork(),
             mm: self.mm.clone(),
             now: self.now,
+            cmdline: self.cmdline.clone(),
+            exe: self.exe.clone(),
+            cpu_ns: 0,
+            started_ns: self.now.saturating_sub(EPOCH_NS),
         }
     }
 

@@ -181,6 +181,21 @@ fn busybox_shell_runs_pipelines_jobs_and_traps() {
             "caught\nafter\n",
         ),
         ("trap 'echo bye' EXIT; echo body", "body\nbye\n"),
+        // /proc, sysinfo and statfs, all made up by the host
+        (
+            "ps -o pid,ppid,comm | head -2",
+            "PID   PPID  COMMAND\n    1     0 sh\n",
+        ),
+        ("sleep 90; cut -d. -f1 /proc/uptime", "90\n"),
+        (
+            "df / | tail -1 | cut -c1-30",
+            "shem                   4194304\n",
+        ),
+        ("free | awk '/Mem/ { print $2 }'", "16384\n"),
+        (
+            "readlink /proc/self/exe; cat /proc/self/comm",
+            "/bin/busybox\nbusybox\n",
+        ),
     ];
     for (script, expected) in cases {
         let out = run_in(Some(root.path()), &busybox, &["sh", "-c", script]);

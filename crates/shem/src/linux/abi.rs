@@ -74,6 +74,9 @@ pub mod nr {
     pub const CLOCK_NANOSLEEP_TIME64: u32 = 407;
     pub const UTIMENSAT_TIME64: u32 = 412;
     pub const FACCESSAT2: u32 = 439;
+    pub const STATFS64: u32 = 43;
+    pub const FSTATFS64: u32 = 44;
+    pub const SYSINFO: u32 = 179;
 }
 
 /// A Linux errno. Guests see these numbers, so they must not come from the host OS.
@@ -190,6 +193,7 @@ pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;
 
 pub const X_OK: u32 = 1;
+pub const W_OK: u32 = 2;
 pub const RENAME_NOREPLACE: u32 = 1;
 pub const TIMER_ABSTIME: u32 = 1;
 pub const UTIME_NOW: i64 = (1 << 30) - 1;
@@ -231,6 +235,11 @@ pub const RLIM_INFINITY: u64 = u64::MAX;
 
 const S_IFCHR: u32 = 0o020000;
 const S_IFIFO: u32 = 0o010000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
+/// The device `/proc` is on: 0:4, as an anonymous device.
+pub const PROC_DEV: u64 = 4;
 
 pub const DT_UNKNOWN: u8 = 0;
 pub const DT_FIFO: u8 = 1;

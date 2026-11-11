@@ -16,8 +16,8 @@ use thiserror::Error;
 use crate::elf::{self, ElfError};
 use crate::emulate::{Emulation, Emulator};
 use crate::linux::{
-    Action, Delivery, Exec, FreezeError, FrozenLinux, FrozenProcess, Linux, Process, Report, Stdio,
-    Termination, Wait,
+    Action, Delivery, Exec, FreezeError, FrozenLinux, FrozenProcess, Linux, ProcEntry, Process,
+    Report, Stdio, Termination, Wait,
 };
 use crate::vcpu::{A0, A7, Exit, ExitReason, MachineState, MemoryFault, SP, SnapshotError, Vcpu};
 use serde::{Deserialize, Serialize};
@@ -142,7 +142,8 @@ impl<V: Vcpu + Clone> Container<V> {
             emulator: Emulator::default(),
             state: State::Runnable,
         };
-        load(&mut task, elf, argv, envp)?;
+        let exe = argv.first().map_or(&b""[..], |arg| arg.as_bytes());
+        load(&mut task, elf, exe, argv, envp)?;
         Ok(Self {
             linux: Linux::new(),
             tasks: BTreeMap::from([(INIT, task)]),
@@ -282,6 +283,7 @@ impl<V: Vcpu + Clone> Container<V> {
         }
         let exit = task.vcpu.run(budget);
         self.steps += exit.steps;
+        task.process.cpu_ns += exit.steps;
         let init = pid == INIT;
         match exit.reason {
             ExitReason::Budget => {}
@@ -315,6 +317,10 @@ impl<V: Vcpu + Clone> Container<V> {
 
     /// Service the system call `pid` is stopped on. Returns false if it blocked.
     fn syscall(&mut self, pid: u32) -> bool {
+        let nr = self.tasks[&pid].vcpu.reg(A7);
+        if Linux::needs_processes(nr) {
+            self.linux.processes = self.proc_entries();
+        }
         let task = self.tasks.get_mut(&pid).unwrap();
         let call = [17, 10, 11, 12, 13].map(|reg| task.vcpu.reg(reg));
         let action = self
@@ -361,6 +367,20 @@ impl<V: Vcpu + Clone> Container<V> {
         true
     }
 
+    /// The processes as `/proc` shows them.
+    fn proc_entries(&self) -> Vec<ProcEntry> {
+        (self.tasks.values())
+            .map(|task| {
+                let state = match task.state {
+                    State::Runnable => b'R',
+                    State::Blocked => b'S',
+                    State::Zombie(_) => b'Z',
+                };
+                task.process.proc_entry(state)
+            })
+            .collect()
+    }
+
     /// Return `value` from the system call `pid` is stopped on.
     fn finish(&mut self, pid: u32, value: u32) {
         let task = self.tasks.get_mut(&pid).unwrap();
@@ -403,7 +423,7 @@ impl<V: Vcpu + Clone> Container<V> {
         task.vcpu.reset();
         task.emulator = Emulator::default();
         task.state = State::Runnable;
-        if load(task, &exec.elf, &exec.argv, &exec.envp).is_err() {
+        if load(task, &exec.elf, &exec.path, &exec.argv, &exec.envp).is_err() {
             self.terminate(pid, Termination::Killed(SIGSEGV));
         }
     }
@@ -549,10 +569,11 @@ impl<V: Vcpu + Clone> Container<V> {
 }
 
 /// Load a program into `task`: its segments, a fresh address space, and the
-/// initial stack, ready to start at the entry point.
+/// initial stack, ready to start at the entry point. `exe` is its guest path.
 fn load<V: Vcpu>(
     task: &mut Task<V>,
     elf: &[u8],
+    exe: &[u8],
     argv: &[impl AsRef<[u8]>],
     envp: &[impl AsRef<[u8]>],
 ) -> Result<(), StartError> {
@@ -561,6 +582,7 @@ fn load<V: Vcpu>(
     let sp = elf::setup_stack(&mut task.vcpu, &image, stack_top, argv, envp)?;
     task.process
         .exec(image.brk, stack_top.saturating_sub(STACK_SIZE));
+    task.process.set_command(argv, exe);
     task.vcpu.set_reg(SP, sp);
     task.vcpu.set_pc(image.entry);
     Ok(())

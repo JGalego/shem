@@ -42,6 +42,17 @@ impl AddressSpace {
         self.brk
     }
 
+    /// Bytes in use below the stack: the program image, the heap and the
+    /// mappings.
+    pub fn in_use(&self) -> u64 {
+        let mapped: u64 = self
+            .maps
+            .iter()
+            .map(|(start, end)| (end - start) as u64)
+            .sum();
+        self.brk as u64 + mapped
+    }
+
     /// Move the program break if the request is in range, and return where the
     /// break now is, as Linux does.
     pub fn set_brk(&mut self, vcpu: &mut dyn Vcpu, addr: u32) -> u32 {

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use super::abi::*;
+use super::proc::{self, Node, Snapshot};
 use super::rootfs::{PATH_MAX, Resolved, RootFs};
 use super::{Exec, IOV_MAX, MAX_IO, NS_PER_SEC, Process, Stdio};
 use crate::elf;
@@ -40,6 +41,11 @@ enum Kind {
     Dir(Dir),
     Pipe(PipeEnd),
     Device(Device),
+    /// A file under `/proc`, generated when it was opened.
+    Proc {
+        path: Vec<u8>,
+        data: std::io::Cursor<Vec<u8>>,
+    },
 }
 
 /// The device files every container has under /dev, whatever its rootfs holds.
@@ -104,7 +110,8 @@ impl Drop for PipeEnd {
 
 struct Dir {
     guest: Vec<u8>,
-    host: PathBuf,
+    /// None for a directory under `/proc`.
+    host: Option<PathBuf>,
     /// Listed when the directory is opened, sorted by name so that runs are
     /// deterministic whatever order the host filesystem uses.
     entries: Vec<Dirent>,
@@ -258,6 +265,7 @@ impl Description {
             }
             Kind::Input(input) => Ok(input.read(buf)?),
             Kind::File(file) => Ok(file.read(buf)?),
+            Kind::Proc { data, .. } => Ok(data.read(buf)?),
             Kind::Dir(_) => Err(Errno::EISDIR),
             Kind::Output(_) => Err(Errno::EBADF),
         }
@@ -290,7 +298,7 @@ impl Description {
             }
             Kind::File(file) => file.write_all(data)?,
             Kind::Dir(_) => return Err(Errno::EISDIR),
-            Kind::Input(_) => return Err(Errno::EBADF),
+            Kind::Input(_) | Kind::Proc { .. } => return Err(Errno::EBADF),
         }
         Ok(data.len())
     }
@@ -298,7 +306,11 @@ impl Description {
     fn stat(&self, root: Option<&RootFs>) -> Result<Stat, Errno> {
         match &self.kind {
             Kind::File(file) => Ok(guest_stat(root, &file.metadata()?)),
-            Kind::Dir(dir) => Ok(guest_stat(root, &std::fs::metadata(&dir.host)?)),
+            Kind::Dir(Dir {
+                host: Some(host), ..
+            }) => Ok(guest_stat(root, &std::fs::metadata(host)?)),
+            Kind::Dir(dir) => Ok(proc::stat(&dir.guest, &Node::Dir(Vec::new()))),
+            Kind::Proc { path, .. } => Ok(proc::stat(path, &Node::File(Vec::new()))),
             Kind::Input(_) | Kind::Output(_) => Ok(Stat::char_device()),
             Kind::Pipe(_) => Ok(Stat::fifo()),
             Kind::Device(device) => Ok(device.stat()),
@@ -348,6 +360,77 @@ impl Process {
         }
     }
 
+    /// The absolute guest path `path` names relative to `dirfd`, if it is
+    /// under `/proc`.
+    fn proc_at(&self, vcpu: &dyn Vcpu, dirfd: u32, path: u32) -> Result<Option<Vec<u8>>, Errno> {
+        let path = read_cstr(vcpu, path, PATH_MAX)?;
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let path = normalize(&self.base_dir(dirfd)?, &path);
+        Ok(proc::is_proc(&path).then_some(path))
+    }
+
+    /// Open a path under `/proc`. A symlink into the root filesystem, such as
+    /// `/proc/self/exe`, opens its target there.
+    fn open_proc(
+        &mut self,
+        path: Vec<u8>,
+        flags: u32,
+        mode: u32,
+        s: &Snapshot,
+    ) -> Result<u32, Errno> {
+        let access = flags & O_ACCMODE;
+        let kind = match proc::lookup(&path, flags & O_NOFOLLOW == 0, s)? {
+            Node::Dir(_) if access != O_RDONLY || flags & O_CREAT != 0 => {
+                return Err(Errno::EISDIR);
+            }
+            Node::Dir(listed) => {
+                let mut entries = vec![
+                    Dirent {
+                        ino: proc::stat(&path, &Node::Dir(Vec::new())).ino,
+                        kind: DT_DIR,
+                        name: b".".to_vec(),
+                    },
+                    Dirent {
+                        ino: 1,
+                        kind: DT_DIR,
+                        name: b"..".to_vec(),
+                    },
+                ];
+                for (name, kind) in listed {
+                    let child = [path.as_slice(), b"/", &name].concat();
+                    let ino = proc::stat(&child, &Node::Dir(Vec::new())).ino;
+                    entries.push(Dirent { ino, kind, name });
+                }
+                entries[2..].sort_by(|a, b| a.name.cmp(&b.name));
+                Kind::Dir(Dir {
+                    guest: path,
+                    host: None,
+                    entries,
+                    next: 0,
+                })
+            }
+            Node::File(_) if flags & O_DIRECTORY != 0 => return Err(Errno::ENOTDIR),
+            Node::File(_) if access != O_RDONLY => return Err(Errno::EACCES),
+            Node::File(data) => Kind::Proc {
+                path,
+                data: std::io::Cursor::new(data),
+            },
+            Node::Link(_) if flags & O_NOFOLLOW != 0 => return Err(Errno::ELOOP),
+            Node::Link(target) => {
+                let root = self.root.clone().ok_or(Errno::ENOENT)?;
+                let resolved = root.resolve(b"/", &target, true)?;
+                return self.open_host(resolved, flags, mode);
+            }
+        };
+        let description = Description {
+            kind,
+            flags: flags & O_ACCMODE,
+        };
+        self.files.install(description, 0, flags & O_CLOEXEC != 0)
+    }
+
     pub(super) fn openat(
         &mut self,
         vcpu: &dyn Vcpu,
@@ -355,7 +438,11 @@ impl Process {
         path: u32,
         flags: u32,
         mode: u32,
+        s: &Snapshot,
     ) -> Result<u32, Errno> {
+        if let Some(path) = self.proc_at(vcpu, dirfd, path)? {
+            return self.open_proc(path, flags, mode, s);
+        }
         match self.device_at(vcpu, dirfd, path)? {
             Some(Ok(device)) => {
                 let flags = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK);
@@ -369,6 +456,11 @@ impl Process {
             None => {}
         }
         let resolved = self.resolve_at(vcpu, dirfd, path, flags & O_NOFOLLOW == 0)?;
+        self.open_host(resolved, flags, mode)
+    }
+
+    /// Open a file in the root filesystem, creating it if asked to.
+    fn open_host(&mut self, resolved: Resolved, flags: u32, mode: u32) -> Result<u32, Errno> {
         let access = flags & O_ACCMODE;
         let creating = flags & O_CREAT != 0;
         let existed = std::fs::symlink_metadata(&resolved.host).is_ok();
@@ -557,6 +649,12 @@ impl Process {
                 offset as u64
             }
             Kind::Dir(_) => return Err(Errno::EINVAL),
+            Kind::Proc { data, .. } => data.seek(match whence {
+                SEEK_SET => SeekFrom::Start(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
+                SEEK_CUR => SeekFrom::Current(offset),
+                SEEK_END => SeekFrom::End(offset),
+                _ => return Err(Errno::EINVAL),
+            })?,
             Kind::Device(_) => 0,
             Kind::Input(_) | Kind::Output(_) | Kind::Pipe(_) => return Err(Errno::ESPIPE),
         };
@@ -599,9 +697,17 @@ impl Process {
         path: u32,
         flags: u32,
         buf: u32,
+        s: &Snapshot,
     ) -> Result<u32, Errno> {
         let name = read_cstr(vcpu, path, PATH_MAX)?;
-        let stat = if name.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        let stat = if let Some(path) = self.proc_at(vcpu, dirfd, path)? {
+            match proc::lookup(&path, follow, s)? {
+                // A link out of /proc, such as exe, stats as its target
+                Node::Link(target) if follow => self.stat_path(&target, true)?,
+                node => proc::stat(&path, &node),
+            }
+        } else if name.is_empty() && flags & AT_EMPTY_PATH != 0 {
             if dirfd == AT_FDCWD {
                 self.stat_path(&self.cwd.clone(), true)?
             } else {
@@ -612,7 +718,6 @@ impl Process {
                 Some(Ok(device)) => device.stat(),
                 Some(Err(stream)) => self.files.get(stream)?.lock().unwrap().stat(self.root())?,
                 None => {
-                    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
                     let resolved = self.resolve_at(vcpu, dirfd, path, follow)?;
                     stat_host(self.root(), &resolved, follow)?
                 }
@@ -633,11 +738,22 @@ impl Process {
         dirfd: u32,
         path: u32,
         mode: u32,
+        s: &Snapshot,
     ) -> Result<u32, Errno> {
         if self.device_at(vcpu, dirfd, path)?.is_some() {
             return Ok(0);
         }
-        let stat = stat_host(self.root(), &self.resolve_at(vcpu, dirfd, path, true)?, true)?;
+        if let Some(path) = self.proc_at(vcpu, dirfd, path)? {
+            return match proc::lookup(&path, true, s)? {
+                Node::File(_) if mode & (W_OK | X_OK) != 0 => Err(Errno::EACCES),
+                _ => Ok(0),
+            };
+        }
+        let stat = stat_host(
+            self.root(),
+            &self.resolve_at(vcpu, dirfd, path, true)?,
+            true,
+        )?;
         // The guest is root, so only execute permission can be missing.
         let is_dir = stat.mode & 0o170000 == 0o040000;
         if mode & X_OK != 0 && !is_dir && stat.mode & 0o111 == 0 {
@@ -655,7 +771,16 @@ impl Process {
         Ok(cwd.len() as u32)
     }
 
-    pub(super) fn chdir(&mut self, vcpu: &dyn Vcpu, path: u32) -> Result<u32, Errno> {
+    pub(super) fn chdir(&mut self, vcpu: &dyn Vcpu, path: u32, s: &Snapshot) -> Result<u32, Errno> {
+        if let Some(path) = self.proc_at(vcpu, AT_FDCWD, path)? {
+            return match proc::lookup(&path, true, s)? {
+                Node::Dir(_) => {
+                    self.cwd = path;
+                    Ok(0)
+                }
+                _ => Err(Errno::ENOTDIR),
+            };
+        }
         let resolved = self.resolve_at(vcpu, AT_FDCWD, path, true)?;
         if !std::fs::metadata(&resolved.host)?.is_dir() {
             return Err(Errno::ENOTDIR);
@@ -731,13 +856,23 @@ impl Process {
         path: u32,
         buf: u32,
         size: u32,
+        s: &Snapshot,
     ) -> Result<u32, Errno> {
-        let resolved = self.resolve_at(vcpu, dirfd, path, false)?;
-        if !std::fs::symlink_metadata(&resolved.host)?.is_symlink() {
-            return Err(Errno::EINVAL);
-        }
-        let target = std::fs::read_link(&resolved.host)?;
-        let target = target.as_os_str().as_bytes();
+        let target = if let Some(path) = self.proc_at(vcpu, dirfd, path)? {
+            match proc::lookup(&path, false, s)? {
+                Node::Link(target) => target,
+                _ => return Err(Errno::EINVAL),
+            }
+        } else {
+            let resolved = self.resolve_at(vcpu, dirfd, path, false)?;
+            if !std::fs::symlink_metadata(&resolved.host)?.is_symlink() {
+                return Err(Errno::EINVAL);
+            }
+            std::fs::read_link(&resolved.host)?
+                .as_os_str()
+                .as_bytes()
+                .to_vec()
+        };
         let n = target.len().min(size as usize);
         vcpu.write_mem(buf, &target[..n])?;
         Ok(n as u32)
@@ -829,8 +964,15 @@ impl Process {
         let file = if path == 0 {
             match &self.files.get(dirfd)?.lock().unwrap().kind {
                 Kind::File(file) => file.try_clone()?,
-                Kind::Dir(dir) => File::open(&dir.host)?,
-                Kind::Input(_) | Kind::Output(_) | Kind::Pipe(_) | Kind::Device(_) => return Ok(0),
+                Kind::Dir(Dir {
+                    host: Some(host), ..
+                }) => File::open(host)?,
+                Kind::Dir(_)
+                | Kind::Proc { .. }
+                | Kind::Input(_)
+                | Kind::Output(_)
+                | Kind::Pipe(_)
+                | Kind::Device(_) => return Ok(0),
             }
         } else {
             let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
@@ -897,7 +1039,7 @@ impl Process {
         let path = read_cstr(vcpu, path, PATH_MAX)?;
         let mut argv = read_strings(vcpu, argv)?;
         let envp = read_strings(vcpu, envp)?;
-        let mut elf = self.read_executable(&path)?;
+        let (mut elf, mut exe) = self.read_executable(&path)?;
         if let Some(rest) = elf.strip_prefix(b"#!") {
             let end = rest
                 .iter()
@@ -920,14 +1062,28 @@ impl Process {
             script_argv.push(path);
             script_argv.extend(argv.into_iter().skip(1));
             argv = script_argv;
-            elf = self.read_executable(&interpreter)?;
+            (elf, exe) = self.read_executable(&interpreter)?;
         }
         elf::parse(&elf, vcpu.mem_size()).map_err(|_| Errno::ENOEXEC)?;
-        Ok(Exec { elf, argv, envp })
+        Ok(Exec {
+            path: exe,
+            elf,
+            argv,
+            envp,
+        })
     }
 
-    fn read_executable(&self, path: &[u8]) -> Result<Vec<u8>, Errno> {
+    /// An executable's contents and its canonical guest path.
+    fn read_executable(&self, path: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Errno> {
         let root = self.root.as_ref().ok_or(Errno::ENOENT)?;
+        // Programs, BusyBox among them, run themselves again through /proc/self/exe
+        let normalized = normalize(&self.cwd, path);
+        let own = format!("/proc/{}/exe", self.pid);
+        let path = if normalized == b"/proc/self/exe" || normalized == own.as_bytes() {
+            &self.exe
+        } else {
+            path
+        };
         let resolved = root.resolve(&self.cwd, path, true)?;
         let meta = std::fs::metadata(&resolved.host)?;
         if !meta.is_file() || meta.mode() & 0o111 == 0 {
@@ -936,7 +1092,65 @@ impl Process {
         if meta.len() > MAX_EXECUTABLE {
             return Err(Errno::ENOMEM);
         }
-        Ok(std::fs::read(&resolved.host)?)
+        Ok((std::fs::read(&resolved.host)?, resolved.guest))
+    }
+
+    /// `statfs64`: the root filesystem, or `/proc`.
+    pub(super) fn statfs64(
+        &mut self,
+        vcpu: &mut dyn Vcpu,
+        path: u32,
+        size: u32,
+        buf: u32,
+    ) -> Result<u32, Errno> {
+        let guest = normalize(&self.cwd, &read_cstr(vcpu, path, PATH_MAX)?);
+        let stats = if proc::is_proc(&guest) {
+            statfs(PROC_SUPER_MAGIC, 0, 0, 0)
+        } else {
+            self.resolve_at(vcpu, AT_FDCWD, path, true)?;
+            self.root_statfs()?
+        };
+        write_statfs(vcpu, size, buf, stats)
+    }
+
+    pub(super) fn fstatfs64(
+        &mut self,
+        vcpu: &mut dyn Vcpu,
+        fd: u32,
+        size: u32,
+        buf: u32,
+    ) -> Result<u32, Errno> {
+        let stats = match &self.files.get(fd)?.lock().unwrap().kind {
+            Kind::Proc { .. } | Kind::Dir(Dir { host: None, .. }) => {
+                statfs(PROC_SUPER_MAGIC, 0, 0, 0)
+            }
+            Kind::File(_) | Kind::Dir(_) => self.root_statfs()?,
+            _ => statfs(PIPEFS_MAGIC, 0, 0, 0),
+        };
+        write_statfs(vcpu, size, buf, stats)
+    }
+
+    /// The root filesystem's usage: a fixed size, less what its files take,
+    /// counted from the guest's files rather than asked of the host.
+    fn root_statfs(&self) -> Result<[u8; STATFS_SIZE], Errno> {
+        let root = self.root.as_ref().ok_or(Errno::ENOENT)?;
+        let (mut used, mut files) = (0u64, 0u64);
+        let mut pending = vec![root.resolve(b"/", b"/", true)?.host];
+        while let Some(dir) = pending.pop() {
+            let mut entries: Vec<_> = std::fs::read_dir(&dir)?.collect::<Result<_, _>>()?;
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                    continue;
+                };
+                files += 1;
+                used += meta.len().div_ceil(4096);
+                if meta.is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        Ok(statfs(SHEM_MAGIC, ROOT_BLOCKS, used, files))
     }
 
     pub(super) fn dup(&mut self, fd: u32, min: u32, cloexec: bool) -> Result<u32, Errno> {
@@ -1037,11 +1251,19 @@ fn list_dir(root: Option<&RootFs>, resolved: Resolved) -> Result<Dir, Errno> {
             name: entry.file_name().as_bytes().to_vec(),
         });
     }
+    // /proc is always there, whether or not the rootfs has a directory for it
+    if resolved.guest == b"/" && !listed.iter().any(|entry| entry.name == b"proc") {
+        listed.push(Dirent {
+            ino: proc::stat(b"/proc", &Node::Dir(Vec::new())).ino,
+            kind: DT_DIR,
+            name: b"proc".to_vec(),
+        });
+    }
     listed.sort_by(|a, b| a.name.cmp(&b.name));
     entries.extend(listed);
     Ok(Dir {
         guest: resolved.guest,
-        host: resolved.host,
+        host: Some(resolved.host),
         entries,
         next: 0,
     })
@@ -1108,8 +1330,56 @@ fn stamp(path: &std::path::Path, access: Option<u64>, modify: Option<u64>) {
     let times = [timespec(access), timespec(modify)];
     // SAFETY: a NUL-terminated path and two timespecs, as utimensat expects.
     unsafe {
-        libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW);
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        );
     }
+}
+
+const STATFS_SIZE: usize = 88;
+const SHEM_MAGIC: u32 = 0x5348_454d; // "SHEM"
+const PROC_SUPER_MAGIC: u32 = 0x9fa0;
+const PIPEFS_MAGIC: u32 = 0x5049_5045;
+/// The root filesystem's size in 4 KiB blocks, and its inode count: 4 GiB.
+const ROOT_BLOCKS: u64 = 1 << 20;
+
+/// `struct statfs64` for an RV32 guest: 4 KiB blocks, `blocks` of them with
+/// `used` taken, and as many inodes as blocks with `files` taken.
+fn statfs(magic: u32, blocks: u64, used: u64, files: u64) -> [u8; STATFS_SIZE] {
+    let mut out = [0u8; STATFS_SIZE];
+    let free = blocks.saturating_sub(used);
+    let ffree = blocks.saturating_sub(files);
+    out[0..4].copy_from_slice(&magic.to_le_bytes());
+    out[4..8].copy_from_slice(&4096u32.to_le_bytes()); // f_bsize
+    for (at, value) in [
+        (8, blocks),
+        (16, free),
+        (24, free),
+        (32, blocks),
+        (40, ffree),
+    ] {
+        out[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    out[56..60].copy_from_slice(&255u32.to_le_bytes()); // f_namelen
+    out[60..64].copy_from_slice(&4096u32.to_le_bytes()); // f_frsize
+    out
+}
+
+fn write_statfs(
+    vcpu: &mut dyn Vcpu,
+    size: u32,
+    buf: u32,
+    stats: [u8; STATFS_SIZE],
+) -> Result<u32, Errno> {
+    // 84 bytes of fields, which the C struct pads to 88
+    if size != 84 && size != 88 {
+        return Err(Errno::EINVAL);
+    }
+    vcpu.write_mem(buf, &stats[..size as usize])?;
+    Ok(0)
 }
 
 fn iovecs(vcpu: &dyn Vcpu, iov: u32, count: u32) -> Result<Vec<(u32, u32)>, Errno> {
