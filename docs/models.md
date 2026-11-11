@@ -9,6 +9,8 @@ shem push qwen3 ghcr.io/me/qwen3:0.6b       # to a registry
 shem run ghcr.io/me/qwen3:0.6b "Olá"        # elsewhere: pulled on first use, then run
 ```
 
+`docker build` builds model images too, through shem's BuildKit frontend: add `# syntax=ghcr.io/jgalego/shem/dockerfile:latest` as the first line ([shemfile.md](shemfile.md#with-docker-build)).
+
 ## Shemfile
 
 ```dockerfile

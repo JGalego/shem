@@ -4,7 +4,7 @@ name: Release
 #   - the shem and containerd-shim-shem crates on crates.io
 #   - the shem-neural package on PyPI
 #   - shem and containerd-shim-shem-v1 binaries, with build provenance, on the GitHub release
-#   - the guest toolchain image and the shem-neural runtime image on GHCR, for amd64 and arm64
+#   - the guest toolchain, the shem-neural runtime and the docker build frontend images on GHCR, for amd64 and arm64
 #   - the examples as shem images on GHCR: programs, a warm shell, a booted Linux, and models
 #   - release notes from the conventional commits since the last tag
 # Running it by hand builds and checks everything, and publishes nothing.
@@ -92,6 +92,7 @@ jobs:
         include:
           - { image: shem-toolchain, context: toolchain, target: toolchain }
           - { image: shem-neural, context: neural, target: "" }
+          - { image: shem/dockerfile, context: frontend, target: "" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -116,6 +117,7 @@ jobs:
           context: ${{ matrix.context }}
           target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ needs.verify.outputs.version }}
           sbom: true
           provenance: mode=max
           push: ${{ github.ref_type == 'tag' }}

@@ -11,6 +11,31 @@ shem push hello ghcr.io/me/hello:1.0     # push to an OCI registry
 shem pull ghcr.io/me/hello:1.0           # pull into the store, and run it by that name
 ```
 
+## With docker build
+
+`docker build` builds Shemfiles too, through shem's BuildKit frontend ([`frontend/`](../frontend/)). Make the first line name it:
+
+```dockerfile
+# syntax=ghcr.io/jgalego/shem/dockerfile:latest
+FROM hf.co/Qwen/Qwen3.5-0.8B
+ENTRYPOINT ["shem:generate", "--system", "You are Shem, a golem made of clay."]
+CMD ["Who are you?"]
+WARM --until=prompt
+```
+
+```sh
+docker build --platform linux/riscv32 -t golem .
+```
+
+BuildKit pulls and runs the frontend, which turns the Shemfile into a Dockerfile and has BuildKit's own Dockerfile frontend build it:
+
+- `FROM hf.co/ORG/NAME[:REVISION]` runs the importer in the `shem-neural` image, then copies each weights file into a layer of its own, as `shem build` does. A gated model's token comes from the build's secret `HF_TOKEN` (`docker build --secret id=HF_TOKEN,env=HF_TOKEN`), and downloads are cached between builds.
+- `WARM --until=prompt` runs the model's driver over the prompt in the `shem-neural` image and copies the primed session into `/.shem`.
+- `KERNEL` becomes the image's `dev.shem.kernel` and `dev.shem.bootargs` labels.
+- Other stages are Docker stages, built on the build platform, and `RUN` is refused in shem stages, as with `shem build`.
+
+The image is for `linux/riscv32` (pass `--platform linux/riscv32` to keep Docker from warning that it is not the host's). `docker push`, `docker save` and the rest work as for any image, and `shem run` runs what `docker save` writes. Not yet: `WARM` for programs and VMs, which `shem build` does; the build argument `SHEM_NEURAL_IMAGE` picks another runtime image.
+
 ## Examples
 
 [`examples/hello`](../examples/hello/Shemfile) compiles a C program in an ordinary Docker stage and ships it:
