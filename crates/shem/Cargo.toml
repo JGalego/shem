@@ -12,6 +12,12 @@ readme = "../../README.md"
 keywords.workspace = true
 categories.workspace = true
 
+# cargo binstall downloads the release's binaries instead of compiling
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/shem-{ version }-{ target }.tar.gz"
+bin-dir = "shem-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

@@ -7,6 +7,7 @@ name: Release
 #   - the guest toolchain, the shem-neural runtime and the docker build frontend images on GHCR, for amd64 and arm64
 #   - the examples as shem images on GHCR: programs, a warm shell, a booted Linux, and models
 #   - the compiled CPU's weights, with a model card, on the Hugging Face Hub
+#   - a Homebrew formula on the release, and in the tap JGalego/homebrew-shem when there is a token for it
 #   - release notes from the conventional commits since the last tag
 # Running it by hand builds and checks everything, and publishes nothing.
 
@@ -255,3 +256,36 @@ jobs:
       - run: gh release create "$GITHUB_REF_NAME" dist/* --title "shem $GITHUB_REF_NAME" --notes-file NOTES.md
         env:
           GH_TOKEN: ${{ github.token }}
+
+  homebrew:
+    name: Homebrew formula
+    needs: [verify, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+      - name: Write the formula and attach it to the release
+        run: |
+          packaging/homebrew/formula.sh "$VERSION" dist > shem.rb
+          gh release upload "$GITHUB_REF_NAME" shem.rb
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Update the tap
+        if: env.TAP_TOKEN != ''
+        run: |
+          git clone "https://x-access-token:$TAP_TOKEN@github.com/JGalego/homebrew-shem.git" tap
+          mkdir -p tap/Formula
+          cp shem.rb tap/Formula/shem.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "feat: shem $VERSION" && git push
