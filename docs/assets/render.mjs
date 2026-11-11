@@ -1,4 +1,4 @@
-// Regenerate the README visuals: node docs/assets/render.mjs
+// Regenerate the documentation visuals: node docs/assets/render.mjs
 // Requires Node.js, Python with CairoSVG and Pillow, and Fontconfig with Noto Color Emoji.
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -199,6 +199,43 @@ function dockerWorkflow() {
   return svg(452, "Model Dockerfile to registry to shem", "Hugging Face supplies model checkpoints to shem's BuildKit frontend. docker build produces a linux/riscv32 OCI image containing the model weights, tokenizer and optional session state. docker push and pull exchange it with an ordinary registry, such as Docker Hub or GHCR. docker run selects io.containerd.shem.v1 and starts a Python/PyTorch model session through the shem shim.", body);
 }
 
+function imageComparison() {
+  const body = [
+    box(32, 34, 430, 356, paper, teal),
+    emoji(54, 45, "🐳", 25), text(93, 67, "Regular Docker image", 22, teal),
+    box(54, 88, 386, 52),
+    text(247, 120, "FROM python:3.12", 16, ink, "middle", true),
+    arrow(247, 145, 247, 158, teal),
+    box(54, 160, 386, 72, tealWash, teal),
+    text(247, 186, "python:3.12", 19, teal, "middle", true),
+    text(247, 214, "OS + Python runtime", 16, muted, "middle"),
+    arrow(247, 237, 247, 249, teal),
+    box(54, 251, 386, 59),
+    text(247, 287, "app code + dependencies", 18, ink, "middle"),
+    arrow(247, 315, 247, 324, teal),
+    box(54, 326, 386, 48, tealWash, teal),
+    emoji(69, 337, "📦", 25), text(261, 357, "OCI image", 21, teal, "middle"),
+
+    box(498, 34, 430, 356, paper, clay),
+    emoji(520, 45, "🤗", 25), text(559, 67, "LLM image", 22, clay),
+    box(520, 88, 386, 52),
+    text(713, 120, "FROM hf.co/Qwen/Qwen3.5-0.8B", 14, ink, "middle", true),
+    arrow(713, 145, 713, 158, clay),
+    box(520, 160, 386, 72, clayWash, clay),
+    text(713, 186, "model weights + tokenizer", 18, clay, "middle"),
+    text(713, 214, "imported from Hugging Face", 15, muted, "middle"),
+    arrow(713, 237, 713, 249, clay),
+    box(520, 251, 386, 59),
+    text(713, 276, "ENTRYPOINT + prompt", 17, ink, "middle"),
+    text(713, 299, "optional WARM session", 14, muted, "middle"),
+    arrow(713, 315, 713, 324, clay),
+    box(520, 326, 386, 48, clayWash, clay),
+    emoji(535, 337, "📦", 25), text(727, 357, "OCI image", 21, clay, "middle"),
+    text(480, 427, "Different bases; the same OCI image format", 19, muted, "middle"),
+  ].join("\n  ");
+  return svg(448, "Regular Docker images and LLM images", "A regular Docker image starts from a runtime such as python:3.12, then adds application code and dependencies. An LLM image starts from a Hugging Face checkpoint, which supplies model weights and a tokenizer, then adds its entrypoint, prompt and optional warmed session. Both are OCI images.", body);
+}
+
 const phases = [
   { label: "Load", seconds: 1.6, pc: "00", t0: 0, a0: 1, row: -1, route: "load" },
   { label: "Step", seconds: 1.6, pc: "04", t0: 6, a0: 1, row: 0, route: "cpu" },
@@ -257,6 +294,7 @@ function execution(phase, progress = 0, poster = false) {
 
 writeFileSync(join(directory, "architecture.svg"), architecture());
 writeFileSync(join(directory, "docker-workflow.svg"), dockerWorkflow());
+writeFileSync(join(directory, "image-comparison.svg"), imageComparison());
 writeFileSync(join(directory, "execution.svg"), execution(phases[5], 0, true));
 
 const scratch = mkdtempSync(join(tmpdir(), "shem-visuals-"));
@@ -298,7 +336,7 @@ for frame in json.load(sys.stdin):
 frames[0].save(sys.argv[1], save_all=True, append_images=frames[1:],
                duration=durations, loop=0, disposal=1, optimize=True)
 `, join(directory, "execution.gif")], { input: JSON.stringify(frames), stdio: ["pipe", "inherit", "inherit"] });
-  console.log("Rendered architecture.svg, docker-workflow.svg, execution.svg and execution.gif");
+  console.log("Rendered architecture.svg, docker-workflow.svg, image-comparison.svg, execution.svg and execution.gif");
 } finally {
   rmSync(scratch, { recursive: true, force: true });
 }

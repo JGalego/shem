@@ -15,6 +15,8 @@ shem pull ghcr.io/your-user/hello:1.0         # pull into the store, and run it 
 
 `docker build` builds Shemfiles too, through shem's BuildKit frontend ([`frontend/`](../frontend/)). Make the first line name it:
 
+![A regular Docker image starts from a Python runtime and adds application code and dependencies; an LLM image starts from a Hugging Face model and adds its entrypoint, prompt and optional warm session. Both are OCI images.](assets/image-comparison.svg)
+
 ```dockerfile
 # syntax=ghcr.io/jgalego/shem/dockerfile:latest
 FROM hf.co/Qwen/Qwen3.5-0.8B
