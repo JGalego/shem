@@ -230,7 +230,8 @@ fn annotated_bundles_run_inside_the_model() {
 #[ignore = "needs a model server and an unpacked model image: set SHEM_NEURAL_SOCKET and SHEM_MODEL_ROOT"]
 fn model_images_run_on_the_model_server() {
     let socket = std::env::var("SHEM_NEURAL_SOCKET").expect("SHEM_NEURAL_SOCKET");
-    let root = std::env::var("SHEM_MODEL_ROOT").expect("SHEM_MODEL_ROOT, the root of an unpacked model image");
+    let root = std::env::var("SHEM_MODEL_ROOT")
+        .expect("SHEM_MODEL_ROOT, the root of an unpacked model image");
     let dir = tempfile::tempdir().unwrap();
     let config = serde_json::json!({
         "process": {"args": ["shem:generate", "--max-tokens", "12", "Say hi in Portuguese."]},
