@@ -1,6 +1,22 @@
 # containerd
 
-`containerd-shim-shem-v1` ([`crates/containerd-shim-shem`](../crates/containerd-shim-shem/)) is a containerd runtime shim. With it, containerd runs containers on shem: the image is an ordinary OCI image, and its entrypoint, a static RV32 Linux executable, runs on a shem vCPU instead of the host CPU. This is the pattern runwasi uses to run WebAssembly.
+`containerd-shim-shem-v1` ([`crates/containerd-shim-shem`](../crates/containerd-shim-shem/)) is a containerd runtime shim. With it, containerd, and Docker on top of it, run containers on shem: the image is an ordinary OCI image, and its entrypoint, a static RV32 Linux executable, runs on a shem vCPU instead of the host CPU. This is the pattern runwasi uses to run WebAssembly.
+
+## With Docker
+
+```sh
+cargo build --release -p containerd-shim-shem
+sudo install target/release/containerd-shim-shem-v1 /usr/local/bin/
+
+just cc -O2 -o hello guests/hello.c
+printf 'FROM scratch\nCOPY hello /hello\nENTRYPOINT ["/hello"]\n' > Dockerfile
+docker build --platform linux/riscv32 -t shem-hello .
+docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 shem-hello one two
+```
+
+Docker 23 and later take a containerd shim's name as `--runtime` with no configuration, so installing the binary is the only setup. The platform is `linux/riscv32`, which is what the image is: RV32 Linux programs. The runtime is what puts them on shem; without it, Docker tries to run them on the host CPU and fails with `exec format error`. `just docker-test` builds and runs an image this way and checks the output and the exit status, and CI runs it on every push.
+
+## With containerd
 
 ```sh
 cargo build --release -p containerd-shim-shem
@@ -22,7 +38,7 @@ containerd starts the shim and calls its task service over ttrpc. The shim:
 
 1. **create**: mounts the image's root filesystem, which containerd's snapshotter prepared, into the bundle;
 2. **start**: reads the bundle's `config.json` (the OCI runtime spec) for the process's arguments, environment and working directory, and the memory limit, which becomes the guest's memory (64 MiB if none is set), then runs the process as a shem container on the reference vCPU, with its standard streams on containerd's FIFOs;
-3. **wait**, **state**: report the exit status when the container's init exits;
+3. **wait**, **state**: report the exit status when the container's init exits; the shim also publishes the task's create, start, exit and delete events to containerd, which is how Docker learns that a container has exited;
 4. **kill**: stops the guest at the next slice of instructions, with the status a shell reports for the signal;
 5. **delete**: unmounts the root filesystem.
 
@@ -32,5 +48,5 @@ The part that turns a bundle into a container ([`bundle.rs`](../crates/container
 
 - Shem images with warm state: containerd unpacks only standard layers, so for now the shim starts the entrypoint cold.
 - The neural vCPU, which needs a server; the shim uses the reference vCPU.
-- `ctr exec`, pausing, checkpoints and resource statistics.
+- `ctr exec` and `docker exec`, pausing, checkpoints and resource statistics, and `-t` terminals.
 - A Kubernetes `RuntimeClass` example.

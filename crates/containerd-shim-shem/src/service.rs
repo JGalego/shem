@@ -1,6 +1,7 @@
 //! The containerd shim v2 protocol: containerd starts this binary, talks to it
 //! over ttrpc, and calls the task service below to create, start, wait for,
-//! kill and delete the container.
+//! kill and delete the container. The shim reports what happens to the task
+//! as events, which is how Docker learns that a container has exited.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -10,9 +11,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use containerd_shim::event::Event;
+use containerd_shim::protos::events::task::{TaskCreate, TaskDelete, TaskExit, TaskStart};
 use containerd_shim::protos::protobuf::well_known_types::timestamp::Timestamp;
 use containerd_shim::protos::protobuf::{EnumOrUnknown, MessageField};
-use containerd_shim::protos::ttrpc;
+use containerd_shim::protos::ttrpc::{self, context::Context};
 use containerd_shim::synchronous::publisher::RemotePublisher;
 use containerd_shim::{
     self as shim, Config, DeleteResponse, ExitSignal, Flags, StartOpts, TtrpcContext, TtrpcResult,
@@ -29,6 +32,9 @@ const SIGKILL: u32 = 9;
 pub struct Service {
     exit: Arc<ExitSignal>,
     task: Arc<(Mutex<Option<Task>>, Condvar)>,
+    /// The containerd namespace, which events are published in.
+    namespace: String,
+    events: Option<Arc<RemotePublisher>>,
 }
 
 struct Task {
@@ -53,10 +59,12 @@ fn pid() -> u32 {
 impl shim::Shim for Service {
     type T = Service;
 
-    fn new(_runtime_id: &str, _args: &Flags, _config: &mut Config) -> Self {
+    fn new(_runtime_id: &str, args: &Flags, _config: &mut Config) -> Self {
         Self {
             exit: Arc::new(ExitSignal::default()),
             task: Arc::new((Mutex::new(None), Condvar::new())),
+            namespace: args.namespace.clone(),
+            events: None,
         }
     }
 
@@ -74,12 +82,26 @@ impl shim::Shim for Service {
         self.exit.wait();
     }
 
-    fn create_task_service(&self, _publisher: RemotePublisher) -> Self::T {
-        self.clone()
+    fn create_task_service(&self, publisher: RemotePublisher) -> Self::T {
+        Self {
+            events: Some(Arc::new(publisher)),
+            ..self.clone()
+        }
     }
 }
 
 impl Service {
+    /// Tell containerd what happened to the task, as runc's shim does.
+    fn publish(&self, event: impl Event + 'static) {
+        let Some(events) = &self.events else { return };
+        let topic = event.topic();
+        if let Err(err) =
+            events.publish(Context::default(), &topic, &self.namespace, Box::new(event))
+        {
+            warn!("publishing {topic}: {err}");
+        }
+    }
+
     fn with_task<R>(&self, f: impl FnOnce(&mut Task) -> R) -> TtrpcResult<R> {
         let mut task = self.task.0.lock().unwrap();
         let task = task
@@ -145,6 +167,12 @@ impl shim::Task for Service {
             )
             .map_err(error)?;
         }
+        self.publish(TaskCreate {
+            container_id: req.id.clone(),
+            bundle: req.bundle.clone(),
+            pid: pid(),
+            ..Default::default()
+        });
         *self.task.0.lock().unwrap() = Some(Task {
             id: req.id,
             bundle,
@@ -166,13 +194,23 @@ impl shim::Task for Service {
         _ctx: &TtrpcContext,
         _req: api::StartRequest,
     ) -> TtrpcResult<api::StartResponse> {
-        let (bundle_dir, streams, kill) = self.with_task(|task| {
+        let (id, bundle_dir, streams, kill) = self.with_task(|task| {
             task.status = api::Status::RUNNING;
             let streams = (task.stdin.clone(), task.stdout.clone(), task.stderr.clone());
-            (task.bundle.clone(), streams, task.kill.clone())
+            (
+                task.id.clone(),
+                task.bundle.clone(),
+                streams,
+                task.kill.clone(),
+            )
         })?;
         let bundle = Bundle::load(&bundle_dir).map_err(error)?;
-        let state = self.task.clone();
+        self.publish(TaskStart {
+            container_id: id.clone(),
+            pid: pid(),
+            ..Default::default()
+        });
+        let service = self.clone();
         std::thread::spawn(move || {
             let status = match stdio(&streams.0, &streams.1, &streams.2) {
                 Ok(stdio) => bundle::run(&bundle, stdio, &kill).unwrap_or_else(|err| {
@@ -188,12 +226,22 @@ impl shim::Task for Service {
                     125
                 }
             };
-            let (lock, exited) = &*state;
+            // The container's streams are closed by now, so readers see the end
+            let at = Timestamp::now();
+            let (lock, exited) = &*service.task;
             if let Some(task) = lock.lock().unwrap().as_mut() {
                 task.status = api::Status::STOPPED;
-                task.exited = Some((status as u32, Timestamp::now()));
+                task.exited = Some((status as u32, at.clone()));
             }
             exited.notify_all();
+            service.publish(TaskExit {
+                container_id: id.clone(),
+                id,
+                pid: pid(),
+                exit_status: status as u32,
+                exited_at: MessageField::some(at),
+                ..Default::default()
+            });
         });
         Ok(api::StartResponse {
             pid: pid(),
@@ -252,11 +300,20 @@ impl shim::Task for Service {
         _ctx: &TtrpcContext,
         _req: api::DeleteRequest,
     ) -> TtrpcResult<api::DeleteResponse> {
-        let (bundle, exited) = self.with_task(|task| (task.bundle.clone(), task.exited.clone()))?;
+        let (id, bundle, exited) =
+            self.with_task(|task| (task.id.clone(), task.bundle.clone(), task.exited.clone()))?;
         let rootfs = bundle.join("rootfs");
         if let Err(err) = shim::mount::umount_recursive(rootfs.to_str(), 0) {
             warn!("unmounting {}: {err}", rootfs.display());
         }
+        self.publish(TaskDelete {
+            container_id: id.clone(),
+            id,
+            pid: pid(),
+            exit_status: exited.as_ref().map_or(0, |(status, _)| *status),
+            exited_at: MessageField::from_option(exited.clone().map(|(_, at)| at)),
+            ..Default::default()
+        });
         Ok(api::DeleteResponse {
             pid: pid(),
             exit_status: exited.as_ref().map_or(0, |(status, _)| *status),

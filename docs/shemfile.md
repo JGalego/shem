@@ -141,5 +141,4 @@ Layers have sorted entries, timestamps of 0 and root ownership, compression is d
 ## Later
 
 - A BuildKit frontend (`# syntax=ghcr.io/shem/shemfile:1`), so `docker buildx build` does the parsing, caching and pushing.
-- Which OCI platform should shem images declare, so Docker and containerd pick a shem shim? runwasi uses `wasi/wasm`.
 - How much host process state should a state layer carry before it becomes CRIU by another name?

@@ -108,6 +108,25 @@ containerd-test: toolchain
         exit 1
     fi
 
+# Build an RV32 image with docker build and run it with docker run on the shem runtime; needs Docker and sudo
+docker-test: toolchain
+    #!/bin/sh
+    set -e
+    cargo build --release -p containerd-shim-shem
+    sudo install -m 0755 target/release/containerd-shim-shem-v1 /usr/local/bin/
+    mkdir -p target/oci-hello
+    just cc -O2 -o target/oci-hello/hello guests/hello.c
+    printf 'FROM scratch\nCOPY hello /hello\nENTRYPOINT ["/hello"]\n' | docker build -q --platform linux/riscv32 -t shem-hello:riscv32 -f - target/oci-hello
+    status=0
+    timeout 120 docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 shem-hello:riscv32 one two > target/oci-hello/docker.txt || status=$?
+    cat target/oci-hello/docker.txt
+    echo "docker run exited with status $status (the program exits with its argument count, 3)"
+    if ! grep -q "sum of squares below 100000" target/oci-hello/docker.txt || [ "$status" != 3 ]; then
+        docker info 2>&1 | grep -iE 'version|storage|driver|runtime' || true
+        sudo journalctl -u containerd -u docker --no-pager | grep -iE 'shem|error|warn' | tail -30 || true
+        exit 1
+    fi
+
 # Push and pull an image through a local registry; needs Docker and oras
 registry-test:
     #!/bin/sh

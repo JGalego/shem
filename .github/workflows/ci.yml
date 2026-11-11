@@ -90,7 +90,7 @@ jobs:
         run: just vm-tests
 
   containerd:
-    name: containerd shim (ctr run)
+    name: containerd shim (ctr run, docker run)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -100,6 +100,8 @@ jobs:
       - uses: extractions/setup-just@v4
       - name: Run an RV32 container through containerd on shem
         run: just containerd-test
+      - name: Build it with docker build and run it with docker run on shem
+        run: just docker-test
 
   registry:
     name: Registry (push and pull)
