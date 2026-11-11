@@ -8,7 +8,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use common::SharedBuf;
-use shem::linux::{Action, Linux, Stdio};
+use shem::linux::{Action, Exec, Linux, Process, Report, Stdio, Termination, Wait};
 use shem::reference::ReferenceVcpu;
 use shem::vcpu::{A0, A7, Vcpu};
 use tempfile::TempDir;
@@ -23,13 +23,20 @@ const SYMLINKAT: u32 = 36;
 const CHDIR: u32 = 49;
 const OPENAT: u32 = 56;
 const CLOSE: u32 = 57;
+const PIPE2: u32 = 59;
 const GETDENTS64: u32 = 61;
 const LLSEEK: u32 = 62;
 const READ: u32 = 63;
 const WRITE: u32 = 64;
 const READV: u32 = 65;
 const READLINKAT: u32 = 78;
+const EXIT_GROUP: u32 = 94;
+const KILL: u32 = 129;
+const RT_SIGACTION: u32 = 134;
 const UNAME: u32 = 160;
+const CLONE: u32 = 220;
+const EXECVE: u32 = 221;
+const WAIT4: u32 = 260;
 const RENAMEAT2: u32 = 276;
 const GETRANDOM: u32 = 278;
 const STATX: u32 = 291;
@@ -44,6 +51,7 @@ const O_RDONLY: u32 = 0;
 const O_WRONLY: u32 = 1;
 const O_CREAT: u32 = 0o100;
 const O_EXCL: u32 = 0o200;
+const O_NONBLOCK: u32 = 0o4000;
 const O_TRUNC: u32 = 0o1000;
 const O_DIRECTORY: u32 = 0o200000;
 const O_CLOEXEC: u32 = 0o2000000;
@@ -51,6 +59,11 @@ const F_GETFD: u32 = 1;
 const RENAME_NOREPLACE: u32 = 1;
 const CLOCK_REALTIME: u32 = 0;
 const CLOCK_MONOTONIC: u32 = 1;
+const SIGCHLD: u32 = 17;
+const SIGPIPE: u32 = 13;
+const CLONE_VM: u32 = 0x100;
+const CLONE_THREAD: u32 = 0x10000;
+const WNOHANG: u32 = 1;
 
 const ENOENT: i32 = -2;
 const EBADF: i32 = -9;
@@ -58,12 +71,17 @@ const EEXIST: i32 = -17;
 const ENOTDIR: i32 = -20;
 const EISDIR: i32 = -21;
 const EINVAL: i32 = -22;
+const EACCES: i32 = -13;
+const ENOEXEC: i32 = -8;
+const EAGAIN: i32 = -11;
+const EPIPE: i32 = -32;
 const EBUSY: i32 = -16;
 
 const MEM: u32 = 1 << 20;
 
 struct Guest {
     linux: Linux,
+    process: Process,
     vcpu: ReferenceVcpu,
     stdout: SharedBuf,
     root: TempDir,
@@ -74,7 +92,7 @@ struct Guest {
 impl Guest {
     fn new() -> Self {
         let mut guest = Self::without_root();
-        guest.linux.set_root(guest.root.path()).unwrap();
+        guest.process.set_root(guest.root.path()).unwrap();
         guest
     }
 
@@ -86,7 +104,8 @@ impl Guest {
             stderr: Box::new(std::io::sink()),
         };
         Self {
-            linux: Linux::new(stdio, 0x1000, MEM),
+            linux: Linux::new(),
+            process: Process::new(1, stdio, 0x1000, MEM),
             vcpu: ReferenceVcpu::new(MEM),
             stdout,
             root: tempfile::tempdir().unwrap(),
@@ -121,15 +140,38 @@ impl Guest {
         bytes
     }
 
-    fn call(&mut self, nr: u32, args: &[u32]) -> i32 {
+    fn action(&mut self, nr: u32, args: &[u32]) -> Action {
         self.vcpu.set_reg(A7, nr);
         for (i, &arg) in args.iter().enumerate() {
             self.vcpu.set_reg(A0 + i, arg);
         }
-        match self.linux.handle(&mut self.vcpu, self.retired) {
+        self.linux
+            .handle(&mut self.process, &mut self.vcpu, self.retired)
+    }
+
+    fn call(&mut self, nr: u32, args: &[u32]) -> i32 {
+        match self.action(nr, args) {
             Action::Return(value) => value as i32,
-            Action::Exit(status) => panic!("guest exited with status {status}"),
+            action => panic!("expected a return value, got {action:?}"),
         }
+    }
+
+    fn pipe(&mut self, flags: u32) -> (u32, u32) {
+        let fds = self.buf(8);
+        assert_eq!(self.call(PIPE2, &[fds, flags]), 0);
+        let fds = self.get(fds, 8);
+        (word(&fds, 0), word(&fds, 4))
+    }
+
+    /// Write a NULL-terminated array of strings into guest memory.
+    fn strings(&mut self, list: &[&str]) -> u32 {
+        let pointers: Vec<u32> = list.iter().map(|s| self.cstr(s)).chain([0]).collect();
+        self.put(
+            &pointers
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
     }
 
     fn open(&mut self, path: &str, flags: u32) -> i32 {
@@ -407,4 +449,112 @@ fn without_a_root_there_are_no_files() {
     let mut g = Guest::without_root();
     assert_eq!(g.open("/anything", O_RDONLY), ENOENT);
     assert_eq!(g.write(1, b"stdio still works"), 17);
+}
+
+#[test]
+fn pipes_block_when_empty_and_read_eof_once_closed() {
+    let mut g = Guest::new();
+    let (read, write) = g.pipe(0);
+    assert_eq!((read, write), (3, 4));
+    let buf = g.buf(16);
+    assert_eq!(g.action(READ, &[read, buf, 16]), Action::Block);
+    assert_eq!(g.write(write as i32, b"data"), 4);
+    assert_eq!(g.read(read as i32, 16), b"data");
+    assert_eq!(g.call(CLOSE, &[write]), 0);
+    assert_eq!(g.call(READ, &[read, buf, 16]), 0, "end of file");
+}
+
+#[test]
+fn nonblocking_pipes_return_eagain() {
+    let mut g = Guest::new();
+    let (read, _write) = g.pipe(O_NONBLOCK);
+    let buf = g.buf(16);
+    assert_eq!(g.call(READ, &[read, buf, 16]), EAGAIN);
+}
+
+#[test]
+fn writing_to_an_unread_pipe_raises_sigpipe_unless_ignored() {
+    let mut g = Guest::new();
+    let (read, write) = g.pipe(0);
+    g.call(CLOSE, &[read]);
+    let data = g.put(b"x");
+    let killed = Action::Exit(Termination::Killed(SIGPIPE));
+    assert_eq!(g.action(WRITE, &[write, data, 1]), killed);
+
+    let sig_ign = g.put(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(g.call(RT_SIGACTION, &[SIGPIPE, sig_ign, 0, 8]), 0);
+    assert_eq!(g.write(write as i32, b"x"), EPIPE);
+}
+
+#[test]
+fn process_calls_become_container_actions() {
+    let mut g = Guest::new();
+    let fork = Action::Fork {
+        stack: 0,
+        parent_tid: 0,
+    };
+    assert_eq!(g.action(CLONE, &[SIGCHLD, 0, 0, 0, 0]), fork);
+    assert_eq!(
+        g.call(CLONE, &[CLONE_VM | CLONE_THREAD, 0, 0, 0, 0]),
+        EINVAL
+    );
+
+    let status = g.buf(4);
+    let wait = Wait {
+        pid: None,
+        nohang: true,
+        report: Report::Status(status),
+    };
+    assert_eq!(
+        g.action(WAIT4, &[-1i32 as u32, status, WNOHANG, 0]),
+        Action::Wait(wait)
+    );
+    assert_eq!(
+        g.action(KILL, &[5, 15]),
+        Action::Kill { pid: 5, signal: 15 }
+    );
+    assert_eq!(
+        g.action(EXIT_GROUP, &[3]),
+        Action::Exit(Termination::Exited(3))
+    );
+}
+
+#[test]
+fn execve_reads_the_program_and_follows_shebang_lines() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut g = Guest::new();
+    let program = common::elf(&[common::ECALL], &[]);
+    fs::create_dir(g.host("bin")).unwrap();
+    for (name, contents) in [
+        ("prog", program.clone()),
+        ("script", b"#!/bin/prog -x\necho ignored\n".to_vec()),
+        ("junk", b"not a program".to_vec()),
+        ("plain", program.clone()),
+    ] {
+        fs::write(g.host(&format!("bin/{name}")), contents).unwrap();
+        let mode = if name == "plain" { 0o644 } else { 0o755 };
+        fs::set_permissions(
+            g.host(&format!("bin/{name}")),
+            fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
+    }
+
+    let (script, argv) = (g.cstr("/bin/script"), g.strings(&["script", "arg1"]));
+    let envp = g.strings(&["HOME=/"]);
+    let expected = Exec {
+        elf: program,
+        argv: ["/bin/prog", "-x", "/bin/script", "arg1"]
+            .map(|a| a.as_bytes().to_vec())
+            .to_vec(),
+        envp: vec![b"HOME=/".to_vec()],
+    };
+    assert_eq!(
+        g.action(EXECVE, &[script, argv, envp]),
+        Action::Exec(expected)
+    );
+
+    let (junk, plain) = (g.cstr("/bin/junk"), g.cstr("/bin/plain"));
+    assert_eq!(g.call(EXECVE, &[junk, argv, 0]), ENOEXEC);
+    assert_eq!(g.call(EXECVE, &[plain, argv, 0]), EACCES);
 }

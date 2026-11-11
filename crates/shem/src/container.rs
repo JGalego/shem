@@ -1,16 +1,43 @@
-//! The hypervisor loop for container mode: run the vCPU, service its exits, repeat.
+//! Container mode: a set of guest processes, each on its own vCPU, with the host
+//! as their kernel.
+//!
+//! The scheduler runs each runnable process for a slice of instructions in
+//! turn, which is all the preemption a guest needs (design rule 3). A process
+//! whose system call cannot finish yet, such as a read from an empty pipe, is
+//! parked with its pc still on the `ecall`, and the call is retried on its next
+//! turn. `fork` copies the vCPU (design rule 4). The container ends when its
+//! first process, init, exits.
+
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use thiserror::Error;
 
 use crate::elf::{self, ElfError};
 use crate::emulate::{Emulation, Emulator};
-use crate::linux::{Action, Linux, Stdio};
+use crate::linux::{Action, Delivery, Exec, Linux, Process, Report, Stdio, Termination, Wait};
 use crate::vcpu::{A0, Exit, ExitReason, MemoryFault, SP, Vcpu};
 
 /// Memory kept free for the stack at the top of guest memory, above the heap and mappings.
 pub const STACK_SIZE: u32 = 1 << 20;
-/// Instructions per `run` call. Each slice boundary is a preemption point.
+/// Instructions per turn. Each slice boundary is a preemption point.
 pub const SLICE: u64 = 1 << 16;
+/// The pid of the container's first process.
+pub const INIT: u32 = 1;
+/// Most processes a container holds at once, zombies included.
+const MAX_PROCESSES: usize = 256;
+
+const SIGILL: u32 = 4;
+const SIGTRAP: u32 = 5;
+const SIGSEGV: u32 = 11;
+const SIGCHLD: u32 = 17;
+const CLD_EXITED: u32 = 1;
+const CLD_KILLED: u32 = 2;
+const EPERM: u32 = 1;
+const ESRCH: u32 = 3;
+const ECHILD: u32 = 10;
+const EAGAIN: u32 = 11;
+const EFAULT: u32 = 14;
 
 #[derive(Debug, Error)]
 pub enum StartError {
@@ -22,77 +49,420 @@ pub enum StartError {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RunError {
-    /// The guest stopped on something the host cannot service.
+    /// Init stopped on something the host cannot service.
     #[error("guest stopped: {:?} at pc {:#010x}", .0.reason, .0.pc)]
     Fault(Exit),
     #[error("guest did not exit within {0} instructions")]
     StepLimit(u64),
+    #[error("every guest process is blocked waiting for another")]
+    Deadlock,
 }
 
-/// One guest process plus the host-side kernel state that belongs to it.
-pub struct Container<V> {
+/// One guest process: its kernel state, its vCPU, and where it is in its life.
+pub struct Task<V> {
+    pub process: Process,
     pub vcpu: V,
-    pub linux: Linux,
-    pub emulator: Emulator,
-    /// Instructions retired so far by the vCPU. Emulated instructions are not counted.
-    pub steps: u64,
+    emulator: Emulator,
+    pub state: State,
 }
 
-impl<V: Vcpu> Container<V> {
-    /// Load a static executable into `vcpu` and set it up to start at its entry point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Runnable,
+    /// Parked on a system call that will be retried.
+    Blocked,
+    /// Exited, and not yet reaped by its parent.
+    Zombie(Termination),
+}
+
+pub struct Container<V> {
+    pub linux: Linux,
+    tasks: BTreeMap<u32, Task<V>>,
+    next_pid: u32,
+    /// Instructions retired so far, across all processes.
+    pub steps: u64,
+    /// Processes other than init that a fault killed, for diagnostics.
+    pub faults: Vec<(u32, Exit)>,
+    /// Print each system call and its outcome to stderr, like strace.
+    pub trace: bool,
+}
+
+impl<V: Vcpu + Clone> Container<V> {
+    /// Start a container whose init process runs the static executable `elf`.
     pub fn from_elf(
-        mut vcpu: V,
+        vcpu: V,
         elf: &[u8],
         argv: &[String],
         envp: &[String],
         stdio: Stdio,
     ) -> Result<Self, StartError> {
-        let image = elf::load(&mut vcpu, elf)?;
-        let stack_top = vcpu.mem_size();
-        let sp = elf::setup_stack(&mut vcpu, &image, stack_top, argv, envp)?;
-        vcpu.set_reg(SP, sp);
-        vcpu.set_pc(image.entry);
-        let linux = Linux::new(stdio, image.brk, stack_top.saturating_sub(STACK_SIZE));
-        Ok(Self {
+        let mut task = Task {
+            process: Process::new(INIT, stdio, 0, 0),
             vcpu,
-            linux,
             emulator: Emulator::default(),
+            state: State::Runnable,
+        };
+        load(&mut task, elf, argv, envp)?;
+        Ok(Self {
+            linux: Linux::new(),
+            tasks: BTreeMap::from([(INIT, task)]),
+            next_pid: INIT + 1,
             steps: 0,
+            faults: Vec::new(),
+            trace: false,
         })
     }
 
-    /// Run until the guest exits, and return its exit status.
+    /// Give the guest a filesystem: the host directory `root` becomes `/`.
+    pub fn set_root(&mut self, root: &Path) -> std::io::Result<()> {
+        self.tasks.get_mut(&INIT).unwrap().process.set_root(root)
+    }
+
+    /// The first process, which lives as long as the container.
+    pub fn init(&self) -> &Task<V> {
+        &self.tasks[&INIT]
+    }
+
+    pub fn task(&self, pid: u32) -> Option<&Task<V>> {
+        self.tasks.get(&pid)
+    }
+
+    /// Run until init exits, and return its exit status: the exit code, or 128
+    /// plus the signal that killed it.
     pub fn run(&mut self, max_steps: Option<u64>) -> Result<u8, RunError> {
         loop {
-            let budget = match max_steps {
-                None => SLICE,
-                Some(max) if self.steps >= max => return Err(RunError::StepLimit(max)),
-                Some(max) => SLICE.min(max - self.steps),
-            };
-            let exit = self.vcpu.run(budget);
-            self.steps += exit.steps;
-            match exit.reason {
-                // A scheduler running many guests would switch to another one here.
-                ExitReason::Budget => {}
-                ExitReason::Ecall => match self.linux.handle(&mut self.vcpu, self.steps) {
-                    Action::Exit(status) => return Ok(status),
-                    Action::Return(value) => {
-                        self.vcpu.set_reg(A0, value);
-                        self.vcpu.set_pc(exit.pc.wrapping_add(4));
-                    }
-                },
-                ExitReason::IllegalInstruction(ins) => {
-                    match self.emulator.emulate(&mut self.vcpu, ins) {
-                        Emulation::Done => {}
-                        Emulation::Unsupported => return Err(RunError::Fault(exit)),
-                        Emulation::Fault(addr) => {
-                            let reason = ExitReason::MemoryFault(addr);
-                            return Err(RunError::Fault(Exit { reason, ..exit }));
-                        }
-                    }
+            let mut progress = false;
+            let pids: Vec<u32> = self.tasks.keys().copied().collect();
+            for pid in pids {
+                progress |= self.turn(pid, max_steps)?;
+                if let State::Zombie(termination) = self.tasks[&INIT].state {
+                    return Ok(termination.status());
                 }
-                _ => return Err(RunError::Fault(exit)),
+            }
+            if !progress {
+                return Err(RunError::Deadlock);
             }
         }
     }
+
+    /// Give `pid` one turn, and report whether it got anywhere.
+    fn turn(&mut self, pid: u32, max_steps: Option<u64>) -> Result<bool, RunError> {
+        let Some(task) = self.tasks.get_mut(&pid) else {
+            return Ok(false);
+        };
+        if let State::Zombie(_) = task.state {
+            return Ok(false);
+        }
+        // Pending signals come first: a handler runs, or a default action kills.
+        let parked = task.state == State::Blocked;
+        match task.process.signals.deliver(&mut task.vcpu, parked) {
+            Delivery::Killed(termination) => {
+                self.terminate(pid, termination);
+                return Ok(true);
+            }
+            Delivery::Handler => task.state = State::Runnable,
+            Delivery::Nothing if parked => return Ok(self.syscall(pid)),
+            Delivery::Nothing => {}
+        }
+        let budget = match max_steps {
+            None => SLICE,
+            Some(max) if self.steps >= max => return Err(RunError::StepLimit(max)),
+            Some(max) => SLICE.min(max - self.steps),
+        };
+        let exit = task.vcpu.run(budget);
+        self.steps += exit.steps;
+        match exit.reason {
+            ExitReason::Budget => {}
+            ExitReason::Ecall => {
+                self.syscall(pid);
+            }
+            ExitReason::IllegalInstruction(ins) => {
+                let task = self.tasks.get_mut(&pid).unwrap();
+                match task.emulator.emulate(&mut task.vcpu, ins) {
+                    Emulation::Done => {}
+                    Emulation::Unsupported => self.fault(pid, exit)?,
+                    Emulation::Fault(addr) => {
+                        let reason = ExitReason::MemoryFault(addr);
+                        self.fault(pid, Exit { reason, ..exit })?;
+                    }
+                }
+            }
+            _ => self.fault(pid, exit)?,
+        }
+        Ok(true)
+    }
+
+    /// Service the system call `pid` is stopped on. Returns false if it blocked.
+    fn syscall(&mut self, pid: u32) -> bool {
+        let task = self.tasks.get_mut(&pid).unwrap();
+        let call = [17, 10, 11, 12, 13].map(|reg| task.vcpu.reg(reg));
+        let action = self
+            .linux
+            .handle(&mut task.process, &mut task.vcpu, self.steps);
+        if self.trace {
+            trace(pid, call, &action);
+        }
+        match action {
+            Action::Return(value) => self.finish(pid, value),
+            Action::Block => {
+                task.state = State::Blocked;
+                return false;
+            }
+            Action::Exit(termination) => self.terminate(pid, termination),
+            Action::Fork { stack, parent_tid } => {
+                let result = self.fork(pid, stack, parent_tid);
+                self.finish(pid, result);
+            }
+            Action::Exec(exec) => self.exec(pid, exec),
+            Action::Wait(wait) => return self.wait(pid, wait),
+            Action::Kill {
+                pid: target,
+                signal,
+            } => self.kill(pid, target, signal),
+            Action::Resume => task_state(&mut self.tasks, pid, State::Runnable),
+            Action::SetPgid { pid: child, pgid } => {
+                let result = match self.tasks.get_mut(&child) {
+                    Some(task) if task.process.ppid == pid => {
+                        task.process.pgid = pgid;
+                        0
+                    }
+                    Some(_) => EPERM.wrapping_neg(),
+                    None => ESRCH.wrapping_neg(),
+                };
+                self.finish(pid, result);
+            }
+            Action::GetPgid { pid: target } => {
+                let result = (self.tasks.get(&target))
+                    .map_or(ESRCH.wrapping_neg(), |task| task.process.pgid);
+                self.finish(pid, result);
+            }
+        }
+        true
+    }
+
+    /// Return `value` from the system call `pid` is stopped on.
+    fn finish(&mut self, pid: u32, value: u32) {
+        let task = self.tasks.get_mut(&pid).unwrap();
+        task.vcpu.set_reg(A0, value);
+        task.vcpu.set_pc(task.vcpu.pc().wrapping_add(4));
+        task.state = State::Runnable;
+    }
+
+    fn fork(&mut self, parent: u32, stack: u32, parent_tid: u32) -> u32 {
+        if self.tasks.len() >= MAX_PROCESSES {
+            return EAGAIN.wrapping_neg();
+        }
+        let pid = self.next_pid;
+        let task = self.tasks.get_mut(&parent).unwrap();
+        if parent_tid != 0 && task.vcpu.write_mem(parent_tid, &pid.to_le_bytes()).is_err() {
+            return EFAULT.wrapping_neg();
+        }
+        self.next_pid += 1;
+        let mut child = Task {
+            process: task.process.fork(pid),
+            vcpu: task.vcpu.clone(),
+            emulator: Emulator::default(),
+            state: State::Runnable,
+        };
+        // The child returns 0 from the same `ecall`, on its own stack if given one.
+        child.vcpu.set_reg(A0, 0);
+        child.vcpu.set_pc(child.vcpu.pc().wrapping_add(4));
+        if stack != 0 {
+            child.vcpu.set_reg(SP, stack);
+        }
+        self.tasks.insert(pid, child);
+        pid
+    }
+
+    /// Replace the image of `pid`. `Linux` has already checked that the program
+    /// loads, so the only failure left is arguments that overflow the stack.
+    /// That is past the point of no return, and Linux kills the process then too.
+    fn exec(&mut self, pid: u32, exec: Exec) {
+        let task = self.tasks.get_mut(&pid).unwrap();
+        task.vcpu.reset();
+        task.emulator = Emulator::default();
+        task.state = State::Runnable;
+        if load(task, &exec.elf, &exec.argv, &exec.envp).is_err() {
+            self.terminate(pid, Termination::Killed(SIGSEGV));
+        }
+    }
+
+    /// Reap a zombie child of `pid`, or block until there is one. Returns false
+    /// if it blocked.
+    fn wait(&mut self, pid: u32, wait: Wait) -> bool {
+        let children: Vec<(u32, State)> = self
+            .tasks
+            .iter()
+            .filter(|(child, task)| {
+                task.process.ppid == pid && wait.pid.is_none_or(|wanted| wanted == **child)
+            })
+            .map(|(&child, task)| (child, task.state))
+            .collect();
+        if children.is_empty() {
+            self.finish(pid, ECHILD.wrapping_neg());
+            return true;
+        }
+        let zombie = children.iter().find_map(|&(child, state)| match state {
+            State::Zombie(termination) => Some((child, termination)),
+            _ => None,
+        });
+        let Some((child, termination)) = zombie else {
+            if !wait.nohang {
+                self.tasks.get_mut(&pid).unwrap().state = State::Blocked;
+                return false;
+            }
+            let cleared = match wait.report {
+                Report::Siginfo(info) => self.write(pid, info, &[0; 128]),
+                Report::Status(_) => true,
+            };
+            self.finish(pid, if cleared { 0 } else { EFAULT.wrapping_neg() });
+            return true;
+        };
+        let (written, value) = match wait.report {
+            Report::Status(0) => (true, child),
+            Report::Status(status) => {
+                let word = termination.wait_status().to_le_bytes();
+                (self.write(pid, status, &word), child)
+            }
+            Report::Siginfo(info) => {
+                let (code, status) = match termination {
+                    Termination::Exited(code) => (CLD_EXITED, code as u32),
+                    Termination::Killed(signal) => (CLD_KILLED, signal),
+                };
+                let mut siginfo = [0u8; 128];
+                for (offset, field) in [(0, SIGCHLD), (8, code), (12, child), (20, status)] {
+                    siginfo[offset..offset + 4].copy_from_slice(&field.to_le_bytes());
+                }
+                (self.write(pid, info, &siginfo), 0)
+            }
+        };
+        if !written {
+            self.finish(pid, EFAULT.wrapping_neg());
+            return true;
+        }
+        self.tasks.remove(&child);
+        self.finish(pid, value);
+        true
+    }
+
+    /// Send `signal` from `sender` to a pid, to a process group (0 for the
+    /// sender's, -g for group g), or to every process but init (-1). Handlers
+    /// never run, so a signal either kills its target or does nothing. Zombies
+    /// count as targets, but are past killing.
+    fn kill(&mut self, sender: u32, target: i32, signal: u32) {
+        let group = |pgid: u32| -> Vec<u32> {
+            let members = self
+                .tasks
+                .iter()
+                .filter(|(_, task)| task.process.pgid == pgid);
+            members.map(|(&pid, _)| pid).collect()
+        };
+        let targets: Vec<u32> = match target {
+            1.. if self.tasks.contains_key(&(target as u32)) => vec![target as u32],
+            1.. => Vec::new(),
+            0 => group(self.tasks[&sender].process.pgid),
+            -1 => self
+                .tasks
+                .keys()
+                .copied()
+                .filter(|&pid| pid != INIT)
+                .collect(),
+            _ => group(target.unsigned_abs()),
+        };
+        if targets.is_empty() {
+            self.finish(sender, ESRCH.wrapping_neg());
+            return;
+        }
+        for &pid in &targets {
+            let task = self.tasks.get_mut(&pid).unwrap();
+            if matches!(task.state, State::Zombie(_)) {
+                continue;
+            }
+            if let Some(termination) = task.process.signals.raise(signal) {
+                self.terminate(pid, termination);
+            }
+        }
+        if !matches!(self.tasks[&sender].state, State::Zombie(_)) {
+            self.finish(sender, 0);
+        }
+    }
+
+    /// A process other than init that faults is killed, as Linux would with
+    /// SIGSEGV or SIGILL. A fault in init stops the container with the details.
+    fn fault(&mut self, pid: u32, exit: Exit) -> Result<(), RunError> {
+        if pid == INIT {
+            return Err(RunError::Fault(exit));
+        }
+        self.faults.push((pid, exit));
+        let signal = match exit.reason {
+            ExitReason::IllegalInstruction(_) => SIGILL,
+            ExitReason::Ebreak => SIGTRAP,
+            _ => SIGSEGV,
+        };
+        self.terminate(pid, Termination::Killed(signal));
+        Ok(())
+    }
+
+    /// End `pid`: close its files, which closes pipe ends, and hand its children
+    /// to init.
+    fn terminate(&mut self, pid: u32, termination: Termination) {
+        let task = self.tasks.get_mut(&pid).unwrap();
+        task.state = State::Zombie(termination);
+        task.process.release();
+        let ppid = task.process.ppid;
+        if let Some(parent) = self.tasks.get_mut(&ppid) {
+            // SIGCHLD is ignored by default, so this only queues it for a handler.
+            parent.process.signals.raise(SIGCHLD);
+        }
+        for task in self.tasks.values_mut() {
+            if task.process.ppid == pid {
+                task.process.ppid = INIT;
+            }
+        }
+    }
+
+    fn write(&mut self, pid: u32, addr: u32, bytes: &[u8]) -> bool {
+        let task = self.tasks.get_mut(&pid).unwrap();
+        task.vcpu.write_mem(addr, bytes).is_ok()
+    }
+}
+
+/// Load a program into `task`: its segments, a fresh address space, and the
+/// initial stack, ready to start at the entry point.
+fn load<V: Vcpu>(
+    task: &mut Task<V>,
+    elf: &[u8],
+    argv: &[impl AsRef<[u8]>],
+    envp: &[impl AsRef<[u8]>],
+) -> Result<(), StartError> {
+    let image = elf::load(&mut task.vcpu, elf)?;
+    let stack_top = task.vcpu.mem_size();
+    let sp = elf::setup_stack(&mut task.vcpu, &image, stack_top, argv, envp)?;
+    task.process
+        .exec(image.brk, stack_top.saturating_sub(STACK_SIZE));
+    task.vcpu.set_reg(SP, sp);
+    task.vcpu.set_pc(image.entry);
+    Ok(())
+}
+
+/// Print one system call the way `strace` would, more or less.
+fn trace(pid: u32, [nr, args @ ..]: [u32; 5], action: &Action) {
+    let outcome = match action {
+        Action::Return(value) => (*value as i32).to_string(),
+        Action::Exec(exec) => {
+            let argv: Vec<_> = exec
+                .argv
+                .iter()
+                .map(|a| String::from_utf8_lossy(a))
+                .collect();
+            format!("exec {argv:?}")
+        }
+        other => format!("{other:?}"),
+    };
+    let [a0, a1, a2, a3] = args;
+    eprintln!("[{pid}] syscall {nr}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x}) -> {outcome}");
+}
+
+fn task_state<V>(tasks: &mut BTreeMap<u32, Task<V>>, pid: u32, state: State) {
+    tasks.get_mut(&pid).unwrap().state = state;
 }

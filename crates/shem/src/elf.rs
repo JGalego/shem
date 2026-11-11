@@ -42,8 +42,8 @@ pub enum ElfError {
     DoesNotFit(u32),
 }
 
-/// What the loader learned about the executable it placed in memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the loader learned about an executable.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {
     pub entry: u32,
     /// First page above the highest loaded segment: where the heap starts.
@@ -51,9 +51,20 @@ pub struct Image {
     /// Guest address of the program headers, if a loaded segment covers them.
     pub phdr: Option<u32>,
     pub phnum: u32,
+    segments: Vec<Segment>,
 }
 
-pub fn load(vcpu: &mut dyn Vcpu, data: &[u8]) -> Result<Image, ElfError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Segment {
+    vaddr: u32,
+    offset: usize,
+    filesz: u32,
+    memsz: u32,
+}
+
+/// Check that `data` is an executable this loader can place in `mem_size`
+/// bytes of guest memory, and work out where everything goes.
+pub fn parse(data: &[u8], mem_size: u32) -> Result<Image, ElfError> {
     if data.get(..4) != Some(b"\x7fELF".as_slice()) {
         return Err(ElfError::NotElf);
     }
@@ -77,6 +88,7 @@ pub fn load(vcpu: &mut dyn Vcpu, data: &[u8]) -> Result<Image, ElfError> {
     let phnum = u16_at(data, 44)? as u32;
     let mut top = 0u32;
     let mut phdr = None;
+    let mut segments = Vec::new();
     for i in 0..phnum {
         let ph = phoff as usize + (i * phentsize) as usize;
         let [p_type, offset, vaddr, _paddr, filesz, memsz] =
@@ -87,23 +99,23 @@ pub fn load(vcpu: &mut dyn Vcpu, data: &[u8]) -> Result<Image, ElfError> {
             _ => continue,
         }
         let (offset, vaddr, filesz, memsz) = (offset?, vaddr?, filesz?, memsz?);
-        if memsz < filesz {
+        if memsz < filesz || data.len() < offset as usize + filesz as usize {
             return Err(ElfError::Malformed);
         }
-        let bytes = data
-            .get(offset as usize..(offset as usize + filesz as usize))
-            .ok_or(ElfError::Malformed)?;
-        let end = vaddr
-            .checked_add(memsz)
-            .ok_or(ElfError::DoesNotFit(vaddr))?;
-        let fits = |_: MemoryFault| ElfError::DoesNotFit(vaddr);
-        vcpu.write_mem(vaddr, bytes).map_err(fits)?;
-        vcpu.write_mem(vaddr + filesz, &vec![0; (memsz - filesz) as usize])
-            .map_err(fits)?;
+        let end = match vaddr.checked_add(memsz) {
+            Some(end) if end <= mem_size => end,
+            _ => return Err(ElfError::DoesNotFit(vaddr)),
+        };
         if (offset..offset + filesz).contains(&phoff) {
             phdr = Some(vaddr + (phoff - offset));
         }
         top = top.max(end);
+        segments.push(Segment {
+            vaddr,
+            offset: offset as usize,
+            filesz,
+            memsz,
+        });
     }
     let brk = top
         .checked_next_multiple_of(PAGE_SIZE)
@@ -113,7 +125,22 @@ pub fn load(vcpu: &mut dyn Vcpu, data: &[u8]) -> Result<Image, ElfError> {
         brk,
         phdr,
         phnum,
+        segments,
     })
+}
+
+/// Place the executable `data` in guest memory.
+pub fn load(vcpu: &mut dyn Vcpu, data: &[u8]) -> Result<Image, ElfError> {
+    let image = parse(data, vcpu.mem_size())?;
+    for segment in &image.segments {
+        let fits = |_: MemoryFault| ElfError::DoesNotFit(segment.vaddr);
+        let bytes = &data[segment.offset..segment.offset + segment.filesz as usize];
+        vcpu.write_mem(segment.vaddr, bytes).map_err(fits)?;
+        let bss = vec![0; (segment.memsz - segment.filesz) as usize];
+        vcpu.write_mem(segment.vaddr + segment.filesz, &bss)
+            .map_err(fits)?;
+    }
+    Ok(image)
 }
 
 /// Lay out argc, argv, envp and the auxiliary vector below `stack_top`, the way
@@ -122,19 +149,14 @@ pub fn setup_stack(
     vcpu: &mut dyn Vcpu,
     image: &Image,
     stack_top: u32,
-    argv: &[String],
-    envp: &[String],
+    argv: &[impl AsRef<[u8]>],
+    envp: &[impl AsRef<[u8]>],
 ) -> Result<u32, MemoryFault> {
     let mut sp = stack_top;
     // AT_RANDOM normally seeds stack canaries. Fixed bytes keep runs deterministic.
     let random = push(vcpu, &mut sp, &[0; 16])?;
-    let mut strings = |list: &[String]| -> Result<Vec<u32>, MemoryFault> {
-        list.iter()
-            .map(|s| push(vcpu, &mut sp, &[s.as_bytes(), &[0]].concat()))
-            .collect()
-    };
-    let arg_ptrs = strings(argv)?;
-    let env_ptrs = strings(envp)?;
+    let arg_ptrs = push_strings(vcpu, &mut sp, argv)?;
+    let env_ptrs = push_strings(vcpu, &mut sp, envp)?;
 
     let mut words = vec![argv.len() as u32];
     words.extend(&arg_ptrs);
@@ -165,6 +187,16 @@ pub fn setup_stack(
     sp = sp.checked_sub(bytes.len() as u32).ok_or(fault)? & !15;
     vcpu.write_mem(sp, &bytes)?;
     Ok(sp)
+}
+
+fn push_strings(
+    vcpu: &mut dyn Vcpu,
+    sp: &mut u32,
+    list: &[impl AsRef<[u8]>],
+) -> Result<Vec<u32>, MemoryFault> {
+    list.iter()
+        .map(|s| push(vcpu, sp, &[s.as_ref(), &[0]].concat()))
+        .collect()
 }
 
 fn push(vcpu: &mut dyn Vcpu, sp: &mut u32, bytes: &[u8]) -> Result<u32, MemoryFault> {

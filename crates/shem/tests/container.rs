@@ -121,7 +121,10 @@ fn brk_grows_the_heap() {
     ]);
     assert_eq!(out.result, Ok(99));
     // The whole file fits in one page, so the heap starts on the next one.
-    assert_eq!(out.container.linux.mm.brk(), BASE + PAGE_SIZE + 256);
+    assert_eq!(
+        out.container.init().process.mm.brk(),
+        BASE + PAGE_SIZE + 256
+    );
 }
 
 #[test]
@@ -194,7 +197,7 @@ fn mmap_returns_zeroed_pages_below_the_stack() {
         exit_a0(),
     ]);
     assert_eq!(out.result, Ok(0));
-    let addr = out.container.vcpu.reg(S0 as usize);
+    let addr = out.container.init().vcpu.reg(S0 as usize);
     assert_eq!(addr, MEM - STACK_SIZE - 2 * PAGE_SIZE);
 }
 
@@ -217,7 +220,7 @@ fn atomics_are_emulated_by_the_host() {
         &[],
     );
     assert_eq!(out.result, Ok(40));
-    let regs = [A1, A2, A3, A4].map(|r| out.container.vcpu.reg(r as usize));
+    let regs = [A1, A2, A3, A4].map(|r| out.container.init().vcpu.reg(r as usize));
     assert_eq!(regs, [40, 42, 0, 1]);
 }
 
@@ -232,4 +235,123 @@ fn misaligned_atomics_fault() {
         panic!("expected a fault")
     };
     assert_eq!(exit.reason, ExitReason::MemoryFault(DATA + 2));
+}
+
+const SYS_CLONE: i32 = 220;
+const SYS_WAIT4: i32 = 260;
+const SYS_PIPE2: i32 = 59;
+const SIGCHLD: i32 = 17;
+
+#[test]
+fn fork_and_wait_report_the_child_status() {
+    let out = run(program![
+        addi(A0, ZERO, SIGCHLD),
+        addi(A1, ZERO, 0),
+        addi(A7, ZERO, SYS_CLONE),
+        ECALL,
+        bne(A0, ZERO, 16), // the parent skips the child's exit(7)
+        addi(A0, ZERO, 7),
+        exit_a0(),
+        addi(A0, ZERO, -1), // parent: wait4(-1, sp - 16, 0, 0)
+        addi(A1, SP, -16),
+        addi(A2, ZERO, 0),
+        addi(A3, ZERO, 0),
+        addi(A7, ZERO, SYS_WAIT4),
+        ECALL,
+        lw(A0, SP, -16),
+        srai(A0, A0, 8),
+        addi(A0, A0, 10),
+        exit_a0(),
+    ]);
+    assert_eq!(out.result, Ok(17));
+    assert!(out.container.task(2).is_none(), "the child was reaped");
+}
+
+#[test]
+fn a_read_blocks_until_another_process_writes() {
+    let out = run(program![
+        addi(A0, SP, -8), // pipe2(sp - 8, 0)
+        addi(A1, ZERO, 0),
+        addi(A7, ZERO, SYS_PIPE2),
+        ECALL,
+        addi(A0, ZERO, SIGCHLD), // fork
+        addi(A1, ZERO, 0),
+        addi(A7, ZERO, SYS_CLONE),
+        ECALL,
+        beq(A0, ZERO, 36), // the child jumps ahead
+        lw(A0, SP, -8),    // parent: read(fds[0], sp - 16, 1), then exit with the byte
+        addi(A1, SP, -16),
+        addi(A2, ZERO, 1),
+        addi(A7, ZERO, SYS_READ),
+        ECALL,
+        lbu(A0, SP, -16),
+        exit_a0(),
+        addi(T0, ZERO, 65), // child: write(fds[1], "A", 1), then exit(0)
+        sb(T0, SP, -12),
+        lw(A0, SP, -4),
+        addi(A1, SP, -12),
+        addi(A2, ZERO, 1),
+        addi(A7, ZERO, SYS_WRITE),
+        ECALL,
+        addi(A0, ZERO, 0),
+        exit_a0(),
+    ]);
+    assert_eq!(out.result, Ok(65));
+}
+
+#[test]
+fn processes_that_all_block_are_a_deadlock() {
+    let out = run(program![
+        addi(A0, SP, -8),
+        addi(A1, ZERO, 0),
+        addi(A7, ZERO, SYS_PIPE2),
+        ECALL,
+        lw(A0, SP, -8), // read from a pipe whose only writer is this process
+        addi(A1, SP, -16),
+        addi(A2, ZERO, 1),
+        addi(A7, ZERO, SYS_READ),
+        ECALL,
+        exit_a0(),
+    ]);
+    assert_eq!(out.result, Err(RunError::Deadlock));
+}
+
+const SYS_KILL: i32 = 129;
+const SYS_RT_SIGACTION: i32 = 134;
+const SIGUSR1: i32 = 10;
+
+#[test]
+fn signal_handlers_run_and_return_through_sigreturn() {
+    let handler = 84; // byte offset of the handler from the entry point
+    let out = run_with(
+        program![
+            auipc(T0, 0), // sigaction(SIGUSR1, {handler, 0, 0}, NULL, 8)
+            addi(T0, T0, handler),
+            sw(T0, SP, -16),
+            sw(ZERO, SP, -12),
+            sw(ZERO, SP, -8),
+            sw(ZERO, SP, -4),
+            addi(A0, ZERO, SIGUSR1),
+            addi(A1, SP, -16),
+            addi(A2, ZERO, 0),
+            addi(A3, ZERO, 8),
+            addi(A7, ZERO, SYS_RT_SIGACTION),
+            ECALL,
+            addi(A0, ZERO, 1), // kill(1, SIGUSR1): signal ourselves
+            addi(A1, ZERO, SIGUSR1),
+            addi(A7, ZERO, SYS_KILL),
+            ECALL,
+            li(T2, DATA), // exit with the word the handler stored
+            lw(A0, T2, 0),
+            exit_a0(),
+            addi(T1, ZERO, 42), // the handler: store 42, then return
+            li(T2, DATA),
+            sw(T1, T2, 0),
+            jalr(ZERO, RA, 0),
+        ],
+        &[0; 4],
+        &["prog"],
+        &[],
+    );
+    assert_eq!(out.result, Ok(42));
 }

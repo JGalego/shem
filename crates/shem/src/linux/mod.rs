@@ -4,6 +4,11 @@
 //! `ecall`, the host does the work, and the result goes back in a0. It is also
 //! the security boundary, so every guest pointer and length is treated as hostile.
 //!
+//! State is split the way Linux splits it. [`Linux`] holds what the whole
+//! container shares, and [`Process`] what each process owns. Calls that create,
+//! replace, wait for or signal processes come back as an [`Action`] for the
+//! container, which owns the vCPUs.
+//!
 //! Time and randomness are virtual, so a run depends only on its inputs. The
 //! clock advances one nanosecond per retired instruction, as if the guest ran at
 //! 1 GHz, plus whatever time the guest sleeps, which costs nothing. `getrandom`
@@ -12,15 +17,18 @@
 mod abi;
 mod files;
 mod rootfs;
+mod signal;
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 pub use abi::Errno;
 use abi::*;
 use files::{FdTable, MAX_FDS};
 pub use rootfs::{Resolved, RootFs};
+pub use signal::{Delivery, SigAction, Signals};
 
 use crate::container::STACK_SIZE;
 use crate::mm::AddressSpace;
@@ -43,127 +51,262 @@ pub struct Stdio {
     pub stderr: Box<dyn Write + Send>,
 }
 
-/// What the host should do after servicing a system call.
+/// How a process ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    /// Put this value in a0 and resume the guest.
-    Return(u32),
-    /// The guest exited with this status.
-    Exit(u8),
+pub enum Termination {
+    Exited(u8),
+    Killed(u32),
 }
 
+impl Termination {
+    /// The status a shell reports: the exit code, or 128 plus the signal.
+    pub fn status(self) -> u8 {
+        match self {
+            Self::Exited(code) => code,
+            Self::Killed(signal) => (128 + signal) as u8,
+        }
+    }
+
+    /// The status word `wait4` stores.
+    pub fn wait_status(self) -> u32 {
+        match self {
+            Self::Exited(code) => (code as u32) << 8,
+            Self::Killed(signal) => signal & 0x7f,
+        }
+    }
+}
+
+/// A program to replace the calling process's image, read by `execve`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exec {
+    pub elf: Vec<u8>,
+    pub argv: Vec<Vec<u8>>,
+    pub envp: Vec<Vec<u8>>,
+}
+
+/// A request to reap a child: `wait4` or `waitid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wait {
+    /// The child to wait for, or `None` for any child.
+    pub pid: Option<u32>,
+    pub nohang: bool,
+    pub report: Report,
+}
+
+/// Where a wait call reports the child it reaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Report {
+    /// `wait4`: a status word at this address (0 for none); returns the pid.
+    Status(u32),
+    /// `waitid`: a `siginfo_t` at this address; returns 0.
+    Siginfo(u32),
+}
+
+/// What the container should do after a system call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Put this value in a0 and resume after the `ecall`.
+    Return(u32),
+    /// The call cannot finish yet: park the process and retry the call later.
+    Block,
+    /// The process ends.
+    Exit(Termination),
+    /// Fork the process. The child gets `stack` as its stack pointer if it is
+    /// not 0, and its pid is stored at `parent_tid` if that is not 0.
+    Fork { stack: u32, parent_tid: u32 },
+    /// Replace the process image.
+    Exec(Exec),
+    /// Reap a child.
+    Wait(Wait),
+    /// Send `signal` to `pid`, which follows `kill`'s conventions for 0 and
+    /// negative values.
+    Kill { pid: i32, signal: u32 },
+    /// The registers are already set, as after `rt_sigreturn`: resume there.
+    Resume,
+    /// Move `pid`, a child of the caller, into process group `pgid`.
+    SetPgid { pid: u32, pgid: u32 },
+    /// Report the process group of `pid`.
+    GetPgid { pid: u32 },
+}
+
+/// What the whole container shares.
 pub struct Linux {
-    files: FdTable,
-    root: Option<RootFs>,
-    cwd: Vec<u8>,
-    umask: u32,
     /// Virtual nanoseconds the guest has spent asleep.
     slept_ns: u64,
     random: u64,
-    pub mm: AddressSpace,
     /// System calls the guest made that are not implemented, and how many times.
     pub unsupported: BTreeMap<u32, u64>,
 }
 
+/// What each process owns.
+pub struct Process {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+    pub sid: u32,
+    files: FdTable,
+    root: Option<Arc<RootFs>>,
+    cwd: Vec<u8>,
+    umask: u32,
+    pub signals: Signals,
+    pub mm: AddressSpace,
+}
+
+impl Default for Linux {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Linux {
-    /// `brk` is where the heap starts; the heap and mappings share memory up to `top`.
-    pub fn new(stdio: Stdio, brk: u32, top: u32) -> Self {
+    pub fn new() -> Self {
         Self {
-            files: FdTable::new(stdio),
-            root: None,
-            cwd: b"/".to_vec(),
-            umask: 0o022,
             slept_ns: 0,
             random: RANDOM_SEED,
-            mm: AddressSpace::new(brk, top),
             unsupported: BTreeMap::new(),
         }
     }
 
-    /// Give the guest a filesystem: the host directory `root` becomes its `/`.
-    /// Without one, every path lookup fails with ENOENT.
-    pub fn set_root(&mut self, root: &Path) -> std::io::Result<()> {
-        self.root = Some(RootFs::new(root)?);
-        Ok(())
-    }
-
-    /// Service the system call the guest just made. `retired` counts the
-    /// instructions the guest has retired so far, which drives the clock.
-    pub fn handle(&mut self, vcpu: &mut dyn Vcpu, retired: u64) -> Action {
+    /// Service the system call `process` just made. `retired` counts the
+    /// instructions the container has retired so far, which drives the clock.
+    pub fn handle(&mut self, process: &mut Process, vcpu: &mut dyn Vcpu, retired: u64) -> Action {
         let nr = vcpu.reg(A7);
         let a: [u32; 6] = std::array::from_fn(|i| vcpu.reg(A0 + i));
+        let p = process;
         let result = match nr {
-            nr::EXIT | nr::EXIT_GROUP => return Action::Exit(a[0] as u8),
-            nr::KILL | nr::TGKILL => {
-                let signal = if nr == nr::KILL { a[1] } else { a[2] };
-                match signal_status(signal) {
-                    Ok(Some(status)) => return Action::Exit(status),
-                    Ok(None) => Ok(0),
-                    Err(errno) => Err(errno),
+            nr::EXIT | nr::EXIT_GROUP => return Action::Exit(Termination::Exited(a[0] as u8)),
+            nr::CLONE => match clone(a[0]) {
+                Ok(()) => {
+                    return Action::Fork {
+                        stack: a[1],
+                        parent_tid: if a[0] & CLONE_PARENT_SETTID != 0 {
+                            a[2]
+                        } else {
+                            0
+                        },
+                    };
+                }
+                Err(errno) => Err(errno),
+            },
+            nr::EXECVE => match p.execve(vcpu, a[0], a[1], a[2]) {
+                Ok(exec) => return Action::Exec(exec),
+                Err(errno) => Err(errno),
+            },
+            nr::WAIT4 => match zero_fill(vcpu, a[3], RUSAGE_SIZE) {
+                Ok(_) => return Action::Wait(wait4(a[0], a[1], a[2])),
+                Err(errno) => Err(errno),
+            },
+            nr::WAITID => match waitid(a[0], a[1], a[2], a[3]) {
+                Ok(wait) => return Action::Wait(wait),
+                Err(errno) => Err(errno),
+            },
+            nr::KILL | nr::TKILL | nr::TGKILL => {
+                let (pid, signal) = match nr {
+                    nr::TGKILL => (a[1], a[2]),
+                    _ => (a[0], a[1]),
+                };
+                if signal > 64 {
+                    Err(Errno::EINVAL)
+                } else {
+                    return Action::Kill {
+                        pid: pid as i32,
+                        signal,
+                    };
                 }
             }
-            nr::READ => self.read(vcpu, a[0], a[1], a[2]),
-            nr::WRITE => self.write(vcpu, a[0], a[1], a[2]),
-            nr::READV => self.readv(vcpu, a[0], a[1], a[2]),
-            nr::WRITEV => self.writev(vcpu, a[0], a[1], a[2]),
-            nr::OPENAT => self.openat(vcpu, a[0], a[1], a[2], a[3]),
-            nr::CLOSE => self.close(a[0]),
-            nr::LLSEEK => self.llseek(vcpu, a[0], (a[1], a[2]), a[3], a[4]),
-            nr::GETDENTS64 => self.getdents64(vcpu, a[0], a[1], a[2]),
-            nr::STATX => self.statx(vcpu, a[0], a[1], a[2], a[4]),
-            nr::FACCESSAT | nr::FACCESSAT2 => self.faccessat(vcpu, a[0], a[1], a[2]),
-            nr::GETCWD => self.getcwd(vcpu, a[0], a[1]),
-            nr::CHDIR => self.chdir(vcpu, a[0]),
-            nr::MKDIRAT => self.mkdirat(vcpu, a[0], a[1], a[2]),
-            nr::UNLINKAT => self.unlinkat(vcpu, a[0], a[1], a[2]),
-            nr::SYMLINKAT => self.symlinkat(vcpu, a[0], a[1], a[2]),
-            nr::READLINKAT => self.readlinkat(vcpu, a[0], a[1], a[2], a[3]),
-            nr::RENAMEAT2 => self.renameat2(vcpu, (a[0], a[1]), (a[2], a[3]), a[4]),
-            nr::SENDFILE64 => self.sendfile(vcpu, a[0], a[1], a[2], a[3]),
-            nr::UTIMENSAT_TIME64 => self.utimensat(vcpu, a[0], a[1], a[2], a[3], retired),
-            nr::DUP => self.dup(a[0], 0, false),
-            nr::DUP3 => self.dup3(a[0], a[1], a[2]),
-            nr::FCNTL64 => self.fcntl(a[0], a[1], a[2]),
-            nr::FSYNC => self.fsync(a[0]),
+            nr::READ => p.read(vcpu, a[0], a[1], a[2]),
+            nr::WRITE => p.write(vcpu, a[0], a[1], a[2]),
+            nr::READV => p.readv(vcpu, a[0], a[1], a[2]),
+            nr::WRITEV => p.writev(vcpu, a[0], a[1], a[2]),
+            nr::OPENAT => p.openat(vcpu, a[0], a[1], a[2], a[3]),
+            nr::CLOSE => p.close(a[0]),
+            nr::PIPE2 => p.pipe2(vcpu, a[0], a[1]),
+            nr::LLSEEK => p.llseek(vcpu, a[0], (a[1], a[2]), a[3], a[4]),
+            nr::GETDENTS64 => p.getdents64(vcpu, a[0], a[1], a[2]),
+            nr::STATX => p.statx(vcpu, a[0], a[1], a[2], a[4]),
+            nr::FACCESSAT | nr::FACCESSAT2 => p.faccessat(vcpu, a[0], a[1], a[2]),
+            nr::GETCWD => p.getcwd(vcpu, a[0], a[1]),
+            nr::CHDIR => p.chdir(vcpu, a[0]),
+            nr::MKDIRAT => p.mkdirat(vcpu, a[0], a[1], a[2]),
+            nr::UNLINKAT => p.unlinkat(vcpu, a[0], a[1], a[2]),
+            nr::SYMLINKAT => p.symlinkat(vcpu, a[0], a[1], a[2]),
+            nr::READLINKAT => p.readlinkat(vcpu, a[0], a[1], a[2], a[3]),
+            nr::RENAMEAT2 => p.renameat2(vcpu, (a[0], a[1]), (a[2], a[3]), a[4]),
+            nr::SENDFILE64 => p.sendfile(vcpu, a[0], a[1], a[2], a[3]),
+            nr::UTIMENSAT_TIME64 => {
+                let now = EPOCH_NS + retired + self.slept_ns;
+                p.utimensat(vcpu, a[0], a[1], a[2], a[3], now)
+            }
+            nr::DUP => p.dup(a[0], 0, false),
+            nr::DUP3 => p.dup3(a[0], a[1], a[2]),
+            nr::FCNTL64 => p.fcntl(a[0], a[1], a[2]),
+            nr::FSYNC => p.fsync(a[0]),
             nr::IOCTL => Err(Errno::ENOTTY), // no terminals
-            nr::UMASK => Ok(std::mem::replace(&mut self.umask, a[0] & 0o777)),
-            nr::BRK => Ok(self.mm.set_brk(vcpu, a[0])),
-            nr::MMAP => self.mmap(vcpu, a[0], a[1], a[3]),
-            nr::MUNMAP => self.mm.unmap(a[0], a[1]).map(|()| 0).map_err(Errno::from),
+            nr::UMASK => Ok(std::mem::replace(&mut p.umask, a[0] & 0o777)),
+            nr::BRK => Ok(p.mm.set_brk(vcpu, a[0])),
+            nr::MMAP => p.mmap(vcpu, a[0], a[1], a[3]),
+            nr::MUNMAP => p.mm.unmap(a[0], a[1]).map(|()| 0).map_err(Errno::from),
             nr::MREMAP => Err(Errno::ENOMEM), // callers fall back to map, copy, unmap
             nr::MPROTECT | nr::MADVISE => Ok(0), // guest memory has no protection bits
             nr::CLOCK_GETTIME64 => self.clock_gettime(vcpu, a[0], a[1], retired),
             nr::CLOCK_NANOSLEEP_TIME64 => self.clock_nanosleep(vcpu, a[0], a[1], a[2], retired),
             nr::GETRANDOM => self.getrandom(vcpu, a[0], a[1]),
             nr::UNAME => uname(vcpu, a[0]),
-            // No signal is ever delivered: handlers are accepted and never run,
-            // and the previous action and mask always read as the defaults.
-            nr::RT_SIGACTION => zero_fill(vcpu, a[2], 8 + a[3].min(128)),
-            nr::RT_SIGPROCMASK => zero_fill(vcpu, a[2], a[3].min(128)),
+            nr::RT_SIGACTION => p.sigaction(vcpu, a[0], a[1], a[2]),
+            // Wait with a temporary mask until a signal arrives. The container
+            // delivers it to the parked process, which ends the call with EINTR.
+            nr::RT_SIGSUSPEND => match read_u64(vcpu, a[0]) {
+                Ok(mask) => {
+                    p.signals.suspend(mask);
+                    return Action::Block;
+                }
+                Err(errno) => Err(errno),
+            },
+            nr::RT_SIGRETURN => {
+                return match p.signals.sigreturn(vcpu) {
+                    Ok(()) => Action::Resume,
+                    Err(_) => Action::Exit(Termination::Killed(SIGSEGV)),
+                };
+            }
+            nr::RT_SIGPROCMASK => p.sigprocmask(vcpu, a[0], a[1], a[2]),
             nr::PRLIMIT64 => prlimit(vcpu, a[1], a[3]),
             nr::SCHED_GETAFFINITY => sched_getaffinity(vcpu, a[1], a[2]),
-            // The only process and thread, running as root with no parent.
-            nr::SET_TID_ADDRESS | nr::GETPID | nr::GETTID => Ok(1),
-            nr::GETGROUPS => Ok(0), // no supplementary groups
-            nr::GETPPID | nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(0),
+            nr::SET_TID_ADDRESS | nr::GETPID | nr::GETTID => Ok(p.pid),
+            nr::GETPPID => Ok(p.ppid),
+            nr::GETPGID if a[0] == 0 || a[0] == p.pid => Ok(p.pgid),
+            nr::GETPGID => return Action::GetPgid { pid: a[0] },
+            nr::SETPGID => {
+                let pid = if a[0] == 0 { p.pid } else { a[0] };
+                let pgid = if a[1] == 0 { pid } else { a[1] };
+                if pid != p.pid {
+                    return Action::SetPgid { pid, pgid };
+                }
+                p.pgid = pgid;
+                Ok(0)
+            }
+            nr::GETSID => Ok(p.sid),
+            nr::SETSID if p.pgid == p.pid => Err(Errno::EPERM),
+            nr::SETSID => {
+                (p.sid, p.pgid) = (p.pid, p.pid);
+                Ok(p.pid)
+            }
+            nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(0),
+            nr::GETGROUPS => Ok(0),
             _ => {
                 *self.unsupported.entry(nr).or_default() += 1;
                 Err(Errno::ENOSYS)
             }
         };
-        Action::Return(match result {
-            Ok(value) => value,
-            Err(Errno(errno)) => errno.wrapping_neg(),
-        })
-    }
-
-    /// Anonymous mappings only. The offset argument is ignored, which is correct
-    /// for anonymous memory.
-    fn mmap(&mut self, vcpu: &mut dyn Vcpu, addr: u32, len: u32, flags: u32) -> Result<u32, Errno> {
-        if flags & MAP_ANONYMOUS == 0 {
-            return Err(Errno::ENODEV);
+        match result {
+            Ok(value) => Action::Return(value),
+            Err(Errno::WOULD_BLOCK) => Action::Block,
+            // Writing to a pipe nobody reads raises SIGPIPE, which kills by default.
+            Err(Errno::EPIPE) => match p.signals.raise(SIGPIPE) {
+                Some(termination) => Action::Exit(termination),
+                None => Action::Return(Errno::EPIPE.0.wrapping_neg()),
+            },
+            Err(Errno(errno)) => Action::Return(errno.wrapping_neg()),
         }
-        Ok(self.mm.map(vcpu, addr, len, flags & MAP_FIXED != 0)?)
     }
 
     fn now_ns(&self, clock: u32, retired: u64) -> Result<u64, Errno> {
@@ -235,16 +378,156 @@ impl Linux {
     }
 }
 
-/// What sending `signal` to itself does to a process that has no handlers
-/// running: nothing for signals that are ignored by default, otherwise exit
-/// with 128 plus the signal number, the status a shell reports.
-fn signal_status(signal: u32) -> Result<Option<u8>, Errno> {
-    const IGNORED: [u32; 5] = [0, 17, 18, 23, 28]; // none, SIGCHLD, SIGCONT, SIGURG, SIGWINCH
-    match signal {
-        _ if IGNORED.contains(&signal) => Ok(None),
-        1..=64 => Ok(Some((128 + signal) as u8)),
-        _ => Err(Errno::EINVAL),
+impl Process {
+    /// A process with no parent, its standard streams on `stdio`, and a heap that
+    /// starts at `brk` and shares memory with mappings up to `top`.
+    pub fn new(pid: u32, stdio: Stdio, brk: u32, top: u32) -> Self {
+        Self {
+            pid,
+            ppid: 0,
+            pgid: pid,
+            sid: pid,
+            files: FdTable::new(stdio),
+            root: None,
+            cwd: b"/".to_vec(),
+            umask: 0o022,
+            signals: Signals::default(),
+            mm: AddressSpace::new(brk, top),
+        }
     }
+
+    /// Give the process a filesystem: the host directory `root` becomes its `/`,
+    /// and children inherit it. Without one, every path lookup fails with ENOENT.
+    pub fn set_root(&mut self, root: &Path) -> std::io::Result<()> {
+        self.root = Some(Arc::new(RootFs::new(root)?));
+        Ok(())
+    }
+
+    /// The child of a fork: a copy of this process that shares its open files.
+    pub fn fork(&self, pid: u32) -> Self {
+        Self {
+            pid,
+            ppid: self.pid,
+            pgid: self.pgid,
+            sid: self.sid,
+            files: self.files.fork(),
+            root: self.root.clone(),
+            cwd: self.cwd.clone(),
+            umask: self.umask,
+            signals: self.signals.fork(),
+            mm: self.mm.clone(),
+        }
+    }
+
+    /// Start a new program: a fresh address space, close-on-exec files closed,
+    /// and handlers reset to the default. Ignored signals stay ignored.
+    pub fn exec(&mut self, brk: u32, top: u32) {
+        self.mm = AddressSpace::new(brk, top);
+        self.files.close_on_exec();
+        self.signals.exec();
+    }
+
+    /// Close everything the process holds, as when it exits.
+    pub fn release(&mut self) {
+        self.files.close_all();
+    }
+
+    fn sigaction(
+        &mut self,
+        vcpu: &mut dyn Vcpu,
+        signal: u32,
+        act: u32,
+        old: u32,
+    ) -> Result<u32, Errno> {
+        // struct sigaction on riscv32: handler, flags, then a 64-bit mask
+        let new = if act == 0 {
+            None
+        } else {
+            let mut raw = [0u8; 16];
+            vcpu.read_mem(act, &mut raw)?;
+            Some(SigAction {
+                handler: u32::from_le_bytes(raw[..4].try_into().unwrap()),
+                flags: u32::from_le_bytes(raw[4..8].try_into().unwrap()),
+                mask: u64::from_le_bytes(raw[8..].try_into().unwrap()),
+            })
+        };
+        let previous = self.signals.sigaction(signal, new)?;
+        if old != 0 {
+            let mut out = [0u8; 16];
+            out[..4].copy_from_slice(&previous.handler.to_le_bytes());
+            out[4..8].copy_from_slice(&previous.flags.to_le_bytes());
+            out[8..].copy_from_slice(&previous.mask.to_le_bytes());
+            vcpu.write_mem(old, &out)?;
+        }
+        Ok(0)
+    }
+
+    fn sigprocmask(
+        &mut self,
+        vcpu: &mut dyn Vcpu,
+        how: u32,
+        set: u32,
+        old: u32,
+    ) -> Result<u32, Errno> {
+        let current = self.signals.blocked;
+        if set != 0 {
+            let set = read_u64(vcpu, set)?;
+            self.signals.set_mask(match how {
+                SIG_BLOCK => current | set,
+                SIG_UNBLOCK => current & !set,
+                SIG_SETMASK => set,
+                _ => return Err(Errno::EINVAL),
+            });
+        }
+        if old != 0 {
+            vcpu.write_mem(old, &current.to_le_bytes())?;
+        }
+        Ok(0)
+    }
+
+    /// Anonymous mappings only. The offset argument is ignored, which is correct
+    /// for anonymous memory.
+    fn mmap(&mut self, vcpu: &mut dyn Vcpu, addr: u32, len: u32, flags: u32) -> Result<u32, Errno> {
+        if flags & MAP_ANONYMOUS == 0 {
+            return Err(Errno::ENODEV);
+        }
+        Ok(self.mm.map(vcpu, addr, len, flags & MAP_FIXED != 0)?)
+    }
+}
+
+/// `struct rusage` with 32-bit `timeval`s and 14 longs.
+const RUSAGE_SIZE: u32 = 72;
+
+/// Forks are supported, threads are not. `vfork` children get a copy of memory
+/// instead of sharing it, which is safe for the usual pattern of calling
+/// `execve` or `_exit` straight away.
+fn clone(flags: u32) -> Result<(), Errno> {
+    if flags & CLONE_THREAD != 0 || (flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+/// Process groups are not tracked, so waiting for a group waits for any child.
+fn wait4(pid: u32, status: u32, options: u32) -> Wait {
+    let pid = pid as i32;
+    Wait {
+        pid: (pid > 0).then_some(pid as u32),
+        nohang: options & WNOHANG != 0,
+        report: Report::Status(status),
+    }
+}
+
+fn waitid(idtype: u32, id: u32, info: u32, options: u32) -> Result<Wait, Errno> {
+    if options & WEXITED == 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Wait {
+        // process groups are not tracked: P_PGID waits for any child, like P_ALL
+        pid: (idtype == P_PID).then_some(id),
+        nohang: options & WNOHANG != 0,
+        report: Report::Siginfo(info),
+    })
 }
 
 fn uname(vcpu: &mut dyn Vcpu, buf: u32) -> Result<u32, Errno> {
@@ -296,4 +579,10 @@ fn zero_fill(vcpu: &mut dyn Vcpu, addr: u32, len: u32) -> Result<u32, Errno> {
         vcpu.write_mem(addr, &vec![0; len as usize])?;
     }
     Ok(0)
+}
+
+fn read_u64(vcpu: &dyn Vcpu, addr: u32) -> Result<u64, Errno> {
+    let mut raw = [0u8; 8];
+    vcpu.read_mem(addr, &mut raw)?;
+    Ok(u64::from_le_bytes(raw))
 }

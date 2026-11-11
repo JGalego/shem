@@ -21,6 +21,7 @@ pub mod nr {
     pub const CHDIR: u32 = 49;
     pub const OPENAT: u32 = 56;
     pub const CLOSE: u32 = 57;
+    pub const PIPE2: u32 = 59;
     pub const GETDENTS64: u32 = 61;
     pub const LLSEEK: u32 = 62;
     pub const READ: u32 = 63;
@@ -31,12 +32,16 @@ pub mod nr {
     pub const FSYNC: u32 = 82;
     pub const EXIT: u32 = 93;
     pub const EXIT_GROUP: u32 = 94;
+    pub const WAITID: u32 = 95;
     pub const SET_TID_ADDRESS: u32 = 96;
     pub const SCHED_GETAFFINITY: u32 = 123;
     pub const KILL: u32 = 129;
+    pub const TKILL: u32 = 130;
     pub const TGKILL: u32 = 131;
+    pub const RT_SIGSUSPEND: u32 = 133;
     pub const RT_SIGACTION: u32 = 134;
     pub const RT_SIGPROCMASK: u32 = 135;
+    pub const RT_SIGRETURN: u32 = 139;
     pub const UNAME: u32 = 160;
     pub const UMASK: u32 = 166;
     pub const GETPID: u32 = 172;
@@ -49,11 +54,18 @@ pub mod nr {
     pub const BRK: u32 = 214;
     pub const MUNMAP: u32 = 215;
     pub const MREMAP: u32 = 216;
+    pub const CLONE: u32 = 220;
+    pub const EXECVE: u32 = 221;
     pub const MMAP: u32 = 222;
     pub const MPROTECT: u32 = 226;
     pub const MADVISE: u32 = 233;
+    pub const WAIT4: u32 = 260;
     pub const PRLIMIT64: u32 = 261;
     pub const SENDFILE64: u32 = 71;
+    pub const SETPGID: u32 = 154;
+    pub const GETPGID: u32 = 155;
+    pub const GETSID: u32 = 156;
+    pub const SETSID: u32 = 157;
     pub const GETGROUPS: u32 = 158;
     pub const RENAMEAT2: u32 = 276;
     pub const GETRANDOM: u32 = 278;
@@ -71,8 +83,14 @@ pub struct Errno(pub u32);
 impl Errno {
     pub const EPERM: Self = Self(1);
     pub const ENOENT: Self = Self(2);
+    pub const ESRCH: Self = Self(3);
     pub const EIO: Self = Self(5);
+    pub const ENXIO: Self = Self(6);
+    pub const E2BIG: Self = Self(7);
+    pub const ENOEXEC: Self = Self(8);
     pub const EBADF: Self = Self(9);
+    pub const ECHILD: Self = Self(10);
+    pub const EAGAIN: Self = Self(11);
     pub const ENOMEM: Self = Self(12);
     pub const EACCES: Self = Self(13);
     pub const EFAULT: Self = Self(14);
@@ -96,6 +114,9 @@ impl Errno {
     pub const ENOSYS: Self = Self(38);
     pub const ENOTEMPTY: Self = Self(39);
     pub const ELOOP: Self = Self(40);
+    /// Not a real errno: the call cannot finish yet, so the process blocks and
+    /// the system call is retried later. Never returned to the guest.
+    pub const WOULD_BLOCK: Self = Self(u32::MAX);
 }
 
 impl From<MemoryFault> for Errno {
@@ -151,6 +172,7 @@ pub const O_CREAT: u32 = 0o100;
 pub const O_EXCL: u32 = 0o200;
 pub const O_TRUNC: u32 = 0o1000;
 pub const O_APPEND: u32 = 0o2000;
+pub const O_NONBLOCK: u32 = 0o4000;
 pub const O_DIRECTORY: u32 = 0o200000;
 pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_CLOEXEC: u32 = 0o2000000;
@@ -180,11 +202,31 @@ pub const CLOCK_TAI: u32 = 11;
 pub const MAP_FIXED: u32 = 0x10;
 pub const MAP_ANONYMOUS: u32 = 0x20;
 
+pub const WNOHANG: u32 = 1;
+pub const WEXITED: u32 = 4;
+pub const P_PID: u32 = 1;
+
+pub const CLONE_VM: u32 = 0x100;
+pub const CLONE_VFORK: u32 = 0x4000;
+pub const CLONE_THREAD: u32 = 0x10000;
+pub const CLONE_PARENT_SETTID: u32 = 0x100000;
+
+pub const SIGKILL: u32 = 9;
+pub const SIGPIPE: u32 = 13;
+pub const SIGSTOP: u32 = 19;
+pub const SIGSEGV: u32 = 11;
+pub const SIG_BLOCK: u32 = 0;
+pub const SIG_UNBLOCK: u32 = 1;
+pub const SIG_SETMASK: u32 = 2;
+pub const SIG_DFL: u32 = 0;
+pub const SIG_IGN: u32 = 1;
+
 pub const RLIMIT_STACK: u32 = 3;
 pub const RLIMIT_NOFILE: u32 = 7;
 pub const RLIM_INFINITY: u64 = u64::MAX;
 
 const S_IFCHR: u32 = 0o020000;
+const S_IFIFO: u32 = 0o010000;
 
 pub const DT_UNKNOWN: u8 = 0;
 pub const DT_FIFO: u8 = 1;
@@ -232,6 +274,16 @@ impl Stat {
         }
     }
 
+    /// A device file such as /dev/null, with its major and minor numbers.
+    pub fn device(major: u32, minor: u32) -> Self {
+        let (major, minor) = (major as u64, minor as u64);
+        Self {
+            mode: S_IFCHR | 0o666,
+            rdev: (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12),
+            ..Self::char_device()
+        }
+    }
+
     /// The terminal-like character device behind stdin, stdout and stderr.
     pub fn char_device() -> Self {
         Self {
@@ -246,6 +298,15 @@ impl Stat {
             ctime: (0, 0),
             dev: 0,
             rdev: 0,
+        }
+    }
+
+    /// An anonymous pipe.
+    pub fn fifo() -> Self {
+        Self {
+            mode: S_IFIFO | 0o600,
+            blksize: 4096,
+            ..Self::char_device()
         }
     }
 

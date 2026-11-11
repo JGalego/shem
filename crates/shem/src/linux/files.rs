@@ -1,6 +1,6 @@
 //! File descriptors, and the system calls that work on files and paths.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -11,11 +11,19 @@ use std::time::{Duration, SystemTime};
 
 use super::abi::*;
 use super::rootfs::{PATH_MAX, Resolved};
-use super::{IOV_MAX, Linux, MAX_IO, NS_PER_SEC, Stdio};
+use super::{Exec, IOV_MAX, MAX_IO, NS_PER_SEC, Process, Stdio};
+use crate::elf;
 use crate::vcpu::Vcpu;
 
 /// Lowest fd number that `open` cannot hand out, as `RLIMIT_NOFILE` reports.
 pub const MAX_FDS: u32 = 1024;
+/// Bytes a pipe holds before writers block, as on Linux.
+const PIPE_CAPACITY: usize = 64 << 10;
+/// Largest program `execve` loads.
+const MAX_EXECUTABLE: u64 = 64 << 20;
+/// Most argument and environment bytes `execve` accepts.
+const ARG_MAX: usize = 256 << 10;
+const MAX_ARG_STRLEN: usize = 128 << 10;
 
 /// An open file description. `dup` shares one between several descriptors,
 /// along with its offset.
@@ -30,6 +38,68 @@ enum Kind {
     Output(Box<dyn Write + Send>),
     File(File),
     Dir(Dir),
+    Pipe(PipeEnd),
+    Device(Device),
+}
+
+/// The device files every container has under /dev, whatever its rootfs holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Device {
+    Null,
+    Zero,
+    Full,
+    /// /dev/random and /dev/urandom: a seeded PRNG, so runs stay repeatable.
+    Random(u64),
+}
+
+impl Device {
+    /// The device a guest path names, decided on the path's text so that /dev
+    /// need not exist in the rootfs. Standard streams name a descriptor to share.
+    fn named(path: &[u8]) -> Option<Result<Self, u32>> {
+        Some(match path {
+            b"/dev/null" => Ok(Self::Null),
+            b"/dev/zero" => Ok(Self::Zero),
+            b"/dev/full" => Ok(Self::Full),
+            b"/dev/random" | b"/dev/urandom" => Ok(Self::Random(0x5348_454d)),
+            b"/dev/stdin" => Err(0),
+            b"/dev/stdout" => Err(1),
+            b"/dev/stderr" => Err(2),
+            _ => return None,
+        })
+    }
+
+    fn stat(self) -> Stat {
+        match self {
+            Self::Null => Stat::device(1, 3),
+            Self::Zero => Stat::device(1, 5),
+            Self::Full => Stat::device(1, 7),
+            Self::Random(_) => Stat::device(1, 9),
+        }
+    }
+}
+
+struct Pipe {
+    buffer: VecDeque<u8>,
+    readers: usize,
+    writers: usize,
+}
+
+/// One end of a pipe. Dropping the last description that holds an end closes
+/// it, which is how readers see end-of-file and writers see EPIPE.
+struct PipeEnd {
+    pipe: Arc<Mutex<Pipe>>,
+    writer: bool,
+}
+
+impl Drop for PipeEnd {
+    fn drop(&mut self) {
+        let mut pipe = self.pipe.lock().unwrap();
+        if self.writer {
+            pipe.writers -= 1;
+        } else {
+            pipe.readers -= 1;
+        }
+    }
 }
 
 struct Dir {
@@ -73,6 +143,33 @@ impl FdTable {
         table
     }
 
+    /// The table a forked child starts with: the same descriptions, shared.
+    pub fn fork(&self) -> Self {
+        let slots = self.slots.iter().map(|(&fd, slot)| {
+            let description = slot.description.clone();
+            (
+                fd,
+                Slot {
+                    description,
+                    cloexec: slot.cloexec,
+                },
+            )
+        });
+        Self {
+            slots: slots.collect(),
+        }
+    }
+
+    /// Close the descriptors marked close-on-exec.
+    pub fn close_on_exec(&mut self) {
+        self.slots.retain(|_, slot| !slot.cloexec);
+    }
+
+    /// Close every descriptor, as when a process exits.
+    pub fn close_all(&mut self) {
+        self.slots.clear();
+    }
+
     fn get(&self, fd: u32) -> Result<Arc<Mutex<Description>>, Errno> {
         self.slots
             .get(&fd)
@@ -110,7 +207,38 @@ impl Description {
         if self.flags & O_ACCMODE == O_WRONLY {
             return Err(Errno::EBADF);
         }
+        let nonblock = self.flags & O_NONBLOCK != 0;
         match &mut self.kind {
+            Kind::Device(Device::Null) => Ok(0),
+            Kind::Device(Device::Zero | Device::Full) => {
+                buf.fill(0);
+                Ok(buf.len())
+            }
+            Kind::Device(Device::Random(state)) => {
+                for chunk in buf.chunks_mut(8) {
+                    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    let mut z = *state;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                    chunk.copy_from_slice(&(z ^ (z >> 31)).to_le_bytes()[..chunk.len()]);
+                }
+                Ok(buf.len())
+            }
+            Kind::Pipe(end) => {
+                let mut pipe = end.pipe.lock().unwrap();
+                if pipe.buffer.is_empty() {
+                    return if pipe.writers == 0 {
+                        Ok(0)
+                    } else {
+                        Err(blocked(nonblock))
+                    };
+                }
+                let n = buf.len().min(pipe.buffer.len());
+                for (slot, byte) in buf.iter_mut().zip(pipe.buffer.drain(..n)) {
+                    *slot = byte;
+                }
+                Ok(n)
+            }
             Kind::Input(input) => Ok(input.read(buf)?),
             Kind::File(file) => Ok(file.read(buf)?),
             Kind::Dir(_) => Err(Errno::EISDIR),
@@ -122,7 +250,23 @@ impl Description {
         if self.flags & O_ACCMODE == O_RDONLY {
             return Err(Errno::EBADF);
         }
+        let nonblock = self.flags & O_NONBLOCK != 0;
         match &mut self.kind {
+            Kind::Device(Device::Full) => return Err(Errno::ENOSPC),
+            Kind::Device(_) => return Ok(data.len()),
+            Kind::Pipe(end) => {
+                let mut pipe = end.pipe.lock().unwrap();
+                if pipe.readers == 0 {
+                    return Err(Errno::EPIPE);
+                }
+                let room = PIPE_CAPACITY - pipe.buffer.len();
+                if room == 0 && !data.is_empty() {
+                    return Err(blocked(nonblock));
+                }
+                let n = data.len().min(room);
+                pipe.buffer.extend(&data[..n]);
+                return Ok(n);
+            }
             Kind::Output(output) => {
                 output.write_all(data)?;
                 output.flush()?;
@@ -139,11 +283,13 @@ impl Description {
             Kind::File(file) => Ok(Stat::from_metadata(&file.metadata()?)),
             Kind::Dir(dir) => Ok(Stat::from_metadata(&std::fs::metadata(&dir.host)?)),
             Kind::Input(_) | Kind::Output(_) => Ok(Stat::char_device()),
+            Kind::Pipe(_) => Ok(Stat::fifo()),
+            Kind::Device(device) => Ok(device.stat()),
         }
     }
 }
 
-impl Linux {
+impl Process {
     fn resolve_at(
         &self,
         vcpu: &dyn Vcpu,
@@ -151,12 +297,26 @@ impl Linux {
         path: u32,
         follow: bool,
     ) -> Result<Resolved, Errno> {
-        let path = read_cstr(vcpu, path)?;
+        let path = read_cstr(vcpu, path, PATH_MAX)?;
         let base = self.base_dir(dirfd)?;
         self.root
             .as_ref()
             .ok_or(Errno::ENOENT)?
             .resolve(&base, &path, follow)
+    }
+
+    /// The device `path` names relative to `dirfd`, if it names one.
+    fn device_at(
+        &self,
+        vcpu: &dyn Vcpu,
+        dirfd: u32,
+        path: u32,
+    ) -> Result<Option<Result<Device, u32>>, Errno> {
+        let path = read_cstr(vcpu, path, PATH_MAX)?;
+        if path.is_empty() {
+            return Ok(None);
+        }
+        Ok(Device::named(&normalize(&self.base_dir(dirfd)?, &path)))
     }
 
     /// The guest directory that relative paths start from: the working directory
@@ -179,6 +339,18 @@ impl Linux {
         flags: u32,
         mode: u32,
     ) -> Result<u32, Errno> {
+        match self.device_at(vcpu, dirfd, path)? {
+            Some(Ok(device)) => {
+                let flags = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK);
+                let description = Description {
+                    kind: Kind::Device(device),
+                    flags,
+                };
+                return self.files.install(description, 0, flags & O_CLOEXEC != 0);
+            }
+            Some(Err(stream)) => return self.dup(stream, 0, flags & O_CLOEXEC != 0),
+            None => {}
+        }
         let resolved = self.resolve_at(vcpu, dirfd, path, flags & O_NOFOLLOW == 0)?;
         let access = flags & O_ACCMODE;
         let creating = flags & O_CREAT != 0;
@@ -259,7 +431,10 @@ impl Linux {
     ) -> Result<u32, Errno> {
         let mut total = 0u32;
         for (base, len) in iovecs(vcpu, iov, count)? {
-            let n = self.read(vcpu, fd, base, len)?;
+            let n = match self.read(vcpu, fd, base, len) {
+                Err(err) if total > 0 && is_blocked(err) => break,
+                result => result?,
+            };
             total = total.saturating_add(n);
             if n < len {
                 break;
@@ -277,7 +452,10 @@ impl Linux {
     ) -> Result<u32, Errno> {
         let mut total = 0u32;
         for (base, len) in iovecs(vcpu, iov, count)? {
-            let n = self.write(vcpu, fd, base, len)?;
+            let n = match self.write(vcpu, fd, base, len) {
+                Err(err) if total > 0 && is_blocked(err) => break,
+                result => result?,
+            };
             total = total.saturating_add(n);
             if n < len {
                 break;
@@ -309,7 +487,8 @@ impl Linux {
                 offset as u64
             }
             Kind::Dir(_) => return Err(Errno::EINVAL),
-            Kind::Input(_) | Kind::Output(_) => return Err(Errno::ESPIPE),
+            Kind::Device(_) => 0,
+            Kind::Input(_) | Kind::Output(_) | Kind::Pipe(_) => return Err(Errno::ESPIPE),
         };
         vcpu.write_mem(result, &position.to_le_bytes())?;
         Ok(0)
@@ -351,7 +530,7 @@ impl Linux {
         flags: u32,
         buf: u32,
     ) -> Result<u32, Errno> {
-        let name = read_cstr(vcpu, path)?;
+        let name = read_cstr(vcpu, path, PATH_MAX)?;
         let stat = if name.is_empty() && flags & AT_EMPTY_PATH != 0 {
             if dirfd == AT_FDCWD {
                 self.stat_path(&self.cwd.clone(), true)?
@@ -359,8 +538,14 @@ impl Linux {
                 self.files.get(dirfd)?.lock().unwrap().stat()?
             }
         } else {
-            let resolved = self.resolve_at(vcpu, dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-            stat_host(&resolved, flags & AT_SYMLINK_NOFOLLOW == 0)?
+            match self.device_at(vcpu, dirfd, path)? {
+                Some(Ok(device)) => device.stat(),
+                Some(Err(stream)) => self.files.get(stream)?.lock().unwrap().stat()?,
+                None => {
+                    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+                    stat_host(&self.resolve_at(vcpu, dirfd, path, follow)?, follow)?
+                }
+            }
         };
         vcpu.write_mem(buf, &stat.statx())?;
         Ok(0)
@@ -378,6 +563,9 @@ impl Linux {
         path: u32,
         mode: u32,
     ) -> Result<u32, Errno> {
+        if self.device_at(vcpu, dirfd, path)?.is_some() {
+            return Ok(0);
+        }
         let stat = stat_host(&self.resolve_at(vcpu, dirfd, path, true)?, true)?;
         // The guest is root, so only execute permission can be missing.
         let is_dir = stat.mode & 0o170000 == 0o040000;
@@ -452,7 +640,7 @@ impl Linux {
         dirfd: u32,
         path: u32,
     ) -> Result<u32, Errno> {
-        let target = read_cstr(vcpu, target)?;
+        let target = read_cstr(vcpu, target, PATH_MAX)?;
         if target.is_empty() {
             return Err(Errno::ENOENT);
         }
@@ -542,9 +730,8 @@ impl Linux {
         path: u32,
         times: u32,
         flags: u32,
-        retired: u64,
+        now: u64,
     ) -> Result<u32, Errno> {
-        let now = self.now_ns(CLOCK_REALTIME, retired)?;
         let mut stamps = [Some(now); 2];
         if times != 0 {
             let mut raw = [0u8; 32];
@@ -564,7 +751,7 @@ impl Linux {
             match &self.files.get(dirfd)?.lock().unwrap().kind {
                 Kind::File(file) => file.try_clone()?,
                 Kind::Dir(dir) => File::open(&dir.host)?,
-                Kind::Input(_) | Kind::Output(_) => return Ok(0),
+                Kind::Input(_) | Kind::Output(_) | Kind::Pipe(_) | Kind::Device(_) => return Ok(0),
             }
         } else {
             let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
@@ -580,6 +767,97 @@ impl Linux {
         }
         file.set_times(file_times)?;
         Ok(0)
+    }
+
+    pub(super) fn pipe2(
+        &mut self,
+        vcpu: &mut dyn Vcpu,
+        fds: u32,
+        flags: u32,
+    ) -> Result<u32, Errno> {
+        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let pipe = Arc::new(Mutex::new(Pipe {
+            buffer: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+        }));
+        let end = |writer: bool| Description {
+            kind: Kind::Pipe(PipeEnd {
+                pipe: pipe.clone(),
+                writer,
+            }),
+            flags: if writer { O_WRONLY } else { O_RDONLY } | (flags & O_NONBLOCK),
+        };
+        let cloexec = flags & O_CLOEXEC != 0;
+        let read = self.files.install(end(false), 0, cloexec)?;
+        let installed = self.files.install(end(true), 0, cloexec).and_then(|write| {
+            let pair = [read.to_le_bytes(), write.to_le_bytes()].concat();
+            vcpu.write_mem(fds, &pair).map_err(|fault| {
+                self.files.slots.remove(&write);
+                Errno::from(fault)
+            })
+        });
+        if let Err(errno) = installed {
+            self.files.slots.remove(&read);
+            return Err(errno);
+        }
+        Ok(0)
+    }
+
+    /// Read the program `execve` names, following one `#!` line, along with the
+    /// new arguments and environment. The caller replaces the process image.
+    pub(super) fn execve(
+        &self,
+        vcpu: &dyn Vcpu,
+        path: u32,
+        argv: u32,
+        envp: u32,
+    ) -> Result<Exec, Errno> {
+        let path = read_cstr(vcpu, path, PATH_MAX)?;
+        let mut argv = read_strings(vcpu, argv)?;
+        let envp = read_strings(vcpu, envp)?;
+        let mut elf = self.read_executable(&path)?;
+        if let Some(rest) = elf.strip_prefix(b"#!") {
+            let end = rest
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(rest.len())
+                .min(255);
+            let line = rest[..end].trim_ascii();
+            let split = line
+                .iter()
+                .position(u8::is_ascii_whitespace)
+                .unwrap_or(line.len());
+            let (interpreter, arg) = (line[..split].to_vec(), line[split..].trim_ascii().to_vec());
+            if interpreter.is_empty() {
+                return Err(Errno::ENOEXEC);
+            }
+            let mut script_argv = vec![interpreter.clone()];
+            if !arg.is_empty() {
+                script_argv.push(arg);
+            }
+            script_argv.push(path);
+            script_argv.extend(argv.into_iter().skip(1));
+            argv = script_argv;
+            elf = self.read_executable(&interpreter)?;
+        }
+        elf::parse(&elf, vcpu.mem_size()).map_err(|_| Errno::ENOEXEC)?;
+        Ok(Exec { elf, argv, envp })
+    }
+
+    fn read_executable(&self, path: &[u8]) -> Result<Vec<u8>, Errno> {
+        let root = self.root.as_ref().ok_or(Errno::ENOENT)?;
+        let resolved = root.resolve(&self.cwd, path, true)?;
+        let meta = std::fs::metadata(&resolved.host)?;
+        if !meta.is_file() || meta.mode() & 0o111 == 0 {
+            return Err(Errno::EACCES);
+        }
+        if meta.len() > MAX_EXECUTABLE {
+            return Err(Errno::ENOMEM);
+        }
+        Ok(std::fs::read(&resolved.host)?)
     }
 
     pub(super) fn dup(&mut self, fd: u32, min: u32, cloexec: bool) -> Result<u32, Errno> {
@@ -607,7 +885,12 @@ impl Linux {
                 Ok(0)
             }
             F_GETFL => Ok(slot.description.lock().unwrap().flags),
-            F_SETFL => Ok(0),
+            F_SETFL => {
+                let mut description = slot.description.lock().unwrap();
+                let settable = O_APPEND | O_NONBLOCK;
+                description.flags = (description.flags & !settable) | (arg & settable);
+                Ok(0)
+            }
             _ => Err(Errno::EINVAL),
         }
     }
@@ -618,6 +901,31 @@ impl Linux {
         }
         Ok(0)
     }
+}
+
+/// Join `path` to the guest directory `base` and resolve `.` and `..` by text
+/// alone, the way device paths are matched.
+fn normalize(base: &[u8], path: &[u8]) -> Vec<u8> {
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let start: &[u8] = if path.starts_with(b"/") { b"" } else { base };
+    for part in start
+        .split(|&b| b == b'/')
+        .chain(path.split(|&b| b == b'/'))
+    {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let mut out = Vec::new();
+    for part in parts {
+        out.push(b'/');
+        out.extend_from_slice(part);
+    }
+    out
 }
 
 fn list_dir(resolved: Resolved) -> Result<Dir, Errno> {
@@ -704,8 +1012,49 @@ fn iovecs(vcpu: &dyn Vcpu, iov: u32, count: u32) -> Result<Vec<(u32, u32)>, Errn
         .collect()
 }
 
-/// Read a NUL-terminated string from guest memory, such as a path.
-pub fn read_cstr(vcpu: &dyn Vcpu, addr: u32) -> Result<Vec<u8>, Errno> {
+/// A guest call that cannot finish yet: blocked, or would block on a
+/// non-blocking descriptor.
+fn blocked(nonblock: bool) -> Errno {
+    if nonblock {
+        Errno::EAGAIN
+    } else {
+        Errno::WOULD_BLOCK
+    }
+}
+
+fn is_blocked(err: Errno) -> bool {
+    err == Errno::WOULD_BLOCK || err == Errno::EAGAIN
+}
+
+/// Read a NULL-terminated array of string pointers, as `execve` takes them.
+fn read_strings(vcpu: &dyn Vcpu, list: u32) -> Result<Vec<Vec<u8>>, Errno> {
+    let mut strings = Vec::new();
+    let mut total = 0;
+    if list == 0 {
+        return Ok(strings);
+    }
+    for i in 0u32.. {
+        let mut pointer = [0u8; 4];
+        vcpu.read_mem(list.checked_add(4 * i).ok_or(Errno::EFAULT)?, &mut pointer)?;
+        let pointer = u32::from_le_bytes(pointer);
+        if pointer == 0 {
+            break;
+        }
+        let string = read_cstr(vcpu, pointer, MAX_ARG_STRLEN).map_err(|err| match err {
+            Errno::ENAMETOOLONG => Errno::E2BIG,
+            err => err,
+        })?;
+        total += string.len() + 1 + 4;
+        if total > ARG_MAX {
+            return Err(Errno::E2BIG);
+        }
+        strings.push(string);
+    }
+    Ok(strings)
+}
+
+/// Read a NUL-terminated string of at most `max` bytes from guest memory.
+pub fn read_cstr(vcpu: &dyn Vcpu, addr: u32, max: usize) -> Result<Vec<u8>, Errno> {
     let mut out = Vec::new();
     let mut chunk = [0u8; 256];
     let mut at = addr;
@@ -720,7 +1069,7 @@ pub fn read_cstr(vcpu: &dyn Vcpu, addr: u32) -> Result<Vec<u8>, Errno> {
             return Ok(out);
         }
         out.extend_from_slice(&chunk[..room]);
-        if out.len() >= PATH_MAX {
+        if out.len() >= max {
             return Err(Errno::ENAMETOOLONG);
         }
         at += room as u32;

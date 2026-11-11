@@ -19,7 +19,8 @@ Early. What works today is the host side, running on a reference vCPU:
 - host emulation of the A extension (atomics), so the vCPU itself stays RV32IM
 - a loader for static RV32 Linux executables, with the standard Linux stack layout
 - a Linux system-call layer: files and directories in a host directory used as the guest's root, `brk` and anonymous `mmap`, and a virtual clock, enough for C programs linked against musl and for a static BusyBox
-- `shem run`, which runs an executable as a container
+- processes: `fork`, `execve`, `wait`, pipes, process groups and signal handlers, with the host as the kernel and a scheduler that gives each process a turn
+- `shem run`, which runs an executable as a container (`--trace` prints each system call)
 
 There is no neural vCPU yet. See the [roadmap](docs/architecture.md#roadmap).
 
@@ -38,6 +39,7 @@ just guest-tests                            # build and run riscv-tests, the C g
 
 # after `just guest-tests`, BusyBox and its rootfs are in target/busybox
 just run --root target/busybox target/busybox/bin/busybox ls -l /bin
+just run --root target/busybox target/busybox/bin/busybox sh -c 'ls /bin | wc -l'
 ```
 
 Guest programs are static RV32 Linux executables. `just cc` builds them with Zig against musl, for RV32IMA with soft float; see [`toolchain/`](toolchain/).
@@ -51,12 +53,13 @@ crates/shem/src/
   emulate.rs     host emulation of instructions the vCPU lacks (atomics)
   elf.rs         ELF loading and the initial process stack
   linux/         Linux system calls, implemented by the host
-    mod.rs       dispatch, processes, time and identity
+    mod.rs       dispatch, per-process state, time and identity
     files.rs     file descriptors, files and directories
     rootfs.rs    path resolution inside the guest's root directory
+    signal.rs    signal dispositions, masks and delivery to handlers
     abi.rs       system call numbers, errno values, flags and structs
   mm.rs          the guest address space: heap and anonymous mappings
-  container.rs   the hypervisor loop for container mode
+  container.rs   container mode: processes, the scheduler, fork, exec and wait
   main.rs        the shem CLI
 crates/shem/tests/  unit, integration and guest-program tests
 toolchain/      the guest toolchain image and the riscv-tests environment

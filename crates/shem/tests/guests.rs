@@ -35,7 +35,7 @@ fn run_in(root: Option<&Path>, path: &Path, argv: &[&str]) -> Run {
         .unwrap_or_else(|err| panic!("{}: {err} (run `just guest-tests`)", path.display()));
     let (mut container, stdout) = start(&elf, argv, &[], MEM).unwrap();
     if let Some(root) = root {
-        container.linux.set_root(root).unwrap();
+        container.set_root(root).unwrap();
     }
     let result = container.run(Some(MAX_STEPS));
     Run {
@@ -134,4 +134,69 @@ fn busybox_applets_run_in_a_root_filesystem() {
             "busybox {args:?}: unsupported system calls"
         );
     }
+}
+
+/// Copy BusyBox's installed rootfs, symlinks and all, into a fresh directory.
+fn busybox_root() -> tempfile::TempDir {
+    fn copy(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            let kind = entry.file_type().unwrap();
+            if kind.is_symlink() {
+                let link = std::fs::read_link(entry.path()).unwrap();
+                std::os::unix::fs::symlink(link, &target).unwrap();
+            } else if kind.is_dir() {
+                copy(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    copy(&built("busybox"), root.path());
+    root
+}
+
+#[test]
+#[ignore = "needs guest binaries: run `just guest-tests`"]
+fn busybox_shell_runs_pipelines_jobs_and_traps() {
+    let root = busybox_root();
+    let busybox = root.path().join("bin/busybox");
+    let cases: &[(&str, &str)] = &[
+        ("echo piped | tr a-z A-Z", "PIPED\n"),
+        ("seq 1 5 | sort -r | head -3", "5\n4\n3\n"),
+        ("yes | head -2", "y\ny\n"),
+        ("sh -c 'exit 7'; echo $?", "7\n"),
+        ("x=$(echo captured); echo $x", "captured\n"),
+        ("for i in 1 2 3; do echo $i; done | xargs echo", "1 2 3\n"),
+        (
+            "mkdir -p /tmp && echo hello > /tmp/out && cat /tmp/out",
+            "hello\n",
+        ),
+        ("sleep 1 & wait; echo done", "done\n"),
+        (
+            "trap 'echo caught' TERM; kill $$; echo after",
+            "caught\nafter\n",
+        ),
+        ("trap 'echo bye' EXIT; echo body", "body\nbye\n"),
+    ];
+    for (script, expected) in cases {
+        let out = run_in(Some(root.path()), &busybox, &["sh", "-c", script]);
+        assert_eq!(out.result, Ok(0), "sh -c {script:?}");
+        assert_eq!(out.stdout, *expected, "sh -c {script:?}");
+        assert_eq!(
+            out.unsupported,
+            [] as [u32; 0],
+            "sh -c {script:?}: unsupported system calls"
+        );
+    }
+    let killed = run_in(
+        Some(root.path()),
+        &busybox,
+        &["sh", "-c", "kill $$; echo survived"],
+    );
+    assert_eq!(killed.result, Ok(128 + 15), "killed by SIGTERM");
+    assert_eq!(killed.stdout, "");
 }

@@ -56,6 +56,8 @@ pub trait Vcpu {
     fn mem_size(&self) -> u32;
     fn read_mem(&self, addr: u32, buf: &mut [u8]) -> Result<(), MemoryFault>;
     fn write_mem(&mut self, addr: u32, data: &[u8]) -> Result<(), MemoryFault>;
+    /// Zero the registers and memory, ready for a new program (`execve`).
+    fn reset(&mut self);
     /// Execute at most `budget` instructions.
     fn run(&mut self, budget: u64) -> Exit;
     /// Capture the machine in the canonical, vCPU-independent format.

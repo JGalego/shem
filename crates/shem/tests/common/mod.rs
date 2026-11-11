@@ -14,6 +14,7 @@ pub const RA: u32 = 1;
 pub const SP: u32 = 2;
 pub const T0: u32 = 5;
 pub const T1: u32 = 6;
+pub const T2: u32 = 7;
 pub const S0: u32 = 8;
 pub const A0: u32 = 10;
 pub const A1: u32 = 11;

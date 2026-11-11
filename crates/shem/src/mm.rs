@@ -17,6 +17,7 @@ pub enum MapError {
     NoMemory,
 }
 
+#[derive(Debug, Clone)]
 pub struct AddressSpace {
     brk_start: u32,
     brk: u32,

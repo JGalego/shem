@@ -6,6 +6,7 @@
 
 use crate::vcpu::{Exit, ExitReason, MachineState, MemoryFault, SnapshotError, Vcpu};
 
+#[derive(Clone)]
 pub struct ReferenceVcpu {
     regs: [u32; 32],
     pc: u32,
@@ -191,6 +192,12 @@ impl Vcpu for ReferenceVcpu {
         let range = self.range(addr, data.len())?;
         self.mem[range].copy_from_slice(data);
         Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.regs = [0; 32];
+        self.pc = 0;
+        self.mem.fill(0);
     }
 
     fn run(&mut self, budget: u64) -> Exit {
