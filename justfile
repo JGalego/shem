@@ -96,7 +96,7 @@ containerd-test: toolchain
     printf 'FROM scratch\nCOPY hello /hello\nENTRYPOINT ["/hello"]\n' | docker build -q -t shem-hello:latest -f - target/oci-hello
     docker save shem-hello:latest | sudo ctr images import -
     status=0
-    timeout 120 sudo ctr run --rm --runtime io.containerd.shem.v1 docker.io/library/shem-hello:latest shem-test one two > target/oci-hello/out.txt || status=$?
+    timeout 120 sudo ctr run --rm --runtime io.containerd.shem.v1 docker.io/library/shem-hello:latest shem-test /hello one two > target/oci-hello/out.txt || status=$?
     cat target/oci-hello/out.txt
     echo "ctr run exited with status $status (the program exits with its argument count, 3)"
     if ! grep -q "sum of squares below 100000" target/oci-hello/out.txt; then

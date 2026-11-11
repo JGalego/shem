@@ -11,10 +11,10 @@ just cc -O2 -o hello guests/hello.c
 printf 'FROM scratch\nCOPY hello /hello\nENTRYPOINT ["/hello"]\n' | docker build -t shem-hello -f - .
 docker save shem-hello | sudo ctr images import -
 
-sudo ctr run --rm --runtime io.containerd.shem.v1 docker.io/library/shem-hello:latest demo one two
+sudo ctr run --rm --runtime io.containerd.shem.v1 docker.io/library/shem-hello:latest demo /hello one two
 ```
 
-containerd finds the shim by name on its `PATH`, so installing the binary is the only setup. `just containerd-test` does all of the above and checks the output, and CI runs it on every push.
+containerd finds the shim by name on its `PATH`, so installing the binary is the only setup. As with any `ctr run`, a command after the container ID replaces the image's entrypoint, so it starts with the program. `just containerd-test` does all of the above and checks the output, and CI runs it on every push.
 
 ## How it works
 
