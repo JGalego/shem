@@ -3,8 +3,12 @@
 //! image names a kernel in its filesystem instead, and its warm state is a
 //! frozen machine that has booted it.
 //!
-//! An image is stored as an [OCI image layout] whose config and state layer have
-//! shem media types, so OCI registries and tools such as ORAS can store it.
+//! An image is stored as a standard [OCI image layout] for `linux/riscv32`, so
+//! registries, Docker and containerd treat it like any other image: shem's own
+//! settings are labels (`dev.shem.*`), and a warm image's state is an ordinary
+//! last layer whose files are all under `/.shem`. In memory, that layer is a
+//! `STATE_TYPE` layer of the files alone. Layouts in shem's earlier format,
+//! with its own config and state media types, can still be read.
 //! Builds are reproducible: layers have sorted entries, fixed timestamps and
 //! root ownership, and execution is deterministic, so building the same
 //! Shemfile twice gives the same digest. See `docs/shemfile.md`.
@@ -36,7 +40,16 @@ use crate::vcpu::{MachineState, Vcpu};
 use crate::vm::{self, Console, FrozenMachine, Machine};
 
 pub const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+pub const OCI_CONFIG_TYPE: &str = "application/vnd.oci.image.config.v1+json";
+/// The config media type of shem's earlier image format, still read.
 pub const CONFIG_TYPE: &str = "application/vnd.shem.config.v1+json";
+const LAYER_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+/// The config media type of images Docker builds without the OCI exporter.
+const DOCKER_CONFIG_TYPE: &str = "application/vnd.docker.container.image.v1+json";
+/// The prefix of the labels that hold shem's own settings.
+const LABEL: &str = "dev.shem.";
+/// Where an image's state lives in its filesystem.
+pub const STATE_DIR: &str = ".shem";
 pub const ROOTFS_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
 pub const STATE_TYPE: &str = "application/vnd.shem.state.v1.tar";
 const REF_NAME: &str = "org.opencontainers.image.ref.name";
@@ -45,6 +58,73 @@ const REF_NAME: &str = "org.opencontainers.image.ref.name";
 const COMPRESSED: &str = "+zstd";
 const ZSTD_LEVEL: i32 = 3;
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// The labels a config's shem settings become, by field name.
+const SETTINGS: [&str; 5] = ["machine", "memory", "kernel", "bootargs", "model"];
+
+impl Config {
+    /// The OCI image config: platform, process, and shem's own settings as
+    /// labels, with the layers' uncompressed digests.
+    fn to_oci(&self, diff_ids: Vec<String>) -> serde_json::Value {
+        let mut labels = self.labels.clone();
+        let settings = [
+            Some(self.machine.clone()),
+            self.memory.map(|m| m.to_string()),
+            self.kernel.clone(),
+            self.bootargs.clone(),
+            self.model.clone(),
+        ];
+        for (name, value) in SETTINGS.iter().zip(settings) {
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                labels.insert(format!("{LABEL}{name}"), value);
+            }
+        }
+        let mut process = serde_json::json!({
+            "Entrypoint": self.entrypoint,
+            "Cmd": self.cmd,
+            "Env": self.env,
+            "Labels": labels,
+        });
+        if !self.workdir.is_empty() {
+            process["WorkingDir"] = self.workdir.clone().into();
+        }
+        serde_json::json!({
+            "created": "1970-01-01T00:00:00Z",
+            "architecture": "riscv32",
+            "os": "linux",
+            "config": process,
+            "rootfs": { "type": "layers", "diff_ids": diff_ids },
+        })
+    }
+
+    fn from_oci(oci: &serde_json::Value) -> anyhow::Result<Self> {
+        let process = &oci["config"];
+        let strings = |value: &serde_json::Value| -> Vec<String> {
+            value
+                .as_array()
+                .map(|items| items.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        };
+        let mut labels: BTreeMap<String, String> =
+            serde_json::from_value(process["Labels"].clone()).unwrap_or_default();
+        let mut setting = |name: &str| labels.remove(&format!("{LABEL}{name}"));
+        let machine = setting("machine").unwrap_or_else(|| "rv32im".into());
+        let memory = setting("memory").map(|m| m.parse()).transpose()?;
+        let (kernel, bootargs, model) = (setting("kernel"), setting("bootargs"), setting("model"));
+        Ok(Self {
+            machine,
+            entrypoint: strings(&process["Entrypoint"]),
+            cmd: strings(&process["Cmd"]),
+            env: strings(&process["Env"]),
+            workdir: process["WorkingDir"].as_str().unwrap_or_default().into(),
+            labels,
+            memory,
+            kernel,
+            bootargs,
+            model,
+        })
+    }
+}
 
 /// How to run an image.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +170,8 @@ struct Descriptor {
     size: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     annotations: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    platform: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -182,17 +264,20 @@ impl Image {
                 digest,
                 size: data.len() as u64,
                 annotations: BTreeMap::new(),
+                platform: None,
             })
         };
-        let config = put(CONFIG_TYPE, &serde_json::to_vec(&self.config)?)?;
-        let layers = self
-            .layers
-            .iter()
-            .map(|layer| {
-                let compressed = zstd::encode_all(&layer.data[..], ZSTD_LEVEL)?;
-                put(&format!("{}{COMPRESSED}", layer.media_type), &compressed)
-            })
-            .collect::<anyhow::Result<_>>()?;
+        let mut layers = Vec::new();
+        let mut diff_ids = Vec::new();
+        for layer in &self.layers {
+            let tar = match layer.media_type.as_str() {
+                STATE_TYPE => layer::under(&layer.data, STATE_DIR)?,
+                _ => layer.data.clone(),
+            };
+            diff_ids.push(digest(&tar));
+            layers.push(put(LAYER_TYPE, &zstd::encode_all(&tar[..], ZSTD_LEVEL)?)?);
+        }
+        let config = put(OCI_CONFIG_TYPE, &serde_json::to_vec(&self.config.to_oci(diff_ids))?)?;
         let manifest = Manifest {
             schema_version: 2,
             media_type: MANIFEST_TYPE.into(),
@@ -201,6 +286,7 @@ impl Image {
         };
         let mut descriptor = put(MANIFEST_TYPE, &serde_json::to_vec(&manifest)?)?;
         descriptor.annotations.insert(REF_NAME.into(), tag.into());
+        descriptor.platform = Some(serde_json::json!({ "architecture": "riscv32", "os": "linux" }));
         let index = Index {
             schema_version: 2,
             manifests: vec![descriptor.clone()],
@@ -229,30 +315,49 @@ impl Image {
             .first()
             .context("the image layout has no manifest")?;
         let manifest: Manifest = serde_json::from_slice(&blob(entry)?)?;
-        if manifest.config.media_type != CONFIG_TYPE {
-            bail!(
-                "not a shem image: its config is {}",
-                manifest.config.media_type
-            );
-        }
-        let config = serde_json::from_slice(&blob(&manifest.config)?)?;
-        let layers = manifest
+        let config = match manifest.config.media_type.as_str() {
+            OCI_CONFIG_TYPE | DOCKER_CONFIG_TYPE => {
+                Config::from_oci(&serde_json::from_slice(&blob(&manifest.config)?)?)?
+            }
+            CONFIG_TYPE => serde_json::from_slice(&blob(&manifest.config)?)?,
+            other => bail!("not an image: its config is {other}"),
+        };
+        let mut layers: Vec<Layer> = manifest
             .layers
             .iter()
             .map(|d| {
                 let data = blob(d)?;
-                Ok(match d.media_type.strip_suffix(COMPRESSED) {
-                    Some(media_type) => Layer {
-                        media_type: media_type.into(),
-                        data: zstd::decode_all(&data[..])?,
-                    },
-                    None => Layer {
-                        media_type: d.media_type.clone(),
-                        data,
-                    },
+                let gzip = d.media_type.ends_with("gzip");
+                let compressed = d.media_type.ends_with(COMPRESSED) || gzip;
+                let data = if gzip {
+                    let mut out = Vec::new();
+                    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&data[..]), &mut out)?;
+                    out
+                } else if compressed {
+                    zstd::decode_all(&data[..])?
+                } else {
+                    data
+                };
+                let media_type = match d.media_type.as_str() {
+                    t if t.starts_with(STATE_TYPE) => STATE_TYPE,
+                    _ => ROOTFS_TYPE,
+                };
+                Ok(Layer {
+                    media_type: media_type.into(),
+                    data,
                 })
             })
             .collect::<anyhow::Result<_>>()?;
+        // A last layer that holds nothing but /.shem is the state
+        if let Some(last) = layers.last_mut()
+            && last.media_type == ROOTFS_TYPE
+            && let Some(state) = layer::strip(&last.data, STATE_DIR)?
+        {
+            *last = Layer {
+                media_type: STATE_TYPE.into(),
+                data: state,
+            };
+        }
         Ok(Self { config, layers })
     }
 

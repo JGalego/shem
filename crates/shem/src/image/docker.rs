@@ -1,127 +1,48 @@
-//! Images for Docker: a shem image as a standard OCI image for `linux/riscv32`,
-//! which `docker load` takes and `docker run --runtime io.containerd.shem.v1`
-//! runs (see `docs/containerd.md`).
+//! Images for Docker: an image layout as an archive that `docker load` takes,
+//! to run with `docker run --runtime io.containerd.shem.v1` (see
+//! `docs/containerd.md`).
 //!
-//! Docker and containerd only unpack standard layers, so a warm image's state
-//! layer becomes an ordinary layer holding its files under `/.shem`, which the
-//! containerd shim thaws instead of starting the entrypoint.
-
-use std::collections::BTreeMap;
+//! shem's layouts are already standard OCI images for `linux/riscv32`, so the
+//! archive is the layout as a tar, with the name Docker gives the image. A
+//! warm image's state travels as its last layer, files under `/.shem`, which
+//! the containerd shim thaws instead of starting the entrypoint.
 
 use anyhow::bail;
-use serde_json::json;
 
-use super::{Image, MANIFEST_TYPE, REF_NAME, ROOTFS_TYPE, STATE_TYPE, ZSTD_LEVEL, digest, layer};
+use super::{Image, layer};
 
-/// Where a warm image's state lives in its Docker image's filesystem.
-pub const WARM_DIR: &str = ".shem";
-const CONFIG_TYPE: &str = "application/vnd.oci.image.config.v1+json";
-const LAYER_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
-const INDEX_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+/// Where a warm image's state lives in its filesystem.
+pub const WARM_DIR: &str = super::STATE_DIR;
 
 impl Image {
-    /// The image as an OCI image archive, a tar of an image layout, named
-    /// `name` (such as `hello:latest`) for `docker load`. The archive is
-    /// reproducible: the same image gives the same bytes.
+    /// The image as an OCI image archive named `name` (such as
+    /// `hello:latest`) for `docker load`. The archive is reproducible: the
+    /// same image gives the same bytes.
     pub fn docker_archive(&self, name: &str) -> anyhow::Result<Vec<u8>> {
         if self.config.kernel.is_some() {
-            bail!("VM images cannot run under Docker yet: the shim runs containers");
+            bail!("VM images cannot run under Docker yet: the shim runs containers and models");
         }
-        let mut blobs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        let mut put = |data: Vec<u8>| -> serde_json::Value {
-            let (hash, size) = (digest(&data), data.len());
-            blobs.insert(hash.clone(), data);
-            json!({ "digest": hash, "size": size })
-        };
-
-        let mut layers = Vec::new();
-        let mut diff_ids = Vec::new();
-        for layer in &self.layers {
-            let tar = match layer.media_type.as_str() {
-                ROOTFS_TYPE => layer.data.clone(),
-                STATE_TYPE => warm_layer(&layer.data)?,
-                other => bail!("cannot export a layer of type {other}"),
-            };
-            diff_ids.push(digest(&tar));
-            let mut descriptor = put(zstd::encode_all(&tar[..], ZSTD_LEVEL)?);
-            descriptor["mediaType"] = LAYER_TYPE.into();
-            layers.push(descriptor);
-        }
-
-        let config = &self.config;
-        let mut container = json!({
-            "Entrypoint": config.entrypoint,
-            "Cmd": config.cmd,
-            "Env": config.env,
-            "Labels": config.labels,
-        });
-        if !config.workdir.is_empty() {
-            container["WorkingDir"] = config.workdir.clone().into();
-        }
-        let image_config = json!({
-            "created": "1970-01-01T00:00:00Z",
-            "architecture": "riscv32",
-            "os": "linux",
-            "config": container,
-            "rootfs": { "type": "layers", "diff_ids": diff_ids },
-        });
-        let mut config_descriptor = put(serde_json::to_vec(&image_config)?);
-        config_descriptor["mediaType"] = CONFIG_TYPE.into();
-        let manifest = json!({
-            "schemaVersion": 2,
-            "mediaType": MANIFEST_TYPE,
-            "config": config_descriptor,
-            "layers": layers,
-        });
-        let mut manifest_descriptor = put(serde_json::to_vec(&manifest)?);
+        let dir = tempfile::tempdir()?;
         let (_, tag) = super::parse_reference(name)?;
-        manifest_descriptor["mediaType"] = MANIFEST_TYPE.into();
-        manifest_descriptor["platform"] = json!({ "architecture": "riscv32", "os": "linux" });
-        manifest_descriptor["annotations"] = json!({
-            "io.containerd.image.name": docker_name(name)?,
-            REF_NAME: tag,
-        });
-        let index = json!({
-            "schemaVersion": 2,
-            "mediaType": INDEX_TYPE,
-            "manifests": [manifest_descriptor],
-        });
+        self.write_layout(dir.path(), tag)?;
+        let path = dir.path().join("index.json");
+        let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        index["manifests"][0]["annotations"]["io.containerd.image.name"] = docker_name(name)?.into();
+        std::fs::write(&path, serde_json::to_vec(&index)?)?;
 
-        let mut files: Vec<(String, Vec<u8>)> = vec![
-            (
-                "oci-layout".into(),
-                br#"{"imageLayoutVersion":"1.0.0"}"#.to_vec(),
-            ),
-            ("index.json".into(), serde_json::to_vec(&index)?),
-        ];
-        for (hash, data) in blobs {
-            files.push((format!("blobs/sha256/{}", &hash["sha256:".len()..]), data));
-        }
-        let files: Vec<(&str, &[u8])> = files
-            .iter()
-            .map(|(name, data)| (name.as_str(), data.as_slice()))
-            .collect();
-        layer::from_files(&files)
+        let mut files = vec!["oci-layout".to_string(), "index.json".to_string()];
+        let mut blobs: Vec<_> = std::fs::read_dir(dir.path().join("blobs/sha256"))?
+            .map(|entry| entry.map(|e| format!("blobs/sha256/{}", e.file_name().to_string_lossy())))
+            .collect::<Result<_, _>>()?;
+        blobs.sort();
+        files.extend(blobs);
+        let contents: Vec<(String, Vec<u8>)> = files
+            .into_iter()
+            .map(|name| Ok((name.clone(), std::fs::read(dir.path().join(&name))?)))
+            .collect::<anyhow::Result<_>>()?;
+        let entries: Vec<(&str, &[u8])> = contents.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+        layer::from_files(&entries)
     }
-}
-
-/// A state layer's files as an ordinary layer, under `WARM_DIR`.
-fn warm_layer(state: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut builder = tar::Builder::new(Vec::new());
-    let mut header = tar::Header::new_ustar();
-    header.set_entry_type(tar::EntryType::Directory);
-    header.set_mtime(0);
-    header.set_mode(0o700);
-    header.set_size(0);
-    builder.append_data(&mut header, format!("{WARM_DIR}/"), std::io::empty())?;
-    for (name, data) in layer::files(state)? {
-        let mut header = tar::Header::new_ustar();
-        header.set_mtime(0);
-        header.set_mode(0o600);
-        header.set_size(data.len() as u64);
-        builder.append_data(&mut header, format!("{WARM_DIR}/{name}"), &data[..])?;
-    }
-    Ok(builder.into_inner()?)
 }
 
 /// A reference as Docker spells it in full: `hello` is
@@ -129,8 +50,8 @@ fn warm_layer(state: &[u8]) -> anyhow::Result<Vec<u8>> {
 fn docker_name(reference: &str) -> anyhow::Result<String> {
     let (name, tag) = super::parse_reference(reference)?;
     let first = name.split('/').next().unwrap_or_default();
-    let has_host =
-        name.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost");
+    let has_host = name.contains('/')
+        && (first.contains('.') || first.contains(':') || first == "localhost");
     let full = if has_host {
         name.to_string()
     } else if name.contains('/') {
