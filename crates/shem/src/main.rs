@@ -143,6 +143,10 @@ struct PushArgs {
     /// Talk to the registry over plain HTTP, as to a local test registry
     #[arg(long)]
     plain_http: bool,
+    /// Also list the image under these platforms, such as linux/amd64, for
+    /// runtimes that pick images by the host's platform (see docs/kubernetes.md)
+    #[arg(long, value_delimiter = ',')]
+    platform: Vec<String>,
     /// The image: name[:tag] in the store, or an OCI layout directory
     image: String,
     /// Where to push it, such as ghcr.io/me/app:1.0
@@ -157,6 +161,10 @@ struct SaveArgs {
     /// The name Docker gives the image (default: the image's own)
     #[arg(short, long)]
     tag: Option<String>,
+    /// Also list the image under these platforms, such as linux/amd64, for
+    /// runtimes that pick images by the host's platform (see docs/kubernetes.md)
+    #[arg(long, value_delimiter = ',')]
+    platform: Vec<String>,
     /// The image: name[:tag] in the store, or an OCI layout directory
     image: String,
 }
@@ -501,7 +509,15 @@ fn image_dir(target: &str) -> anyhow::Result<PathBuf> {
 }
 
 fn push(args: PushArgs) -> anyhow::Result<u8> {
-    let digest = image::push(&image_dir(&args.image)?, &args.remote, args.plain_http)?;
+    let staged = tempfile::tempdir()?;
+    let dir = if args.platform.is_empty() {
+        image_dir(&args.image)?
+    } else {
+        let (_, tag) = image::parse_reference(&args.remote)?;
+        load_image(&args.image)?.write_layout_for(staged.path(), tag, &args.platform)?;
+        staged.path().to_path_buf()
+    };
+    let digest = image::push(&dir, &args.remote, args.plain_http)?;
     eprintln!("shem: pushed {} {digest}", args.remote);
     Ok(0)
 }
@@ -510,7 +526,7 @@ fn save(args: SaveArgs) -> anyhow::Result<u8> {
     use std::io::{IsTerminal, Write};
     let image = load_image(&args.image)?;
     let name = args.tag.as_deref().unwrap_or(&args.image);
-    let archive = image.docker_archive(name)?;
+    let archive = image.docker_archive(name, &args.platform)?;
     match &args.output {
         Some(path) => std::fs::write(path, archive)?,
         None if std::io::stdout().is_terminal() => {

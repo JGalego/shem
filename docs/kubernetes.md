@@ -26,9 +26,14 @@ Restart containerd.
 sudo systemctl restart containerd
 ```
 
-Images the kubelet pulls for the `shem` runtime class are pulled for `linux/riscv32`. An image loaded onto a node by hand (`ctr -n k8s.io images import`) is read for the node's own platform instead, unless it is labelled with its own: `ctr -n k8s.io images label IMAGE io.cri-containerd.image.platform=linux/riscv32`.
+### Images for the node's platform
 
-The kubelet must ask for images by runtime class, or it looks for `linux/amd64` ones and reports `ErrImageNeverPull` or pulls the wrong platform: turn on the `RuntimeClassInImageCriApi` feature gate (in the kubelet's configuration, `featureGates: {RuntimeClassInImageCriApi: true}`).
+Released containerd (through 2.4) picks a pod's image for the node's platform, `linux/amd64` or `linux/arm64`, whatever its runtime class, so an image listed only for `linux/riscv32` is not found (`ErrImageNeverPull`, or a failed pull). List shem images under the node's platforms too; the guest is RV32 whichever entry containerd picks, and the shem runtime runs it:
+
+- `shem push --platform linux/amd64,linux/arm64 IMAGE REMOTE` (and `shem save --platform ...`) list the same image under those platforms as well;
+- `docker build --platform linux/riscv32,linux/amd64,linux/arm64` builds it for each, which for an image of RV32 programs gives the same files each time.
+
+containerd's development branch picks images per runtime class instead (`runtime_platforms` above, with the kubelet's `RuntimeClassInImageCriApi` feature gate), which makes this unnecessary once released.
 
 ## In the cluster
 

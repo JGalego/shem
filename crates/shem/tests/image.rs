@@ -166,10 +166,10 @@ fn images_save_as_docker_archives_with_their_state_as_files() {
     let shemfile = "FROM scratch\nCOPY echo /bin/echo\nENTRYPOINT [\"/bin/echo\"]\nWARM --until=syscall:read\n";
     let ctx = context(shemfile, &[("echo", echo())]);
     let image = build(ctx.path()).unwrap();
-    let archive = image.docker_archive("echo").unwrap();
+    let archive = image.docker_archive("echo", &[]).unwrap();
     assert_eq!(
         archive,
-        image.docker_archive("echo").unwrap(),
+        image.docker_archive("echo", &[]).unwrap(),
         "reproducible"
     );
 
@@ -217,6 +217,49 @@ fn images_save_as_docker_archives_with_their_state_as_files() {
     let state = fs::read(root.path().join(".shem/machine.state")).unwrap();
     assert_eq!(state, frozen.machine.encode());
     assert!(root.path().join(".shem/container.json").is_file());
+}
+
+#[test]
+fn images_can_be_listed_under_other_platforms_too() {
+    let ctx = context(
+        "FROM scratch\nCOPY hello /bin/hello\nENTRYPOINT [\"/bin/hello\"]\n",
+        &[("hello", hello())],
+    );
+    let image = build(ctx.path()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let also = ["linux/amd64".to_string(), "linux/arm64/v8".to_string()];
+    let digest = image.write_layout_for(dir.path(), "latest", &also).unwrap();
+    let blob = |digest: &str| fs::read(dir.path().join("blobs/sha256").join(&digest[7..])).unwrap();
+    let index: serde_json::Value = serde_json::from_slice(&blob(&digest)).unwrap();
+    let platforms: Vec<String> = (index["manifests"].as_array().unwrap().iter())
+        .map(|m| {
+            format!(
+                "{}/{}",
+                m["platform"]["os"].as_str().unwrap(),
+                m["platform"]["architecture"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(platforms, ["linux/riscv32", "linux/amd64", "linux/arm64"]);
+    let manifests: Vec<&serde_json::Value> = index["manifests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| &m["digest"])
+        .collect();
+    assert!(
+        manifests.windows(2).all(|pair| pair[0] == pair[1]),
+        "one image, listed three times"
+    );
+    // shem reads it back as the image it is
+    let read = Image::read_layout(dir.path()).unwrap();
+    assert_eq!(read.config, image.config);
+    assert_eq!(read.layers, image.layers);
+    assert!(
+        image
+            .write_layout_for(dir.path(), "x", &["amd64".to_string()])
+            .is_err()
+    );
 }
 
 #[test]

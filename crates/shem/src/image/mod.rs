@@ -40,6 +40,7 @@ use crate::vcpu::{MachineState, Vcpu};
 use crate::vm::{self, Console, FrozenMachine, Machine};
 
 pub const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+pub const INDEX_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 pub const OCI_CONFIG_TYPE: &str = "application/vnd.oci.image.config.v1+json";
 /// The config media type of shem's earlier image format, still read.
 pub const CONFIG_TYPE: &str = "application/vnd.shem.config.v1+json";
@@ -196,6 +197,24 @@ struct Index {
     manifests: Vec<Descriptor>,
 }
 
+/// A platform as `os/architecture[/variant]`, such as `linux/arm64/v8`, as
+/// an OCI descriptor's platform.
+fn parse_platform(text: &str) -> anyhow::Result<serde_json::Value> {
+    let parts: Vec<&str> = text.split('/').collect();
+    let mut platform = match parts.as_slice() {
+        [os, architecture] | [os, architecture, _]
+            if !os.is_empty() && !architecture.is_empty() =>
+        {
+            serde_json::json!({ "os": os, "architecture": architecture })
+        }
+        _ => bail!("{text:?} is no platform: give os/architecture, such as linux/amd64"),
+    };
+    if let [_, _, variant] = parts.as_slice() {
+        platform["variant"] = (*variant).into();
+    }
+    Ok(platform)
+}
+
 pub fn digest(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
@@ -259,6 +278,21 @@ impl Image {
     /// Write the image as an OCI image layout in `dir`, tagged `tag`. Returns
     /// the manifest's digest.
     pub fn write_layout(&self, dir: &Path, tag: &str) -> anyhow::Result<String> {
+        self.write_layout_for(dir, tag, &[])
+    }
+
+    /// Write the layout as `write_layout` does, listing the image under the
+    /// platforms `also` (such as `linux/amd64`) as well as `linux/riscv32`,
+    /// in an image index. The guest is RV32 whichever entry a runtime picks,
+    /// so this lets runtimes that pick images by the host's platform, such
+    /// as Kubernetes with released containerd, find shem images. Returns the
+    /// digest of the index, or of the manifest when there are no others.
+    pub fn write_layout_for(
+        &self,
+        dir: &Path,
+        tag: &str,
+        also: &[String],
+    ) -> anyhow::Result<String> {
         let blobs = dir.join("blobs/sha256");
         std::fs::create_dir_all(&blobs)?;
         let put = |media_type: &str, data: &[u8]| -> anyhow::Result<Descriptor> {
@@ -293,8 +327,23 @@ impl Image {
             layers,
         };
         let mut descriptor = put(MANIFEST_TYPE, &serde_json::to_vec(&manifest)?)?;
-        descriptor.annotations.insert(REF_NAME.into(), tag.into());
         descriptor.platform = Some(serde_json::json!({ "architecture": "riscv32", "os": "linux" }));
+        if !also.is_empty() {
+            let mut entries = vec![descriptor.clone()];
+            for platform in also {
+                entries.push(Descriptor {
+                    platform: Some(parse_platform(platform)?),
+                    ..descriptor.clone()
+                });
+            }
+            let index = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": INDEX_TYPE,
+                "manifests": entries,
+            });
+            descriptor = put(INDEX_TYPE, &serde_json::to_vec(&index)?)?;
+        }
+        descriptor.annotations.insert(REF_NAME.into(), tag.into());
         let index = Index {
             schema_version: 2,
             manifests: vec![descriptor.clone()],

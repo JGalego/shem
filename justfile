@@ -176,7 +176,8 @@ kubernetes-test:
     set -e
     # A static shim, since the kind node's C library may be older than this one
     cargo build --release --target x86_64-unknown-linux-musl -p containerd-shim-shem
-    docker build -q --platform linux/riscv32 -t shem-k8s-hello:latest examples/hello
+    # Listed for the node's platform too: released containerd picks a pod's images by it
+    docker build -q --platform linux/riscv32,linux/amd64 -t shem-k8s-hello:latest examples/hello
     kind delete cluster --name shem >/dev/null 2>&1 || true
     # The kubelet asks for images by runtime class, so it finds linux/riscv32 ones
     printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nfeatureGates:\n  RuntimeClassInImageCriApi: true\n' > target/kind.yaml
@@ -190,8 +191,6 @@ kubernetes-test:
         "  platform = 'linux/riscv32'" | docker exec -i "$node" sh -c 'cat >> /etc/containerd/config.toml'
     docker exec "$node" systemctl restart containerd
     docker save shem-k8s-hello:latest | docker exec -i "$node" ctr -n k8s.io images import --all-platforms -
-    # Imported images are read for the node's own platform unless labelled with theirs
-    docker exec "$node" ctr -n k8s.io images label docker.io/library/shem-k8s-hello:latest io.cri-containerd.image.platform=linux/riscv32
     kubectl apply -f examples/kubernetes/runtimeclass.yaml
     sed 's#image: .*#image: docker.io/library/shem-k8s-hello:latest#; s#imagePullPolicy: .*#imagePullPolicy: Never#' examples/kubernetes/hello.yaml | kubectl apply -f -
     if ! kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/shem-hello --timeout=120s; then

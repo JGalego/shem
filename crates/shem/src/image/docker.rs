@@ -18,13 +18,13 @@ impl Image {
     /// The image as an OCI image archive named `name` (such as
     /// `hello:latest`) for `docker load`. The archive is reproducible: the
     /// same image gives the same bytes.
-    pub fn docker_archive(&self, name: &str) -> anyhow::Result<Vec<u8>> {
+    pub fn docker_archive(&self, name: &str, also: &[String]) -> anyhow::Result<Vec<u8>> {
         if self.config.kernel.is_some() {
             bail!("VM images cannot run under Docker yet: the shim runs containers and models");
         }
         let dir = tempfile::tempdir()?;
         let (_, tag) = super::parse_reference(name)?;
-        self.write_layout(dir.path(), tag)?;
+        self.write_layout_for(dir.path(), tag, also)?;
         let path = dir.path().join("index.json");
         let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         index["manifests"][0]["annotations"]["io.containerd.image.name"] =
