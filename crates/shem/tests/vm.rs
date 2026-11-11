@@ -2,12 +2,19 @@
 
 mod common;
 
+use std::fs;
+use std::path::Path;
 use std::sync::mpsc::{Sender, channel};
 use std::time::{Duration, Instant};
 
 use common::*;
+use shem::image::{self, BuildOptions, Image};
 use shem::reference::ReferenceVcpu;
-use shem::vm::{self, Console, DEFAULT_BOOTARGS, Halt, Machine, RAM_BASE, VmError};
+use shem::vcpu::MachineState;
+use shem::vm::{
+    self, Console, DEFAULT_BOOTARGS, Frozen, FrozenMachine, Halt, Machine, Pause, RAM_BASE, Stop,
+    VmError,
+};
 
 const RAM: u32 = 64 << 10;
 const MTVEC: u32 = 0x305;
@@ -27,6 +34,13 @@ const SYSCON: u32 = 0x1110_0000;
 fn putc(reg: u32) -> [u32; 3] {
     let [upper, low] = li(T1, UART);
     [upper, low, sb(reg, T1, 0)]
+}
+
+/// Print `text` on the UART.
+fn print(text: &str) -> Vec<u32> {
+    text.bytes()
+        .flat_map(|b| [li(A0, b as u32).to_vec(), putc(A0).to_vec()].concat())
+        .collect()
 }
 
 /// Power the machine off through the syscon.
@@ -172,6 +186,117 @@ fn timer_interrupts_arrive_and_wfi_skips_ahead() {
     assert!(steps < 100, "only {steps} instructions ran");
 }
 
+/// `frozen` after a trip through its on-disk form, as an image stores it.
+fn round_trip(frozen: Frozen) -> Frozen {
+    let host = serde_json::to_vec(&frozen.host).unwrap();
+    Frozen {
+        machine: MachineState::decode(&frozen.machine.encode()).unwrap(),
+        host: serde_json::from_slice::<FrozenMachine>(&host).unwrap(),
+    }
+}
+
+#[test]
+fn a_frozen_machine_thaws_and_carries_on_identically() {
+    let kernel = timer_program(50, program![beq(A2, ZERO, 0)]);
+    let (mut whole, whole_output, _keys) = boot(&kernel);
+    assert_eq!(whole.run(Some(1_000_000)), Ok(Halt::Poweroff));
+
+    // Freeze mid-spin, with the timer armed and its interrupt enabled
+    let (mut first, first_output, _keys) = boot(&kernel);
+    assert_eq!(
+        first.run_until(None, Some(Pause::Steps(2000))),
+        Ok(Stop::Paused)
+    );
+    assert_eq!(first.steps, 2000);
+    let frozen = round_trip(first.freeze());
+    let output = SharedBuf::default();
+    let (_keys, input) = channel();
+    let console = Console::new(input, Box::new(output.clone()));
+    let vcpu = ReferenceVcpu::with_base(RAM, RAM_BASE);
+    let mut second = Machine::thaw(vcpu, &frozen, console).unwrap();
+    assert_eq!(second.run(Some(1_000_000)), Ok(Halt::Poweroff));
+
+    assert_eq!(second.steps, whole.steps);
+    assert_eq!(second.freeze(), whole.freeze());
+    let resumed = [first_output.contents(), output.contents()].concat();
+    assert_eq!(resumed, whole_output.contents());
+}
+
+#[test]
+fn output_pauses_stop_just_after_the_bytes_are_printed() {
+    let kernel = bytes(&program![print("boot\n> "), print("ok"), poweroff()]);
+    let (mut machine, output, _keys) = boot(&kernel);
+    let prompt = Some(Pause::Output(b"\n> ".to_vec()));
+    assert_eq!(machine.run_until(None, prompt), Ok(Stop::Paused));
+    assert_eq!(output.contents(), b"boot\n> ");
+    assert_eq!(machine.run(None), Ok(Halt::Poweroff));
+    assert_eq!(output.contents(), b"boot\n> ok");
+}
+
+/// Build the Shemfile `shemfile` in a context holding `files`.
+fn build_image(shemfile: &str, files: &[(&str, &[u8])], mem: Option<u32>) -> Image {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("Shemfile"), shemfile).unwrap();
+    for (name, data) in files {
+        fs::write(dir.path().join(name), data).unwrap();
+    }
+    image::build(&BuildOptions {
+        shemfile: dir.path().join("Shemfile"),
+        context: dir.path().to_path_buf(),
+        build_args: Default::default(),
+        mem,
+    })
+    .unwrap()
+}
+
+/// Start a VM image with `input` waiting on its console, run it until it
+/// stops, and return its console output.
+fn run_image(image: &Image, input: &[u8]) -> (Result<Halt, VmError>, Vec<u8>) {
+    let output = SharedBuf::default();
+    let (keys, console_input) = channel();
+    input.iter().for_each(|b| keys.send(*b).unwrap());
+    let console = Console::new(console_input, Box::new(output.clone()));
+    let root = tempfile::tempdir().unwrap();
+    let vcpu = |mem| Ok(ReferenceVcpu::with_base(mem, RAM_BASE));
+    let mut machine = image::start_vm(image, vcpu, console, root.path(), RAM).unwrap();
+    (machine.run(Some(2_000_000_000)), output.contents())
+}
+
+#[test]
+fn a_vm_image_boots_at_build_time_and_resumes_at_its_prompt() {
+    // Print a banner and a prompt, then echo one key and power off
+    let kernel = bytes(&program![
+        print("boot\n> "),
+        li(T1, UART),
+        lbu(T2, T1, 5), // the line status: is there input?
+        andi_(T2, T2, 1),
+        beq(T2, ZERO, -8),
+        lbu(A0, T1, 0),
+        putc(A0),
+        poweroff(),
+    ]);
+    let cold = build_image(
+        "FROM scratch\nCOPY kernel /boot/kernel\nKERNEL /boot/kernel console=ttyS0\n",
+        &[("kernel", &kernel)],
+        Some(RAM),
+    );
+    assert_eq!(cold.config.kernel.as_deref(), Some("/boot/kernel"));
+    assert_eq!(cold.config.bootargs.as_deref(), Some("console=ttyS0"));
+    assert_eq!(
+        run_image(&cold, b"x"),
+        (Ok(Halt::Poweroff), b"boot\n> x".to_vec())
+    );
+
+    let warm = build_image(
+        "FROM scratch\nCOPY kernel /boot/kernel\nKERNEL /boot/kernel\nWARM --until=output:\"\\n> \"\n",
+        &[("kernel", &kernel)],
+        Some(RAM),
+    );
+    assert_eq!(warm.config.memory, Some(RAM));
+    assert!(warm.warm_machine().unwrap().is_some());
+    assert_eq!(run_image(&warm, b"x"), (Ok(Halt::Poweroff), b"x".to_vec()));
+}
+
 #[test]
 fn the_device_tree_describes_this_machine() {
     let tree = vm::device_tree(0x0100_0000, DEFAULT_BOOTARGS);
@@ -233,4 +358,64 @@ fn linux_boots_to_a_shell_and_powers_off() {
     wait_for(&output, "~ # ", seen);
     type_line("poweroff");
     assert_eq!(running.join().unwrap(), Ok(Halt::Poweroff));
+}
+
+#[test]
+#[ignore = "needs a Linux image: run `just vm-tests`"]
+fn linux_resumes_at_its_prompt_from_a_booted_snapshot() {
+    let image = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/linux/Image");
+    let kernel = std::fs::read(&image).expect("download the image first: just vm-tests");
+    let console = || {
+        let output = SharedBuf::default();
+        let (keys, input) = channel();
+        (Console::new(input, Box::new(output.clone())), output, keys)
+    };
+    let (boot_console, boot_output, _keys) = console();
+    let vcpu = ReferenceVcpu::with_base(64 << 20, RAM_BASE);
+    let mut machine = Machine::boot(vcpu, &kernel, DEFAULT_BOOTARGS, boot_console).unwrap();
+    let prompt = Some(Pause::Output(b"~ # ".to_vec()));
+    assert_eq!(
+        machine.run_until(Some(2_000_000_000), prompt),
+        Ok(Stop::Paused)
+    );
+    assert!(String::from_utf8_lossy(&boot_output.contents()).contains("Linux version"));
+    let frozen = round_trip(machine.freeze());
+    drop(machine);
+
+    // The snapshot starts at the prompt: no kernel messages, just the answer
+    let (console, output, keys) = console();
+    let vcpu = ReferenceVcpu::with_base(64 << 20, RAM_BASE);
+    let mut machine = Machine::thaw(vcpu, &frozen, console).unwrap();
+    for b in b"echo $((6 * 7))\npoweroff\n" {
+        keys.send(*b).unwrap();
+    }
+    assert_eq!(machine.run(Some(2_000_000_000)), Ok(Halt::Poweroff));
+    let text = String::from_utf8_lossy(&output.contents()).into_owned();
+    assert!(text.starts_with("echo $((6 * 7))"), "{text}");
+    assert!(
+        text.contains("\n42\r\n") || text.contains("\n42\n"),
+        "{text}"
+    );
+    assert!(!text.contains("Linux version"), "{text}");
+}
+
+#[test]
+#[ignore = "needs a Linux image: run `just vm-tests`"]
+fn a_linux_image_ships_booted_and_builds_reproducibly() {
+    let linux = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/linux/Image");
+    let kernel = fs::read(&linux).expect("download the image first: just vm-tests");
+    let shemfile =
+        "FROM scratch\nCOPY Image /boot/Image\nKERNEL /boot/Image\nWARM --until=output:\"~ # \"\n";
+    let build = || build_image(shemfile, &[("Image", &kernel)], None);
+    let (first, second) = (build(), build());
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let digest = first.write_layout(a.path(), "latest").unwrap();
+    assert_eq!(digest, second.write_layout(b.path(), "latest").unwrap());
+    assert_eq!(first.config.memory, Some(image::VM_MEM));
+
+    let (halt, output) = run_image(&first, b"echo $((6 * 7))\npoweroff\n");
+    assert_eq!(halt, Ok(Halt::Poweroff));
+    let text = String::from_utf8_lossy(&output).into_owned();
+    assert!(text.starts_with("echo $((6 * 7))"), "{text}");
+    assert!(text.contains("\n42"), "{text}");
 }

@@ -64,6 +64,8 @@ The network as described, the **dense** executor, is the definition. The **fused
 
 Tests check that the two agree unit by unit on random values, edge cases included, and over whole programs. Either way, the multiplier and divider only run when some guest in the batch needs them; otherwise their results would be routed nowhere, so skipping them changes nothing.
 
+For GPUs the fused executor has a **static** mode, which always runs every unit, and **flat** memory, a row of bytes per guest on the device, with gated-off writes sent to a scratch byte past the end. A step then has no control flow that depends on data, so it can be compiled and captured whole (see [On GPUs](#on-gpus)). A test checks that static mode with flat memory matches the paged executor over a batch of programs.
+
 ## Verification
 
 - **Unit tests** ([`neural/tests`](../neural/tests/)): instruction semantics including every M-extension edge case, exits and their details, faults that change nothing, snapshots, dense against fused, and batching.
@@ -124,6 +126,32 @@ The host talks to the server ([`server.py`](../neural/src/shem_neural/server.py)
 | 13 `RESTORE` | canonical machine state | |
 
 Exit reasons are 0 budget, 1 ecall, 2 ebreak, 3 illegal instruction (detail: the word), and 4 memory fault (detail: the address). Snapshots use the canonical format of `MachineState` in [`vcpu.rs`](../crates/shem/src/vcpu.rs), so a snapshot from either vCPU restores on the other.
+
+## On GPUs
+
+The network runs on whatever device its weights are on. [`gpu.py`](../neural/src/shem_neural/gpu.py) steps a batch of guests in place with the static executor and flat memory, in four modes: eager, compiled with `torch.compile` (which generates Triton kernels), eager in a CUDA graph that captures 64 steps so they launch as one, and both.
+
+[`jobs/gpu.py`](../neural/jobs/gpu.py) is a uv script that runs on [Hugging Face Jobs](https://huggingface.co/docs/huggingface_hub/guides/jobs) (`just gpu-job l4x1`). It downloads shem at a given commit and does two things:
+
+1. **A differential test.** 1,024 guests run random RV32IM programs from random register files for 512 steps (about 100,000 instructions, ending in every kind of exit) on the CPU's paged executor, and then in each GPU mode. Every register, byte of memory, pc, instruction count, exit and exit detail must match. They do, in all four modes, on an L4 and an A100: GPU execution is bit-exact. Nothing relies on how the GPU rounds, because every intermediate value is an integer below 2^53, which float64 holds exactly, fused multiply-adds included.
+2. **Throughput.** Every guest runs a loop of multiplies, divides, loads, stores, shifts and branches, at batch sizes from 1 to 32,768, with 64 KiB of memory each.
+
+Instructions per second, with torch 2.15 and CUDA 13.2 (the CPU row is the paged executor on one core, from [Speed](#speed)):
+
+| Guests | CPU | L4, best mode | A100, eager | A100, compiled + graph | A100, eager + graph |
+|---|---|---|---|---|---|
+| 1 | 881 | 4,818 | 192 | **12,859** | 2,086 |
+| 64 | 27,985 | 278,995 | 12,187 | **577,138** | 121,028 |
+| 1,024 | | 891,211 | 189,646 | **2,821,098** | 1,399,234 |
+| 4,096 | | 998,556 | 760,787 | 3,549,051 | **3,664,716** |
+| 16,384 | | 945,402 | 3,026,696 | 3,986,316 | **6,556,971** |
+| 32,768 | | 968,596 | 6,118,754 | 3,166,873 | **7,434,596** |
+
+What the numbers say:
+
+- **Small batches are bound by launches.** Eager mode runs about 190 steps per second whatever the batch: each step is a few hundred kernel launches. Compiling fuses them into a few kernels and the graph launches 64 steps at once, which together make one guest 67 times faster than eager, and 15 times faster than one CPU core.
+- **Large batches are bound by float64.** The A100 reaches 7.4 million instructions per second with 32,768 guests, 250 times a CPU core's best. The L4 levels off near a million, because it runs float64 at 1/64 of its float32 rate. At large batches the eager path in a graph beats the compiled one: cuBLAS does the batched matrix products better than the kernels Inductor generates for them.
+- **The state is mostly bits.** Registers are 32 bits of float64 each, 8 KiB per guest, read and rewritten every step. Bits are exact in any float type, so keeping them in float32 or bfloat16, and only values in float64, would cut both the traffic and the float64 work.
 
 ## Running it
 

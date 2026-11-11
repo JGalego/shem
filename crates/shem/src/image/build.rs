@@ -4,7 +4,8 @@
 //! `COPY` writes into it and records a layer of what it wrote. `WARM` runs the
 //! entrypoint on the reference vCPU until its condition holds, freezes the
 //! container into a state layer, and records the files the guest changed as
-//! another layer. Ordinary Docker stages are built by Docker, only when a
+//! another layer; in a VM image it boots the kernel instead, and freezes the
+//! machine. Ordinary Docker stages are built by Docker, only when a
 //! `COPY --from` needs their files.
 
 use std::collections::BTreeMap;
@@ -18,18 +19,23 @@ use super::{Config, Image, Layer, ROOTFS_TYPE, STATE_TYPE, find_program, layer};
 use crate::container::{Container, Frozen, Pause, Stop};
 use crate::linux::{RootFs, Stdio};
 use crate::reference::ReferenceVcpu;
+use crate::vm::{self, Console, Machine};
 
 /// The stage name the builder adds to export files from a Docker stage.
 const EXPORT_STAGE: &str = "shem-export";
 /// Instructions a `WARM` may run before giving up, unless it sets `--max-steps`.
 const WARM_MAX_STEPS: u64 = 4_000_000_000;
+/// Guest memory for `WARM`, unless the build sets it.
+pub const CONTAINER_MEM: u32 = 16 << 20;
+pub const VM_MEM: u32 = 64 << 20;
 
 pub struct BuildOptions {
     pub shemfile: PathBuf,
     pub context: PathBuf,
     pub build_args: BTreeMap<String, String>,
-    /// Guest memory for `WARM` steps; it becomes the warm image's memory.
-    pub mem: u32,
+    /// Guest memory for `WARM` steps, which becomes the warm image's memory:
+    /// by default `CONTAINER_MEM`, or `VM_MEM` for a VM image.
+    pub mem: Option<u32>,
 }
 
 pub fn build(options: &BuildOptions) -> anyhow::Result<Image> {
@@ -49,6 +55,7 @@ pub fn build(options: &BuildOptions) -> anyhow::Result<Image> {
         root: root.path().to_path_buf(),
         vars: options.build_args.clone(),
         frozen: None,
+        frozen_vm: None,
         docker: BTreeMap::new(),
     };
     builder.from(base)?;
@@ -79,6 +86,7 @@ struct Builder<'a> {
     root: PathBuf,
     vars: BTreeMap<String, String>,
     frozen: Option<Frozen>,
+    frozen_vm: Option<vm::Frozen>,
     /// Docker stages built so far, by name, with their exported files.
     docker: BTreeMap<String, tempfile::TempDir>,
 }
@@ -95,7 +103,11 @@ impl Builder<'_> {
             Base::Image(dir) => {
                 self.image = Image::read_layout(&dir)?;
                 self.image.unpack_rootfs(&self.root)?;
-                self.frozen = self.image.warm_state()?;
+                if self.image.config.kernel.is_some() {
+                    self.frozen_vm = self.image.warm_machine()?;
+                } else {
+                    self.frozen = self.image.warm_state()?;
+                }
             }
         }
         for (key, value) in self
@@ -157,7 +169,24 @@ impl Builder<'_> {
                 }
                 Ok(())
             }
-            Instruction::Warm { until, max_steps } => self.warm(*until, *max_steps),
+            Instruction::Warm { until, max_steps } => {
+                let max_steps = max_steps.unwrap_or(WARM_MAX_STEPS);
+                if self.image.config.kernel.is_some() {
+                    self.warm_vm(until, max_steps)
+                } else {
+                    self.warm(until, max_steps)
+                }
+            }
+            Instruction::Kernel { path, cmdline } => {
+                if self.frozen.is_some() {
+                    bail!("KERNEL after WARM: a warm container cannot become a VM");
+                }
+                let kernel = self.guest_path(&self.expand(path));
+                let cmdline = self.expand(cmdline);
+                self.image.config.kernel = Some(kernel);
+                self.image.config.bootargs = (!cmdline.is_empty()).then_some(cmdline);
+                Ok(())
+            }
             Instruction::Other { keyword, .. } if keyword == "RUN" => {
                 bail!(
                     "RUN is not allowed in a shem stage: build in a Docker stage and COPY --from it"
@@ -339,7 +368,7 @@ impl Builder<'_> {
         Ok(())
     }
 
-    fn warm(&mut self, until: Until, max_steps: Option<u64>) -> anyhow::Result<()> {
+    fn warm(&mut self, until: &Until, max_steps: u64) -> anyhow::Result<()> {
         let config = self.image.config.clone();
         let before = layer::scan(&self.root)?;
         let stdio = || Stdio {
@@ -364,7 +393,7 @@ impl Builder<'_> {
                     .context("WARM needs an ENTRYPOINT or CMD to run")?;
                 let program = find_program(&self.rootfs()?, &config.workdir, &config.env, name)?;
                 let elf = std::fs::read(program)?;
-                let vcpu = ReferenceVcpu::new(self.options.mem);
+                let vcpu = ReferenceVcpu::new(self.options.mem.unwrap_or(CONTAINER_MEM));
                 Container::from_elf(vcpu, &elf, &argv, &config.env, stdio())?
             }
         };
@@ -374,12 +403,15 @@ impl Builder<'_> {
                 .set_cwd(&config.workdir)
                 .map_err(|e| anyhow::anyhow!("WORKDIR {}: errno {}", config.workdir, e.0))?;
         }
-        let pause = match until {
+        let pause = match *until {
             Until::Syscall(nr) => Pause::Syscall(nr),
             Until::Steps(n) => Pause::Steps(n),
             Until::Ebreak => Pause::Ebreak,
+            Until::Output(_) => {
+                bail!("WARM --until=output: is for VM images, which have a console")
+            }
         };
-        match container.run_until(Some(max_steps.unwrap_or(WARM_MAX_STEPS)), Some(pause))? {
+        match container.run_until(Some(max_steps), Some(pause))? {
             Stop::Paused => {}
             Stop::Exited(status) => {
                 bail!("WARM: the guest exited with status {status} before its condition held")
@@ -399,6 +431,57 @@ impl Builder<'_> {
         });
         self.image.config.memory = Some(frozen.machine.mem.len() as u32);
         self.frozen = Some(frozen);
+        Ok(())
+    }
+
+    /// `WARM` in a VM image: boot the kernel, or resume the machine an earlier
+    /// `WARM` froze, until the condition holds, and freeze the machine. The
+    /// console has no input, and its output goes to stderr.
+    fn warm_vm(&mut self, until: &Until, max_steps: u64) -> anyhow::Result<()> {
+        let pause = match until {
+            Until::Steps(n) => vm::Pause::Steps(*n),
+            Until::Output(bytes) => vm::Pause::Output(bytes.clone()),
+            Until::Syscall(_) | Until::Ebreak => {
+                bail!("a VM image can WARM --until=steps:N or output:TEXT")
+            }
+        };
+        let (_, input) = std::sync::mpsc::channel();
+        let console = Console::new(input, Box::new(std::io::stderr()));
+        let mut machine = match self.frozen_vm.take() {
+            Some(frozen) => {
+                let mem = frozen.machine.mem.len() as u32;
+                Machine::thaw(
+                    ReferenceVcpu::with_base(mem, vm::RAM_BASE),
+                    &frozen,
+                    console,
+                )?
+            }
+            None => {
+                let config = &self.image.config;
+                let kernel = super::read_kernel(config, &self.root)?;
+                let bootargs = config.bootargs.as_deref().unwrap_or(vm::DEFAULT_BOOTARGS);
+                let mem = self.options.mem.unwrap_or(VM_MEM);
+                let vcpu = ReferenceVcpu::with_base(mem, vm::RAM_BASE);
+                Machine::boot(vcpu, &kernel, bootargs, console)?
+            }
+        };
+        match machine.run_until(Some(max_steps), Some(pause))? {
+            vm::Stop::Paused => {}
+            vm::Stop::Halted(halt) => {
+                bail!("WARM: the machine stopped ({halt:?}) before its condition held")
+            }
+        }
+        let frozen = machine.freeze();
+        let host = serde_json::to_vec(&frozen.host)?;
+        let state = frozen.machine.encode();
+        let state = layer::from_files(&[("machine.state", &state), ("vm.json", &host)])?;
+        self.image.layers.retain(|l| l.media_type != STATE_TYPE);
+        self.image.layers.push(Layer {
+            media_type: STATE_TYPE.into(),
+            data: state,
+        });
+        self.image.config.memory = Some(frozen.machine.mem.len() as u32);
+        self.frozen_vm = Some(frozen);
         Ok(())
     }
 

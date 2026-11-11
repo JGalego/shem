@@ -17,9 +17,9 @@ Early, but every part of the design exists, from the reference vCPU to a model r
 
 - **Containers** (`shem run`). The host is the guest's kernel: static RV32 Linux programs run with files from a host directory as their root, processes (`fork`, `execve`, `wait`, pipes, signal handlers), a virtual clock, and atomics emulated so the vCPU stays RV32IM. C programs linked against musl and a static BusyBox run, `sh` pipelines and job control included. `--trace` prints each system call.
 - **Images** (`shem build`). A [Shemfile](docs/shemfile.md) becomes a reproducible OCI image. `WARM` freezes a running guest into the image at build time, so `shem run` resumes it where the build left off. `shem push` and `shem pull` move images through OCI registries.
-- **VM mode** (`shem boot`). The host is the machine around a guest kernel, emulating the privileged architecture, a timer, a UART and a syscon: a no-MMU Linux 6.8 boots to a shell in two seconds ([docs/vm.md](docs/vm.md)).
+- **VM mode** (`shem boot`). The host is the machine around a guest kernel, emulating the privileged architecture, a timer, a UART and a syscon: a no-MMU Linux 6.8 boots to a shell in two seconds. A VM image can ship Linux already booted, so `shem run` starts at its prompt ([docs/vm.md](docs/vm.md)).
 - **containerd**. `ctr run --runtime io.containerd.shem.v1` runs RV32 programs from ordinary OCI images on shem ([docs/containerd.md](docs/containerd.md)).
-- **The neural vCPU**. An RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state. It matches the reference vCPU exactly on the official riscv-tests and random programs, resumes snapshots the reference took, batches every running guest into one forward pass, and shares memory pages between them ([docs/neural.md](docs/neural.md)).
+- **The neural vCPU**. An RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state. It matches the reference vCPU exactly on the official riscv-tests and random programs, resumes snapshots the reference took, batches every running guest into one forward pass, and shares memory pages between them. On GPUs it is bit-exact against the CPU and runs up to 7.4 million instructions per second across 32,768 guests on an A100 ([docs/neural.md](docs/neural.md)).
 - **The reference vCPU**. An RV32IM interpreter that defines correct behaviour for the neural one, passes the official riscv-tests, and runs about 175 million instructions per second.
 
 See the [roadmap](docs/architecture.md#roadmap) for what is next.
@@ -52,9 +52,11 @@ shem run hello
 echo 'echo hello from a warm shell' | shem run warm-shell
 shem push warm-shell ghcr.io/me/warm-shell:1.0   # needs oras (https://oras.land)
 
-# boot Linux in VM mode
+# boot Linux in VM mode, or build it into an image that has already booted
 just linux-image
 shem boot target/linux/Image
+shem build -t linux examples/linux
+echo 'uname -a; poweroff' | shem run linux
 
 # run a guest on the neural vCPU
 just neural-server &
@@ -81,12 +83,13 @@ crates/shem/src/
   container.rs   container mode: processes, the scheduler, fork, exec and wait
   neural.rs      the neural vCPU, as the host reaches it over a socket
   image/         images: Shemfile parser, builder, OCI layouts, the local store
-  vm.rs          VM mode: the machine around a guest kernel
+  vm.rs          VM mode: the machine around a guest kernel, and its snapshots
   fdt.rs         device tree writer
   main.rs        the shem CLI
 crates/shem/tests/  unit, integration and guest-program tests
 crates/containerd-shim-shem/  the containerd shim
-neural/         the neural vCPU: ISA table, weight compiler, network, executor, server
+neural/         the neural vCPU: ISA table, weight compiler, network, executors, server
+  jobs/gpu.py    GPU differential test and benchmark, for Hugging Face Jobs
 toolchain/      the guest toolchain image and the riscv-tests environment
 guests/         C guest programs
 examples/       example Shemfiles

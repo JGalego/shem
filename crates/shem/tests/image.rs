@@ -32,7 +32,7 @@ fn build(context: &Path) -> anyhow::Result<Image> {
         shemfile: context.join("Shemfile"),
         context: context.to_path_buf(),
         build_args: Default::default(),
-        mem: MEM,
+        mem: Some(MEM),
     })
 }
 
@@ -326,6 +326,8 @@ WARM --until=syscall:read --max-steps=1000
         "COPY a\n",
         "WARM\n",
         "WARM --until=syscall:nonsense\n",
+        "WARM --until=output:\n",
+        "WARM --until=output:\"unterminated\n",
         "FROM a b c\n",
     ] {
         let text = if bad.starts_with("FROM") {

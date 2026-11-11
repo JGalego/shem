@@ -1,5 +1,7 @@
 //! Images: a guest filesystem as OCI layers, the configuration to run it, and,
-//! for a warm image, the frozen state of a container started from it.
+//! for a warm image, the frozen state of a container started from it. A VM
+//! image names a kernel in its filesystem instead, and its warm state is a
+//! frozen machine that has booted it.
 //!
 //! An image is stored as an [OCI image layout] whose config and state layer have
 //! shem media types, so OCI registries and tools such as ORAS can store it.
@@ -21,13 +23,14 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub use build::{BuildOptions, build};
+pub use build::{BuildOptions, CONTAINER_MEM, VM_MEM, build};
 pub use layer::unpack;
 pub use registry::{pull, push};
 
 use crate::container::{Container, Frozen, FrozenHost};
 use crate::linux::{RootFs, Stdio};
 use crate::vcpu::{MachineState, Vcpu};
+use crate::vm::{self, Console, FrozenMachine, Machine};
 
 pub const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const CONFIG_TYPE: &str = "application/vnd.shem.config.v1+json";
@@ -49,6 +52,12 @@ pub struct Config {
     /// Guest memory for a warm image, which must resume with the memory it
     /// was frozen with.
     pub memory: Option<u32>,
+    /// A VM image's kernel, a path in its filesystem; set by `KERNEL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
+    /// The kernel command line, if not the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootargs: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,8 +106,8 @@ pub fn digest(data: &[u8]) -> String {
 }
 
 impl Image {
-    /// The frozen container of a warm image, if this is one.
-    pub fn warm_state(&self) -> anyhow::Result<Option<Frozen>> {
+    /// The files of the state layer, if this is a warm image.
+    fn state_files(&self) -> anyhow::Result<Option<BTreeMap<String, Vec<u8>>>> {
         let Some(layer) = self
             .layers
             .iter()
@@ -107,7 +116,14 @@ impl Image {
         else {
             return Ok(None);
         };
-        let files = layer::files(&layer.data)?;
+        Ok(Some(layer::files(&layer.data)?))
+    }
+
+    /// The frozen container of a warm image, if this is one.
+    pub fn warm_state(&self) -> anyhow::Result<Option<Frozen>> {
+        let Some(files) = self.state_files()? else {
+            return Ok(None);
+        };
         let host = files
             .get("container.json")
             .context("state layer has no container.json")?;
@@ -116,6 +132,21 @@ impl Image {
             .context("state layer has no machine.state")?;
         Ok(Some(Frozen {
             host: serde_json::from_slice::<FrozenHost>(host)?,
+            machine: MachineState::decode(machine)?,
+        }))
+    }
+
+    /// The frozen machine of a warm VM image, if this is one.
+    pub fn warm_machine(&self) -> anyhow::Result<Option<vm::Frozen>> {
+        let Some(files) = self.state_files()? else {
+            return Ok(None);
+        };
+        let host = files.get("vm.json").context("state layer has no vm.json")?;
+        let machine = files
+            .get("machine.state")
+            .context("state layer has no machine.state")?;
+        Ok(Some(vm::Frozen {
+            host: serde_json::from_slice::<FrozenMachine>(host)?,
             machine: MachineState::decode(machine)?,
         }))
     }
@@ -268,6 +299,42 @@ pub fn start<V: Vcpu + Clone>(
     };
     container.set_root(root)?;
     Ok(container)
+}
+
+/// Start a VM image's machine. A warm image resumes where `WARM` froze it;
+/// otherwise the kernel boots, its filesystem unpacked into `root` to read it.
+/// `vcpu` makes a vCPU with RAM at `vm::RAM_BASE` and the given memory: a warm
+/// image's own size, or `mem` for a cold boot.
+pub fn start_vm<V: Vcpu>(
+    image: &Image,
+    vcpu: impl FnOnce(u32) -> anyhow::Result<V>,
+    console: Console,
+    root: &Path,
+    mem: u32,
+) -> anyhow::Result<Machine<V>> {
+    if let Some(frozen) = image.warm_machine()? {
+        return Ok(Machine::thaw(
+            vcpu(frozen.machine.mem.len() as u32)?,
+            &frozen,
+            console,
+        )?);
+    }
+    image.unpack_rootfs(root)?;
+    let kernel = read_kernel(&image.config, root)?;
+    let bootargs = (image.config.bootargs.as_deref()).unwrap_or(vm::DEFAULT_BOOTARGS);
+    Ok(Machine::boot(vcpu(mem)?, &kernel, bootargs, console)?)
+}
+
+/// The kernel a VM image's config names, from its unpacked filesystem.
+pub fn read_kernel(config: &Config, root: &Path) -> anyhow::Result<Vec<u8>> {
+    let path = config
+        .kernel
+        .as_deref()
+        .context("not a VM image: no KERNEL")?;
+    let resolved = RootFs::new(root)?
+        .resolve(b"/", path.as_bytes(), true)
+        .map_err(|e| anyhow::anyhow!("KERNEL {path}: errno {}", e.0))?;
+    std::fs::read(&resolved.host).with_context(|| format!("KERNEL {path}"))
 }
 
 /// Find the program `name` in `root` the way a shell would: as a path if it has

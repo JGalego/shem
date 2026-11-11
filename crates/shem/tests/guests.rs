@@ -209,7 +209,7 @@ fn build_example(name: &str) -> shem::image::Image {
         shemfile: context.join("Shemfile"),
         context,
         build_args: Default::default(),
-        mem: MEM,
+        mem: Some(MEM),
     })
     .unwrap_or_else(|err| panic!("building examples/{name}: {err:#} (run `just guest-tests`)"))
 }

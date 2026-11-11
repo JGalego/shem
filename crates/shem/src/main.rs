@@ -52,9 +52,10 @@ enum VcpuKind {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Guest memory size, such as 16M (a warm image brings its own)
-    #[arg(long, default_value = "16M", value_parser = parse_size)]
-    mem: u32,
+    /// Guest memory size, such as 16M; the default is 16M, or 64M for a VM
+    /// image, and a warm image brings its own
+    #[arg(long, value_parser = parse_size)]
+    mem: Option<u32>,
     /// Stop the guest after this many instructions
     #[arg(long)]
     max_steps: Option<u64>,
@@ -94,9 +95,10 @@ struct BuildArgs {
     /// Set a build argument (KEY=VALUE)
     #[arg(long = "build-arg", value_name = "KEY=VALUE")]
     build_args: Vec<String>,
-    /// Guest memory for WARM steps, which a warm image keeps
-    #[arg(long, default_value = "16M", value_parser = parse_size)]
-    mem: u32,
+    /// Guest memory for WARM steps, which a warm image keeps; the default is
+    /// 16M, or 64M for a VM image
+    #[arg(long, value_parser = parse_size)]
+    mem: Option<u32>,
     /// Write the image as an OCI layout to this directory instead of the store
     #[arg(short, long, value_name = "DIR")]
     output: Option<PathBuf>,
@@ -195,7 +197,8 @@ fn launch<V: Vcpu + Clone>(
         let argv: Vec<String> = std::iter::once(args.target.clone())
             .chain(args.args.iter().cloned())
             .collect();
-        let mut container = Container::from_elf(vcpu(args.mem)?, &elf, &argv, &args.env, stdio)
+        let mem = args.mem.unwrap_or(image::CONTAINER_MEM);
+        let mut container = Container::from_elf(vcpu(mem)?, &elf, &argv, &args.env, stdio)
             .with_context(|| format!("loading {}", args.target))?;
         if let Some(root) = &args.root {
             container
@@ -209,6 +212,9 @@ fn launch<V: Vcpu + Clone>(
         }
         let image = load_image(&args.target)?;
         let dir = tempfile::tempdir()?;
+        if image.config.kernel.is_some() {
+            return run_vm(args, &image, dir.path());
+        }
         let container = image::start(
             &image,
             vcpu,
@@ -216,7 +222,7 @@ fn launch<V: Vcpu + Clone>(
             &args.env,
             stdio,
             dir.path(),
-            args.mem,
+            args.mem.unwrap_or(image::CONTAINER_MEM),
         )
         .with_context(|| format!("starting {}", args.target))?;
         rootfs = Some(dir);
@@ -293,9 +299,26 @@ fn build(args: BuildArgs) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-fn boot(args: BootArgs) -> anyhow::Result<u8> {
-    let kernel = std::fs::read(&args.kernel)
-        .with_context(|| format!("reading {}", args.kernel.display()))?;
+/// Run a VM image: boot its kernel, or resume its booted machine, with the
+/// console on stdio.
+fn run_vm(args: &RunArgs, image: &Image, root: &Path) -> anyhow::Result<u8> {
+    if matches!(args.vcpu, VcpuKind::Neural) {
+        bail!(
+            "VM images run on the reference vCPU for now: the neural vCPU has no RAM base address yet"
+        );
+    }
+    if !args.args.is_empty() || !args.env.is_empty() {
+        bail!("a VM image takes no arguments or environment: KERNEL sets its command line");
+    }
+    let vcpu = |mem| Ok(ReferenceVcpu::with_base(mem, vm::RAM_BASE));
+    let mem = args.mem.unwrap_or(image::VM_MEM);
+    let machine = image::start_vm(image, vcpu, stdio_console(), root, mem)
+        .with_context(|| format!("starting {}", args.target))?;
+    finish_vm(machine, args.max_steps, args.stats)
+}
+
+/// A console on this process's stdin and stdout.
+fn stdio_console() -> Console {
     let (keys, input) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use std::io::Read;
@@ -305,11 +328,24 @@ fn boot(args: BootArgs) -> anyhow::Result<u8> {
             }
         }
     });
-    let console = Console::new(input, Box::new(std::io::stdout()));
+    Console::new(input, Box::new(std::io::stdout()))
+}
+
+fn boot(args: BootArgs) -> anyhow::Result<u8> {
+    let kernel = std::fs::read(&args.kernel)
+        .with_context(|| format!("reading {}", args.kernel.display()))?;
     let vcpu = ReferenceVcpu::with_base(args.mem, vm::RAM_BASE);
-    let mut machine = Machine::boot(vcpu, &kernel, &args.append, console)?;
-    let halt = machine.run(args.max_steps);
-    if args.stats {
+    let machine = Machine::boot(vcpu, &kernel, &args.append, stdio_console())?;
+    finish_vm(machine, args.max_steps, args.stats)
+}
+
+fn finish_vm(
+    mut machine: Machine<ReferenceVcpu>,
+    max_steps: Option<u64>,
+    stats: bool,
+) -> anyhow::Result<u8> {
+    let halt = machine.run(max_steps);
+    if stats {
         eprintln!("shem: {} instructions retired", machine.steps);
     }
     match halt? {

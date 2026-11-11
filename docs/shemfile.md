@@ -59,6 +59,7 @@ The last stage is the image. It must be a **shem stage**: `FROM scratch`, or `FR
 | `COPY [--from=stage] src... dest` | As in Docker: a directory's contents are copied into `dest`; a file goes to `dest`, or into it when `dest` ends in `/` or there are several sources. Each `COPY` is one layer. Sources must stay inside the context. |
 | `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`, `ARG`, `LABEL` | As in Docker, including shell and exec forms, and `$NAME` and `${NAME}` substitution from `ARG` and `ENV` |
 | `WARM` | New; see below |
+| `KERNEL path [command line]` | New: makes a VM image; see [VM images](#vm-images) |
 | `RUN` | Not allowed: at about a thousand instructions per second on a neural vCPU, a compiler would take days. Build in a Docker stage and `COPY --from` it. |
 
 Resource limits are `shem run` flags (`--mem`, `--max-steps`), not Shemfile instructions, as in Docker.
@@ -88,9 +89,24 @@ A state layer holds:
 
 Files the guest wrote during `WARM` become an ordinary filesystem layer, with whiteouts for deletions.
 
-**WARM runs on the reference vCPU.** Snapshots are canonical, and the neural vCPU is trace-equivalent to the reference one, so the builder runs `WARM` at about 175 million instructions per second instead of about a thousand, and the snapshot resumes on the model. A test builds a warm image this way and runs it on the neural vCPU. This is also what will make VM mode practical: boot a kernel at build time on the CPU, and ship the booted state.
+**WARM runs on the reference vCPU.** Snapshots are canonical, and the neural vCPU is trace-equivalent to the reference one, so the builder runs `WARM` at about 175 million instructions per second instead of about a thousand, and the snapshot resumes on the model. A test builds a warm image this way and runs it on the neural vCPU. VM images use the same idea: the kernel boots at build time on the CPU, and the image ships the booted state.
 
 A warm image takes no arguments or environment at run time, and runs with the memory it was frozen with.
+
+### VM images
+
+```dockerfile
+KERNEL <path> [command line]
+```
+
+Makes the image a VM image: `shem run` boots the kernel at `path` in the image's filesystem in [VM mode](vm.md), with the console on stdio, rather than starting a program. The rest of the line is the kernel command line (default: `earlycon=uart8250,mmio,0x10000000,1000000 console=ttyS0`). Memory is `--mem`, 64 MiB by default.
+
+In a VM image, `WARM` boots the kernel at build time and freezes the machine. Its conditions are:
+
+- `output:TEXT`: stop once the console's output ends with `TEXT`, such as a shell's prompt. Quote it to include spaces; in double quotes, JSON escapes such as `\n` work.
+- `steps:<n>`: stop once `n` instructions have retired.
+
+The state layer holds `machine.state` and `vm.json`, the host's half of the hardware (see [vm.md](vm.md#booted-snapshots)).
 
 ## Image format
 
@@ -98,9 +114,9 @@ A shem image is an [OCI image layout](https://github.com/opencontainers/image-sp
 
 | Media type | Contents |
 |---|---|
-| `application/vnd.shem.config.v1+json` | Entrypoint, cmd, env, workdir, labels, the machine (`rv32im`), and a warm image's memory size |
+| `application/vnd.shem.config.v1+json` | Entrypoint, cmd, env, workdir, labels, the machine (`rv32im`), a warm image's memory size, and a VM image's kernel and command line |
 | `application/vnd.oci.image.layer.v1.tar` | Guest filesystem layers, in the standard format |
-| `application/vnd.shem.state.v1.tar` | A `WARM` snapshot, always the last layer |
+| `application/vnd.shem.state.v1.tar` | A `WARM` snapshot, always the last layer: a container's (`machine.state`, `container.json`) or a VM's (`machine.state`, `vm.json`) |
 
 Images in the local store live under `$SHEM_HOME/images/<name>/<tag>`, by default `~/.local/share/shem/images`. Each run unpacks the image's filesystem into a fresh directory and removes it afterwards, like `docker run --rm`.
 

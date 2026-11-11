@@ -348,7 +348,7 @@ fn warm_images_built_on_the_reference_resume_on_the_neural_vcpu() {
         shemfile: context.path().join("Shemfile"),
         context: context.path().to_path_buf(),
         build_args: Default::default(),
-        mem: MEM,
+        mem: Some(MEM),
     })
     .unwrap();
 

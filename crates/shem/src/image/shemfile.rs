@@ -35,6 +35,11 @@ pub enum Instruction {
         until: Until,
         max_steps: Option<u64>,
     },
+    /// `KERNEL path [command line]`: a VM image's kernel, in its filesystem.
+    Kernel {
+        path: String,
+        cmdline: String,
+    },
     /// Anything else, such as `RUN`: fine in a Docker stage, an error in a shem one.
     Other {
         keyword: String,
@@ -43,11 +48,13 @@ pub enum Instruction {
 }
 
 /// When `WARM` stops the guest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Until {
     Syscall(u32),
     Steps(u64),
     Ebreak,
+    /// A VM's console output ends with these bytes.
+    Output(Vec<u8>),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -130,6 +137,13 @@ pub fn parse(text: &str) -> Result<Vec<Stage>, ParseError> {
                 None => return Err(fail("expected ARG name[=default]".into())),
             },
             "WARM" => parse_warm(&rest).map_err(fail)?,
+            "KERNEL" if !rest.is_empty() => {
+                let (path, cmdline) = rest.split_once(char::is_whitespace).unwrap_or((&rest, ""));
+                Instruction::Kernel {
+                    path: path.to_string(),
+                    cmdline: cmdline.trim().to_string(),
+                }
+            }
             _ => Instruction::Other { keyword, rest },
         };
         stage.instructions.push(instruction);
@@ -240,13 +254,13 @@ fn parse_command(rest: &str) -> Result<Vec<String>, String> {
 }
 
 fn parse_warm(rest: &str) -> Result<Instruction, String> {
-    let (flags, extra) = split_flags(rest);
-    if !extra.is_empty() {
-        return Err(format!("unexpected {extra:?} after WARM's options"));
-    }
     let mut until = None;
     let mut max_steps = None;
-    for (name, value) in flags {
+    // Split with quotes in mind, for an output condition such as "~ # "
+    for word in split_words(rest) {
+        let flag =
+            (word.strip_prefix("--")).ok_or(format!("unexpected {word:?} after WARM's options"))?;
+        let (name, value) = flag.split_once('=').unwrap_or((flag, ""));
         match name {
             "until" => until = Some(parse_until(value)?),
             "max-steps" => {
@@ -275,6 +289,17 @@ fn parse_until(value: &str) -> Result<Until, String> {
             .map(Until::Steps)
             .map_err(|_| format!("bad step count {steps:?}"));
     }
+    if let Some(text) = value.strip_prefix("output:") {
+        let text = if text.starts_with('"') {
+            serde_json::from_str::<String>(text).map_err(|e| format!("bad output {text}: {e}"))?
+        } else {
+            unquote(text)
+        };
+        if text.is_empty() {
+            return Err("--until=output: needs the text to wait for".into());
+        }
+        return Ok(Until::Output(text.into_bytes()));
+    }
     if let Some(name) = value.strip_prefix("syscall:") {
         if let Ok(number) = name.parse() {
             return Ok(Until::Syscall(number));
@@ -288,7 +313,7 @@ fn parse_until(value: &str) -> Result<Until, String> {
             ));
     }
     Err(format!(
-        "expected --until=syscall:NAME, steps:N or ebreak, got {value:?}"
+        "expected --until=syscall:NAME, steps:N, ebreak or output:TEXT, got {value:?}"
     ))
 }
 

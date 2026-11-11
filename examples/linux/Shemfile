@@ -1,0 +1,12 @@
+# Linux, booted at build time: `shem run` resumes it at its shell prompt.
+# The kernel is mini-rv32ima's no-MMU Linux 6.8 with a BusyBox initramfs.
+FROM alpine:3.22 AS kernel
+ARG COMMIT=7da8c6e486b7d510426b5c2283cd338abcf04eb7
+ADD --checksum=sha256:f6fa72e17ee810dfa42daec6d3836e427cadac3693069daa9a52d00055e4c056 \
+    https://raw.githubusercontent.com/cnlohr/mini-rv32ima-images/${COMMIT}/images/linux-6.8-rc1-rv32nommu-cnl-1.zip /linux.zip
+RUN unzip /linux.zip -d /linux
+
+FROM scratch
+COPY --from=kernel /linux/Image /boot/Image
+KERNEL /boot/Image
+WARM --until=output:"~ # "

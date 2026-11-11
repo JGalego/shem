@@ -66,6 +66,10 @@ neural-tests: toolchain
 neural-server socket="/tmp/shem-neural.sock":
     uv run --project neural python -m shem_neural.server --socket {{ socket }}
 
+# Test and benchmark the neural vCPU on a GPU with Hugging Face Jobs, at the pushed HEAD; needs `hf auth login`
+gpu-job flavor="l4x1":
+    uvx --from huggingface_hub hf jobs uv run --flavor {{ flavor }} --timeout 1h neural/jobs/gpu.py --rev $(git rev-parse HEAD)
+
 # Build the BusyBox rootfs as a Docker image, for Shemfiles to COPY --from
 busybox-image:
     docker build -q --target busybox -t shem-busybox toolchain

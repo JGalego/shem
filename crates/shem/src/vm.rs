@@ -16,17 +16,22 @@
 //! The machine is the one mini-rv32ima defines, so its no-MMU Linux images
 //! boot unchanged: RAM at 0x80000000, a 16550 UART at 0x10000000, a CLINT timer
 //! at 0x11000000, and a syscon at 0x11100000 for poweroff and reboot.
+//!
+//! A machine can be frozen and thawed, as a container can: the vCPU's
+//! canonical state, and the host's half of the hardware. So an image can ship a
+//! kernel that has already booted.
 
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::emulate::{Emulation, Emulator};
 use crate::fdt::Fdt;
-use crate::vcpu::{ExitReason, MemoryFault, Vcpu};
+use crate::vcpu::{ExitReason, MachineState, MemoryFault, SnapshotError, Vcpu};
 
 pub const RAM_BASE: u32 = 0x8000_0000;
 const UART: u32 = 0x1000_0000;
@@ -67,6 +72,40 @@ const TIMER_INTERRUPT: u32 = 0x8000_0007;
 pub enum Halt {
     Poweroff,
     Reboot,
+}
+
+/// Where `run_until` should stop, as `WARM --until` asks of a VM image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pause {
+    /// Once this many instructions have retired.
+    Steps(u64),
+    /// Once the console's output ends with these bytes, such as a shell's
+    /// prompt.
+    Output(Vec<u8>),
+}
+
+/// How `run_until` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    Halted(Halt),
+    Paused,
+}
+
+/// A frozen machine: the vCPU's state, and the host's half of the hardware.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frozen {
+    pub machine: MachineState,
+    pub host: FrozenMachine,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenMachine {
+    pub steps: u64,
+    pub privilege: u32,
+    pub csr: Csrs,
+    pub mtimecmp: u64,
+    pub idle_ticks: u64,
+    pub reservation: Option<u32>,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -115,16 +154,17 @@ impl Console {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-struct Csrs {
-    mstatus: u32,
-    mie: u32,
-    mip: u32,
-    mtvec: u32,
-    mscratch: u32,
-    mepc: u32,
-    mcause: u32,
-    mtval: u32,
+/// The machine-mode CSRs the host keeps for the guest.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Csrs {
+    pub mstatus: u32,
+    pub mie: u32,
+    pub mip: u32,
+    pub mtvec: u32,
+    pub mscratch: u32,
+    pub mepc: u32,
+    pub mcause: u32,
+    pub mtval: u32,
 }
 
 pub struct Machine<V> {
@@ -138,6 +178,10 @@ pub struct Machine<V> {
     console: Console,
     /// Instructions retired.
     pub steps: u64,
+    pause: Option<Pause>,
+    /// The console's latest output, as long as an output pause's bytes.
+    tail: VecDeque<u8>,
+    paused: bool,
 }
 
 /// The device tree for this machine with `ram` bytes of memory below the
@@ -229,7 +273,11 @@ impl<V: Vcpu> Machine<V> {
         vcpu.set_pc(RAM_BASE);
         vcpu.set_reg(10, 0);
         vcpu.set_reg(11, RAM_BASE + tree_at);
-        Ok(Self {
+        Ok(Self::new(vcpu, console))
+    }
+
+    fn new(vcpu: V, console: Console) -> Self {
+        Self {
             vcpu,
             csr: Csrs::default(),
             privilege: MACHINE,
@@ -238,12 +286,71 @@ impl<V: Vcpu> Machine<V> {
             emulator: Emulator::default(),
             console,
             steps: 0,
+            pause: None,
+            tail: VecDeque::new(),
+            paused: false,
+        }
+    }
+
+    /// Resume a frozen machine exactly where it stopped, with its console on
+    /// `console`. The vCPU needs the same memory size and base address.
+    pub fn thaw(mut vcpu: V, frozen: &Frozen, console: Console) -> Result<Self, SnapshotError> {
+        vcpu.restore(&frozen.machine)?;
+        let host = &frozen.host;
+        Ok(Self {
+            csr: host.csr,
+            privilege: host.privilege,
+            mtimecmp: host.mtimecmp,
+            idle_ticks: host.idle_ticks,
+            emulator: Emulator::with_reservation(host.reservation),
+            steps: host.steps,
+            ..Self::new(vcpu, console)
         })
+    }
+
+    /// Freeze the machine between instructions. Console input not yet read
+    /// is not part of it.
+    pub fn freeze(&self) -> Frozen {
+        Frozen {
+            machine: self.vcpu.snapshot(),
+            host: FrozenMachine {
+                steps: self.steps,
+                privilege: self.privilege,
+                csr: self.csr,
+                mtimecmp: self.mtimecmp,
+                idle_ticks: self.idle_ticks,
+                reservation: self.emulator.reservation(),
+            },
+        }
     }
 
     /// Run until the guest powers off or reboots.
     pub fn run(&mut self, max_steps: Option<u64>) -> Result<Halt, VmError> {
+        match self.run_until(max_steps, None)? {
+            Stop::Halted(halt) => Ok(halt),
+            Stop::Paused => unreachable!("no pause was asked for"),
+        }
+    }
+
+    /// Run until the guest powers off or reboots, or until `pause`.
+    pub fn run_until(
+        &mut self,
+        max_steps: Option<u64>,
+        pause: Option<Pause>,
+    ) -> Result<Stop, VmError> {
+        self.tail.clear();
+        self.paused = false;
+        self.pause = pause;
         loop {
+            if let Some(Pause::Steps(at)) = self.pause
+                && self.steps >= at
+            {
+                self.paused = true;
+            }
+            if self.paused {
+                self.pause = None;
+                return Ok(Stop::Paused);
+            }
             if let Some(max) = max_steps
                 && self.steps >= max
             {
@@ -256,11 +363,17 @@ impl<V: Vcpu> Machine<V> {
             }
             let mut budget = SLICE;
             if self.timer_enabled() {
-                let ticks = self.mtimecmp.saturating_sub(self.mtime()).max(1);
-                budget = budget.min(ticks.saturating_mul(INSTRUCTIONS_PER_TICK));
+                // Stop exactly where mtime reaches mtimecmp, so the interrupt
+                // arrives at the same instruction however the run is sliced.
+                let due = (self.mtimecmp.saturating_sub(self.idle_ticks))
+                    .saturating_mul(INSTRUCTIONS_PER_TICK);
+                budget = budget.min(due.saturating_sub(self.steps).max(1));
             }
             if let Some(max) = max_steps {
                 budget = budget.min(max - self.steps);
+            }
+            if let Some(Pause::Steps(at)) = self.pause {
+                budget = budget.min(at - self.steps);
             }
             let exit = self.vcpu.run(budget);
             self.steps += exit.steps;
@@ -292,7 +405,7 @@ impl<V: Vcpu> Machine<V> {
                 }
                 ExitReason::MemoryFault(addr) => match self.mmio(pc, addr) {
                     Mmio::Done => self.vcpu.set_pc(pc.wrapping_add(4)),
-                    Mmio::Halt(halt) => return Ok(halt),
+                    Mmio::Halt(halt) => return Ok(Stop::Halted(halt)),
                     Mmio::Load => self.trap(LOAD_FAULT, addr, pc),
                     Mmio::Store => self.trap(STORE_FAULT, addr, pc),
                 },
@@ -499,6 +612,13 @@ impl<V: Vcpu> Machine<V> {
             UART => {
                 let _ = self.console.output.write_all(&[value as u8]);
                 let _ = self.console.output.flush();
+                if let Some(Pause::Output(bytes)) = &self.pause {
+                    self.tail.push_back(value as u8);
+                    if self.tail.len() > bytes.len() {
+                        self.tail.pop_front();
+                    }
+                    self.paused = self.tail.iter().eq(bytes.iter());
+                }
             }
             a if (UART..UART + 0x100).contains(&a) => {}
             a if a == CLINT + 0x4000 => {
