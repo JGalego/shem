@@ -69,3 +69,18 @@ neural-server socket="/tmp/shem-neural.sock":
 # Build the BusyBox rootfs as a Docker image, for Shemfiles to COPY --from
 busybox-image:
     docker build -q --target busybox -t shem-busybox toolchain
+
+# Download a prebuilt no-MMU Linux for VM mode (from cnlohr/mini-rv32ima-images, GPL)
+linux-image:
+    #!/bin/sh
+    set -e
+    [ -f target/linux/Image ] && exit 0
+    mkdir -p target/linux
+    commit=7da8c6e486b7d510426b5c2283cd338abcf04eb7
+    curl -fsSL "https://raw.githubusercontent.com/cnlohr/mini-rv32ima-images/$commit/images/linux-6.8-rc1-rv32nommu-cnl-1.zip" -o target/linux/linux.zip
+    echo "f6fa72e17ee810dfa42daec6d3836e427cadac3693069daa9a52d00055e4c056  target/linux/linux.zip" | sha256sum -c -
+    python3 -m zipfile -e target/linux/linux.zip target/linux
+
+# Boot Linux in VM mode, run commands in its shell, and power it off
+vm-tests: linux-image
+    cargo test --release --test vm -- --ignored

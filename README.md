@@ -22,6 +22,7 @@ Early, but both halves exist: the host, and a model to run guests on.
 - processes: `fork`, `execve`, `wait`, pipes, process groups and signal handlers, with the host as the kernel and a scheduler that gives each process a turn
 - `shem run`, which runs an executable as a container (`--trace` prints each system call)
 - images: `shem build` turns a [Shemfile](docs/shemfile.md) into a reproducible OCI image, and `WARM` freezes a running guest into it, so `shem run` resumes it where the build left off
+- VM mode: `shem boot` boots a no-MMU Linux kernel to a shell, with the host emulating the privileged architecture and the devices ([docs/vm.md](docs/vm.md))
 - a neural vCPU: an RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state, that matches the reference exactly on the official riscv-tests; it batches every running guest into one forward pass and shares memory pages between them ([docs/neural.md](docs/neural.md))
 
 See the [roadmap](docs/architecture.md#roadmap) for what comes next.
@@ -51,6 +52,10 @@ shem build -t warm-shell examples/warm-shell
 shem run hello
 echo 'echo hello from a warm shell' | shem run warm-shell
 
+# boot Linux in VM mode
+just linux-image
+shem boot target/linux/Image
+
 # run a guest on the neural vCPU
 just neural-server &
 just run --vcpu neural --neural-socket /tmp/shem-neural.sock --mem 1M target/riscv-tests/rv32ui-add
@@ -76,6 +81,8 @@ crates/shem/src/
   container.rs   container mode: processes, the scheduler, fork, exec and wait
   neural.rs      the neural vCPU, as the host reaches it over a socket
   image/         images: Shemfile parser, builder, OCI layouts, the local store
+  vm.rs          VM mode: the machine around a guest kernel
+  fdt.rs         device tree writer
   main.rs        the shem CLI
 crates/shem/tests/  unit, integration and guest-program tests
 neural/         the neural vCPU: ISA table, weight compiler, network, executor, server
@@ -85,6 +92,7 @@ examples/       example Shemfiles
 docs/
   architecture.md  design, tech stack and roadmap
   neural.md        how the neural vCPU works, and its protocol
+  vm.md            VM mode
   shemfile.md      the Shemfile and the image format
 ```
 

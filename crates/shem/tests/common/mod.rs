@@ -88,6 +88,14 @@ encoders! {
     amomaxu_w(rd: u32, rs2: u32, rs1: u32) = amo(0x1c, rd, rs1, rs2);
 }
 
+/// csrrw/csrrs/csrrc (funct3 1-3) and their immediate forms (5-7).
+pub fn csr(funct3: u32, rd: u32, csr: u32, rs1: u32) -> u32 {
+    csr << 20 | rs1 << 15 | funct3 << 12 | rd << 7 | 0x73
+}
+
+pub const MRET: u32 = 0x3020_0073;
+pub const WFI: u32 = 0x1050_0073;
+
 fn amo(funct5: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
     funct5 << 27 | rs2 << 20 | rs1 << 15 | 2 << 12 | rd << 7 | 0x2f
 }
@@ -115,6 +123,12 @@ pub trait Emit {
 impl Emit for u32 {
     fn emit(self, out: &mut Vec<u32>) {
         out.push(self);
+    }
+}
+
+impl Emit for Vec<u32> {
+    fn emit(self, out: &mut Vec<u32>) {
+        out.extend(self);
     }
 }
 

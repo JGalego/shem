@@ -11,15 +11,24 @@ pub struct ReferenceVcpu {
     regs: [u32; 32],
     pc: u32,
     mem: Vec<u8>,
+    /// The guest address where memory starts. Accesses outside memory exit
+    /// with a memory fault, which in VM mode is how devices are reached.
+    base: u32,
     instret: u64,
 }
 
 impl ReferenceVcpu {
     pub fn new(mem_size: u32) -> Self {
+        Self::with_base(mem_size, 0)
+    }
+
+    /// A vCPU whose memory occupies `base .. base + mem_size`.
+    pub fn with_base(mem_size: u32, base: u32) -> Self {
         Self {
             regs: [0; 32],
             pc: 0,
             mem: vec![0; mem_size as usize],
+            base,
             instret: 0,
         }
     }
@@ -131,7 +140,7 @@ impl ReferenceVcpu {
     }
 
     fn load(&self, addr: u32, size: usize) -> Result<u32, ExitReason> {
-        let start = addr as usize;
+        let start = addr.wrapping_sub(self.base) as usize;
         let bytes = self
             .mem
             .get(start..start + size)
@@ -142,7 +151,7 @@ impl ReferenceVcpu {
     }
 
     fn store(&mut self, addr: u32, bytes: &[u8]) -> Result<(), ExitReason> {
-        let start = addr as usize;
+        let start = addr.wrapping_sub(self.base) as usize;
         let slot = self
             .mem
             .get_mut(start..start + bytes.len())
@@ -152,7 +161,7 @@ impl ReferenceVcpu {
     }
 
     fn range(&self, addr: u32, len: usize) -> Result<std::ops::Range<usize>, MemoryFault> {
-        let start = addr as usize;
+        let start = addr.wrapping_sub(self.base) as usize;
         match start.checked_add(len) {
             Some(end) if end <= self.mem.len() => Ok(start..end),
             _ => Err(MemoryFault { addr, len }),

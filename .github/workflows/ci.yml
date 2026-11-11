@@ -77,3 +77,14 @@ jobs:
       - uses: extractions/setup-just@v4
       - name: Unit tests, then riscv-tests and random programs on both vCPUs
         run: just neural-tests
+
+  vm:
+    name: VM mode (boots Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v4
+      - name: Boot a no-MMU Linux to a shell and power it off
+        run: just vm-tests

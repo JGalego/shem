@@ -10,6 +10,7 @@ use shem::linux::Stdio;
 use shem::neural::NeuralVcpu;
 use shem::reference::ReferenceVcpu;
 use shem::vcpu::Vcpu;
+use shem::vm::{self, Console, Halt, Machine};
 
 /// Exit status for errors in shem itself rather than the guest, as with `docker run`.
 const HOST_ERROR: u8 = 125;
@@ -33,6 +34,8 @@ enum Command {
     Build(BuildArgs),
     /// List the images in the local store
     Images,
+    /// Boot an operating system kernel in VM mode, with its console on stdio
+    Boot(BootArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -98,11 +101,30 @@ struct BuildArgs {
     context: PathBuf,
 }
 
+#[derive(Args)]
+struct BootArgs {
+    /// Guest memory size, such as 64M
+    #[arg(long, default_value = "64M", value_parser = parse_size)]
+    mem: u32,
+    /// The kernel command line
+    #[arg(long, default_value = vm::DEFAULT_BOOTARGS)]
+    append: String,
+    /// Stop the machine after this many instructions
+    #[arg(long)]
+    max_steps: Option<u64>,
+    /// Print how many instructions the machine retired
+    #[arg(long)]
+    stats: bool,
+    /// A raw RV32 kernel image, such as a no-MMU Linux Image, loaded at 0x80000000
+    kernel: PathBuf,
+}
+
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Run(args) => run(args),
         Command::Build(args) => build(args),
         Command::Images => images(),
+        Command::Boot(args) => boot(args),
     };
     match result {
         Ok(status) => ExitCode::from(status),
@@ -239,6 +261,34 @@ fn build(args: BuildArgs) -> anyhow::Result<u8> {
     let digest = built.write_layout(&dir, &tag)?;
     eprintln!("shem: built {tag} {digest}");
     Ok(0)
+}
+
+fn boot(args: BootArgs) -> anyhow::Result<u8> {
+    let kernel = std::fs::read(&args.kernel)
+        .with_context(|| format!("reading {}", args.kernel.display()))?;
+    let (keys, input) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        for byte in std::io::stdin().lock().bytes().map_while(Result::ok) {
+            if keys.send(byte).is_err() {
+                break;
+            }
+        }
+    });
+    let console = Console::new(input, Box::new(std::io::stdout()));
+    let vcpu = ReferenceVcpu::with_base(args.mem, vm::RAM_BASE);
+    let mut machine = Machine::boot(vcpu, &kernel, &args.append, console)?;
+    let halt = machine.run(args.max_steps);
+    if args.stats {
+        eprintln!("shem: {} instructions retired", machine.steps);
+    }
+    match halt? {
+        Halt::Poweroff => Ok(0),
+        Halt::Reboot => {
+            eprintln!("shem: the guest asked to reboot; stopping instead");
+            Ok(0)
+        }
+    }
 }
 
 fn images() -> anyhow::Result<u8> {

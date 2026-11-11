@@ -19,13 +19,13 @@ The starting point is [Qwenputer](https://divagr.com/blog/qwenputer), which comp
 
 ## Two modes, one runtime
 
-| | Container (`shem run`) | VM (`shem boot`, planned) |
+| | Container (`shem run`) | VM (`shem boot`) |
 |---|---|---|
-| Guest runs | One user-mode program | A kernel and its programs |
+| Guest runs | Programs, with the host as their kernel | A kernel and its programs |
 | Guest exits on | System calls | Device access, traps, timer ticks |
-| Host provides | Linux system calls ([`linux.rs`](../crates/shem/src/linux.rs)) | Virtual devices: console, block, timer |
-| ISA needed | RV32IM; the host emulates the A extension | RV32IMA plus Zicsr, M-mode traps, a timer |
-| Start cost | Load an ELF into memory | Boot a kernel, or resume a booted snapshot |
+| Host provides | Linux system calls ([`linux/`](../crates/shem/src/linux/)) | The machine: CSRs, traps, a timer, a UART and a syscon ([vm.md](vm.md)) |
+| ISA needed | RV32IM; the host emulates the A extension | RV32IM too; the host emulates A, the CSRs and traps |
+| Start cost | Load an ELF into memory, or thaw a warm image | Boot a kernel: about two seconds on the reference vCPU |
 
 Container mode comes first because user-mode RV32IM is exactly what a Qwenputer already implements, and there is no kernel to boot.
 
@@ -82,5 +82,5 @@ Two requirements follow for a neural vCPU:
 5. **Neural vCPU.** Done. An RV32IM CPU compiled into network weights, one instruction per forward pass, with memory and registers in delta-rule state, served to the host over a Unix socket ([neural.md](neural.md)). It matches the reference vCPU exactly on all 60 riscv-tests, on random programs, on resuming a reference snapshot, and on forking containers. It runs about 900 instructions per second on one CPU core.
 6. **Images.** Done. `shem build` turns a Shemfile into an OCI image layout with reproducible layers, building ordinary Docker stages for `COPY --from`. `WARM` freezes a running container into a state layer on the reference vCPU, and `shem run` thaws it, on either vCPU ([shemfile.md](shemfile.md)). Images live in a local store. Not yet: registries, a build cache, overlayfs.
 7. **Density.** Done for the neural executor: memory in shared pages with copy-on-write and content deduplication, so forks and containers resumed from one warm image share memory, and continuous batching of every running vCPU into one forward pass, which multiplies throughput about 32 times at 64 guests on one CPU core ([neural.md](neural.md#density)). Not yet: GPU kernels.
-8. **VM mode.** `shem boot`, virtual devices, a no-MMU Linux kernel.
+8. **VM mode.** Done on the reference vCPU. `shem boot` boots a no-MMU Linux 6.8 to a shell in about 350 million instructions, two seconds, with the host emulating the privileged architecture, the timer and the devices ([vm.md](vm.md)). Not yet: VM mode on the neural vCPU, booted snapshots, block and network devices.
 9. **Ecosystem.** A containerd shim and a BuildKit frontend.

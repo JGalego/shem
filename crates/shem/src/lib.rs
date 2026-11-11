@@ -7,9 +7,11 @@
 pub mod container;
 pub mod elf;
 pub mod emulate;
+pub mod fdt;
 pub mod image;
 pub mod linux;
 pub mod mm;
 pub mod neural;
 pub mod reference;
 pub mod vcpu;
+pub mod vm;
