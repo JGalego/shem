@@ -1,0 +1,34 @@
+# Weekly dependency updates, grouped per ecosystem, with conventional commit
+# messages (`chore: bump ...`, `ci: bump ...`).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    commit-message: { prefix: ci }
+    groups:
+      actions: { patterns: ["*"] }
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly }
+    commit-message: { prefix: chore }
+    groups:
+      crates: { patterns: ["*"], update-types: [minor, patch] }
+  - package-ecosystem: uv
+    directory: /neural
+    schedule: { interval: weekly }
+    commit-message: { prefix: chore }
+    groups:
+      python: { patterns: ["*"], update-types: [minor, patch] }
+  - package-ecosystem: gomod
+    directory: /frontend
+    schedule: { interval: weekly }
+    commit-message: { prefix: chore }
+    groups:
+      go: { patterns: ["*"], update-types: [minor, patch] }
+  - package-ecosystem: docker
+    directories: [/toolchain, /neural, /frontend]
+    schedule: { interval: weekly }
+    commit-message: { prefix: chore }
+    groups:
+      images: { patterns: ["*"] }

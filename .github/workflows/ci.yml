@@ -132,6 +132,13 @@ jobs:
           docker image inspect frontend-test --format '{{.Os}}/{{.Architecture}} {{json .Config.Labels}}' | tee target/frontend-test/out
           grep -q 'linux/riscv32 .*"dev.shem.kernel":"/boot/Image"' target/frontend-test/out
 
+  deny:
+    name: Dependencies (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+
   package:
     name: Package (dry run)
     runs-on: ubuntu-latest

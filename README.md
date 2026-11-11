@@ -166,6 +166,12 @@ Run the neural vCPU's tests.
 uv run --project neural pytest neural/tests
 ```
 
+Check the dependencies' licences and security advisories.
+
+```sh
+cargo deny check
+```
+
 The slower suites are ignored tests that need inputs built first: guest programs, BusyBox, the riscv-tests, a Linux kernel, a neural vCPU server, a registry or containerd. CI builds the inputs and runs every suite on each push, and [`.github/workflows/ci.yml`](.github/workflows/ci.yml) shows how. Run one locally with `cargo test --release --test <suite> -- --ignored` once its inputs exist.
 
 ### Extend shem
