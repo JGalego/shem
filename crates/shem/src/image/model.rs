@@ -42,7 +42,10 @@ pub fn neural_project() -> Option<PathBuf> {
         return Some(PathBuf::from(dir));
     }
     let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../neural");
-    checkout.join("pyproject.toml").is_file().then_some(checkout)
+    checkout
+        .join("pyproject.toml")
+        .is_file()
+        .then_some(checkout)
 }
 
 /// Run a module of the neural package with uv: from its source when there
