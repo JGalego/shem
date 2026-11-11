@@ -115,18 +115,20 @@ A shem image is an [OCI image layout](https://github.com/opencontainers/image-sp
 | Media type | Contents |
 |---|---|
 | `application/vnd.shem.config.v1+json` | Entrypoint, cmd, env, workdir, labels, the machine (`rv32im`), a warm image's memory size, and a VM image's kernel and command line |
-| `application/vnd.oci.image.layer.v1.tar` | Guest filesystem layers, in the standard format |
-| `application/vnd.shem.state.v1.tar` | A `WARM` snapshot, always the last layer: a container's (`machine.state`, `container.json`) or a VM's (`machine.state`, `vm.json`) |
+| `application/vnd.oci.image.layer.v1.tar+zstd` | Guest filesystem layers, in the standard format |
+| `application/vnd.shem.state.v1.tar+zstd` | A `WARM` snapshot, always the last layer: a container's (`machine.state`, `container.json`) or a VM's (`machine.state`, `vm.json`) |
+
+Layers are tars compressed with zstd, which matters most for state layers: they hold all of a guest's memory, mostly zeros. The booted Linux image is 2 MB, where its RAM alone is 64 MiB. Uncompressed layers, which earlier versions wrote, are still read.
 
 Images in the local store live under `$SHEM_HOME/images/<name>/<tag>`, by default `~/.local/share/shem/images`. Each run unpacks the image's filesystem into a fresh directory and removes it afterwards, like `docker run --rm`.
 
 `shem push` and `shem pull` copy images to and from any OCI registry with [ORAS](https://oras.land), which handles any media types, so registries need nothing special; `--plain-http` reaches a registry without TLS, such as a local one. Pushes go by manifest digest, and an image keeps its digest through the round trip. A test pushes a warm image to a registry, pulls it back, and runs it.
 
-Planned: a `application/vnd.shem.weights.v1+safetensors` layer for machine images that carry model weights, and compressed layers: a warm image's state layer holds all of its memory, uncompressed.
+Planned: a `application/vnd.shem.weights.v1+safetensors` layer for machine images that carry model weights.
 
 ## Reproducibility
 
-Layers have sorted entries, timestamps of 0 and root ownership, and execution is deterministic: the clock is virtual, the PRNG is seeded and stdin is empty during builds. So building the same Shemfile twice gives the same manifest digest, warm images included. Tests check both. A build cache keyed on those digests, as in BuildKit, is planned.
+Layers have sorted entries, timestamps of 0 and root ownership, compression is deterministic, and execution is deterministic too: the clock is virtual, the PRNG is seeded and stdin is empty during builds. So building the same Shemfile twice gives the same manifest digest, warm images included. Tests check both. A build cache keyed on those digests, as in BuildKit, is planned.
 
 ## Copy-on-write
 

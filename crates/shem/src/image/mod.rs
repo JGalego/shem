@@ -37,6 +37,10 @@ pub const CONFIG_TYPE: &str = "application/vnd.shem.config.v1+json";
 pub const ROOTFS_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
 pub const STATE_TYPE: &str = "application/vnd.shem.state.v1.tar";
 const REF_NAME: &str = "org.opencontainers.image.ref.name";
+/// Layers are stored compressed with zstd, their media types suffixed as OCI
+/// has it; in memory they are plain tars.
+const COMPRESSED: &str = "+zstd";
+const ZSTD_LEVEL: i32 = 9;
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// How to run an image.
@@ -178,7 +182,10 @@ impl Image {
         let layers = self
             .layers
             .iter()
-            .map(|layer| put(&layer.media_type, &layer.data))
+            .map(|layer| {
+                let compressed = zstd::encode_all(&layer.data[..], ZSTD_LEVEL)?;
+                put(&format!("{}{COMPRESSED}", layer.media_type), &compressed)
+            })
             .collect::<anyhow::Result<_>>()?;
         let manifest = Manifest {
             schema_version: 2,
@@ -227,9 +234,16 @@ impl Image {
             .layers
             .iter()
             .map(|d| {
-                Ok(Layer {
-                    media_type: d.media_type.clone(),
-                    data: blob(d)?,
+                let data = blob(d)?;
+                Ok(match d.media_type.strip_suffix(COMPRESSED) {
+                    Some(media_type) => Layer {
+                        media_type: media_type.into(),
+                        data: zstd::decode_all(&data[..])?,
+                    },
+                    None => Layer {
+                        media_type: d.media_type.clone(),
+                        data,
+                    },
                 })
             })
             .collect::<anyhow::Result<_>>()?;
