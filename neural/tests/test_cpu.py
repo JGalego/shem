@@ -183,6 +183,11 @@ def test_fused_units_match_the_network_on_random_values():
     fused = torch.stack(CPU.divide(a_bits, o_bits, a, o))
     dense = torch.stack(DENSE_CPU.divide(a_bits, o_bits, a, o))
     assert torch.equal(fused, dense)
+    a[:32] = 2**31  # shifting the sign bit
+    a_bits = CPU.decompose(a, 32)
+    fused = torch.stack(CPU.shift(a_bits, o_bits, a))
+    dense = torch.stack(DENSE_CPU.shift(a_bits, o_bits, a))
+    assert torch.equal(fused, dense)
 
 
 BATCH = [

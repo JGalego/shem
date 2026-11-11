@@ -59,6 +59,8 @@ The network as described, the **dense** executor, is the definition. The **fused
 | Unit | Dense | Fused |
 |---|---|---|
 | Memory | A float64 delta-rule state, one row per byte; one-hot keys and matrix products, O(memory) per access | Bytes in shared 4 KiB pages with copy-on-write (see below); indexing, O(1) per access |
+| Register file | One-hot reads, and delta-rule writes over the whole matrix | Gathers of the two operand rows, and the same write to the one row it can change |
+| Shifter | Attention over the shift matrices | Integer shifts |
 | Bits of a value | 35 threshold layers | Shifts and masks |
 | Byte to bits, 5-bit index | One-hot times a table | Index into the table |
 | Division | 32 unrolled layers | Integer division, with RISC-V's rules for zero |

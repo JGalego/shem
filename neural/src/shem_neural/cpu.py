@@ -64,6 +64,11 @@ def decompose(x: torch.Tensor, n: int) -> torch.Tensor:
     return torch.stack(bits[::-1], dim=-1)
 
 
+def _row(regs: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Each guest's register `index[b]`, as a row of bits."""
+    return regs.gather(1, index[:, None, None].expand(-1, 1, regs.shape[2])).squeeze(1)
+
+
 @dataclass
 class State:
     """Everything that defines a batch of machines between instructions."""
@@ -205,9 +210,14 @@ class NeuralCpu:
         # Decode
         is_ = torch.relu(1 - (ibits @ w["decode_w"].T + w["decode_c"]))
         legal = is_.sum(-1)
-        rd = self.index(ibits[:, 7:12])
-        a_bits = torch.einsum("br,brk->bk", self.index(ibits[:, 15:20]), s.regs)
-        b_bits = torch.einsum("br,brk->bk", self.index(ibits[:, 20:25]), s.regs)
+        if self.fused:
+            # Gather the operands' rows, rather than multiply by one-hots
+            rd_index, rs1, rs2 = (self.value(ibits[:, at : at + 5]).long() for at in (7, 15, 20))
+            a_bits, b_bits = _row(s.regs, rs1), _row(s.regs, rs2)
+        else:
+            rd = self.index(ibits[:, 7:12])
+            a_bits = torch.einsum("br,brk->bk", self.index(ibits[:, 15:20]), s.regs)
+            b_bits = torch.einsum("br,brk->bk", self.index(ibits[:, 20:25]), s.regs)
         imm_bits = torch.einsum("bf,foi,bi->bo", is_ @ w["format_route"], w["imm_bits"], ibits)
         uses_imm = (is_ @ w["uses_imm"])[:, None]
         o_bits = uses_imm * imm_bits + (1 - uses_imm) * b_bits
@@ -219,10 +229,7 @@ class NeuralCpu:
         and_bits = a_bits * o_bits
         or_bits = a_bits + o_bits - and_bits
         xor_bits = or_bits - and_bits
-        shamt = self.index(o_bits[:, :5])
-        sll = self.value(torch.einsum("bs,sij,bj->bi", shamt, w["sll"], a_bits))
-        srl_bits = torch.einsum("bs,sij,bj->bi", shamt, w["srl"], a_bits)
-        fill = torch.einsum("bs,si->bi", shamt, w["sra_fill"]) * a_bits[:, 31:32]
+        sll, srl, sra = self.shift(a_bits, o_bits, a)
         signed_a = a - TWO32 * a_bits[:, 31]
         signed_o = o - TWO32 * o_bits[:, 31]
         lt = clamp01(signed_o - signed_a)
@@ -269,7 +276,7 @@ class NeuralCpu:
         results = torch.stack(
             [
                 imm, pc + imm, pc + 4, add, sub, sll, lt, ltu,
-                self.value(xor_bits), self.value(srl_bits), self.value(srl_bits + fill),
+                self.value(xor_bits), srl, sra,
                 self.value(or_bits), self.value(and_bits),
                 mul, mulh, mulhsu, mulhu, div, divu, rem, remu,
                 lb, lh, lw, lbu, lhu,
@@ -289,8 +296,15 @@ class NeuralCpu:
         next_bits = torch.einsum("bc,bci->bi", is_ @ w["next_pc_route"], candidates)
 
         # Commit: delta-rule writes to the register file and memory
-        writes = route.sum(-1) * (1 - rd[:, 0]) * commit
-        s.regs = s.regs + writes[:, None, None] * rd[:, :, None] * (rd_bits[:, None, :] - s.regs)
+        if self.fused:
+            # The same write, to the one row it can change
+            writes = route.sum(-1) * (rd_index != 0) * commit
+            target = rd_index[:, None, None].expand(-1, 1, s.regs.shape[2])
+            old = s.regs.gather(1, target)
+            s.regs = s.regs.scatter(1, target, old + writes[:, None, None] * (rd_bits[:, None, :] - old))
+        else:
+            writes = route.sum(-1) * (1 - rd[:, 0]) * commit
+            s.regs = s.regs + writes[:, None, None] * rd[:, :, None] * (rd_bits[:, None, :] - s.regs)
         store_bytes = b_bits.reshape(batch, 4, 8) @ self.powers[:8]
         gates = commit[:, None] * clamp01(store_size[:, None] - torch.arange(4, device=self.device))
         s.mem.write(offset, store_bytes, gates)
@@ -299,6 +313,24 @@ class NeuralCpu:
         s.pc_low = (1 - keep) * next_bits[:, :2] + keep * s.pc_low
         s.instret = s.instret + commit
         return exits, info
+
+    def shift(self, a_bits, o_bits, a):
+        """sll, srl and sra of `a` by the low five bits of the second operand:
+        attention over the shift matrices, with copies of the sign bit for
+        sra, or for the fused executor, integer shifts."""
+        if self.fused:
+            amount = self.value(o_bits[:, :5]).long()
+            whole = a.long()
+            signed = whole - (whole >> 31 << 32)
+            sll = (whole << amount) & 0xFFFF_FFFF
+            sra = (signed >> amount) & 0xFFFF_FFFF
+            return sll.to(DTYPE), (whole >> amount).to(DTYPE), sra.to(DTYPE)
+        w = self.w
+        shamt = self.index(o_bits[:, :5])
+        sll = self.value(torch.einsum("bs,sij,bj->bi", shamt, w["sll"], a_bits))
+        srl_bits = torch.einsum("bs,sij,bj->bi", shamt, w["srl"], a_bits)
+        fill = torch.einsum("bs,si->bi", shamt, w["sra_fill"]) * a_bits[:, 31:32]
+        return sll, self.value(srl_bits), self.value(srl_bits + fill)
 
     def multiply(self, a_bits, o_bits, a, o):
         """The 64-bit product from 16-bit halves, so every partial value stays
