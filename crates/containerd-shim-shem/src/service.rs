@@ -4,6 +4,8 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -92,7 +94,7 @@ fn stdio(stdin: &str, stdout: &str, stderr: &str) -> std::io::Result<Stdio> {
     let input: Box<dyn Read + Send> = if stdin.is_empty() {
         Box::new(std::io::empty())
     } else {
-        Box::new(File::open(stdin)?)
+        Box::new(open_fifo_for_reading(stdin)?)
     };
     let output = |path: &str| -> std::io::Result<Box<dyn std::io::Write + Send>> {
         if path.is_empty() {
@@ -106,6 +108,22 @@ fn stdio(stdin: &str, stdout: &str, stderr: &str) -> std::io::Result<Stdio> {
         stdout: output(stdout)?,
         stderr: output(stderr)?,
     })
+}
+
+/// Open a FIFO to read from without waiting for a writer, as runc does: with
+/// no writer, reads then see end-of-file instead of hanging the container.
+fn open_fifo_for_reading(path: &str) -> std::io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    // Reads should block for data once the FIFO is open.
+    let fd = file.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+    }
+    Ok(file)
 }
 
 impl shim::Task for Service {
@@ -266,5 +284,30 @@ impl shim::Task for Service {
     fn shutdown(&self, _ctx: &TtrpcContext, _req: api::ShutdownRequest) -> TtrpcResult<api::Empty> {
         self.exit.signal();
         Ok(api::Empty::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn stdin_fifos_without_a_writer_read_as_empty_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("stdin");
+        let path = CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (done, opened) = std::sync::mpsc::channel();
+        let name = fifo.to_str().unwrap().to_string();
+        std::thread::spawn(move || {
+            let mut streams = stdio(&name, "", "").unwrap();
+            let mut buf = [0u8; 8];
+            done.send(streams.stdin.read(&mut buf).unwrap()).unwrap();
+        });
+        let read = opened.recv_timeout(Duration::from_secs(5));
+        assert_eq!(read, Ok(0), "opening or reading the FIFO hung");
     }
 }
