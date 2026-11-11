@@ -26,186 +26,64 @@ See the [roadmap](docs/architecture.md#roadmap) for what is next.
 
 ## Getting started
 
-You need [🦀 Rust](https://www.rust-lang.org) 1.88 or later and [🐳 Docker](https://www.docker.com). The neural vCPU also needs [⚡ uv](https://docs.astral.sh/uv/). Pushing images needs [🗄️ ORAS](https://oras.land). Guest programs are static RV32 Linux executables built with [🦎 Zig](https://ziglang.org) against musl in a [toolchain image](toolchain/).
+Run a container inside the model with Docker. You need [🦀 Rust](https://www.rust-lang.org) 1.88 or later, [🐳 Docker](https://www.docker.com) 23 or later, [⚡ uv](https://docs.astral.sh/uv/) and `sudo`.
 
-Build shem and put it on your `PATH`.
-
-```sh
-cargo build --release
-export PATH="$PWD/target/release:$PATH"
-```
-
-Build the guest toolchain image.
-
-```sh
-docker build --target toolchain -t shem-toolchain toolchain
-```
-
-Compile a C program for RV32.
-
-```sh
-mkdir -p demo
-docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/src" -e ZIG_GLOBAL_CACHE_DIR=/tmp/zig shem-toolchain rv32-cc -O2 -o demo/hello guests/hello.c
-```
-
-Run it as a container.
-
-```sh
-shem run demo/hello one two
-```
-
-Build a BusyBox root filesystem.
-
-```sh
-docker build --target busybox --output type=local,dest=demo/busybox toolchain
-```
-
-Run a BusyBox shell in it.
-
-```sh
-shem run --root demo/busybox demo/busybox/bin/busybox sh -c 'ls /bin | wc -l'
-```
-
-Build the BusyBox image that Shemfiles copy from.
-
-```sh
-docker build --target busybox -t shem-busybox toolchain
-```
-
-Build two images from their Shemfiles.
-
-```sh
-shem build -t hello examples/hello
-shem build -t warm-shell examples/warm-shell
-```
-
-List the images.
-
-```sh
-shem images
-```
-
-Run the hello image.
-
-```sh
-shem run hello
-```
-
-Resume the shell that the build froze.
-
-```sh
-echo 'echo hello from a warm shell' | shem run warm-shell
-```
-
-Push an image to a registry.
-
-```sh
-shem push warm-shell ghcr.io/me/warm-shell:1.0
-```
-
-Pull it back.
-
-```sh
-shem pull ghcr.io/me/warm-shell:1.0
-```
-
-Install the containerd shim for Docker.
+Build the containerd shim.
 
 ```sh
 cargo build --release -p containerd-shim-shem
+```
+
+Install it where containerd looks for shims.
+
+```sh
 sudo install target/release/containerd-shim-shem-v1 /usr/local/bin/
 ```
 
-Package the C program as an RV32 Docker image.
-
-```sh
-printf 'FROM scratch\nCOPY hello /hello\nENTRYPOINT ["/hello"]\n' | docker build --platform linux/riscv32 -t shem-hello -f - demo
-```
-
-Run it with Docker on shem.
-
-```sh
-docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 shem-hello one two
-```
-
-Download a prebuilt no-MMU Linux.
-
-```sh
-curl -fsSL --create-dirs -o demo/linux.zip https://raw.githubusercontent.com/cnlohr/mini-rv32ima-images/7da8c6e486b7d510426b5c2283cd338abcf04eb7/images/linux-6.8-rc1-rv32nommu-cnl-1.zip
-```
-
-Unpack the kernel.
-
-```sh
-python3 -m zipfile -e demo/linux.zip demo/linux
-```
-
-Boot it to a shell and type `poweroff` to leave.
-
-```sh
-shem boot demo/linux/Image
-```
-
-Build Linux into an image that has already booted.
-
-```sh
-shem build -t linux examples/linux
-```
-
-Run a command at its prompt.
-
-```sh
-echo 'uname -a; poweroff' | shem run linux
-```
-
-Start the neural vCPU server in the background.
+Start the model in the background.
 
 ```sh
 uv run --project neural python -m shem_neural.server --socket /tmp/shem-neural.sock &
 ```
 
-Run the C program on the neural vCPU.
+Build an RV32 image.
 
 ```sh
-shem run --vcpu neural --neural-socket /tmp/shem-neural.sock --mem 1M demo/hello one two
+docker build --platform linux/riscv32 -t hello examples/hello
 ```
 
-Run the tests.
+Run it on shem's reference vCPU.
 
 ```sh
-cargo test --workspace
+docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 hello
 ```
+
+Run it inside the model.
+
+```sh
+docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 --annotation dev.shem.vcpu=neural hello
+```
+
+The `shem` CLI does more: Shemfiles with `WARM` ([docs/shemfile.md](docs/shemfile.md)), VM mode with Linux ([docs/vm.md](docs/vm.md)) and the neural vCPU on GPUs ([docs/neural.md](docs/neural.md)).
 
 ### Cleaning up
 
-Stop the neural vCPU server.
+Stop the model.
 
 ```sh
 kill %1
 ```
 
-Remove the shem images.
+Remove the image.
 
 ```sh
-rm -rf ~/.local/share/shem
+docker rmi hello
 ```
 
-Remove the Docker images.
-
-```sh
-docker rmi shem-hello shem-busybox shem-toolchain
-```
-
-Uninstall the containerd shim.
+Uninstall the shim.
 
 ```sh
 sudo rm /usr/local/bin/containerd-shim-shem-v1
-```
-
-Remove the demo files.
-
-```sh
-rm -rf demo
 ```
 
 Remove the build outputs.
