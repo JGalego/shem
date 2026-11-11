@@ -7,4 +7,6 @@
 
 pub mod bundle;
 #[cfg(target_os = "linux")]
+pub mod holder;
+#[cfg(target_os = "linux")]
 pub mod service;
