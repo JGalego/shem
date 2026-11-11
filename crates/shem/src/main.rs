@@ -279,7 +279,9 @@ fn launch<V: Vcpu + Clone>(
         container
     };
     container.trace = args.trace;
+    let terminal = Terminal::attach(&mut container.linux);
     let status = container.run(args.max_steps);
+    drop(terminal);
     if args.stats {
         eprintln!("shem: {} instructions retired", container.steps);
     }
@@ -294,6 +296,48 @@ fn launch<V: Vcpu + Clone>(
     }
     drop(rootfs);
     Ok(status?)
+}
+
+/// The host terminal, while a container uses it: its settings, restored when
+/// the container is done, since the guest may change them (a shell turns off
+/// echo and line buffering to edit lines itself).
+struct Terminal {
+    saved: libc::termios,
+}
+
+impl Terminal {
+    /// Give the container the host's terminal if stdin is one, and send the
+    /// signals typed at it (Ctrl-C, Ctrl-\, Ctrl-Z) to the guest instead of
+    /// to shem.
+    fn attach(linux: &mut shem::linux::Linux) -> Option<Self> {
+        // SAFETY: isatty, tcgetattr and signal take a descriptor, a buffer
+        // the size of termios, and a handler that only stores an integer
+        unsafe {
+            if libc::isatty(0) != 1 {
+                return None;
+            }
+            let mut saved: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut saved) != 0 {
+                return None;
+            }
+            extern "C" fn typed(signal: libc::c_int) {
+                shem::container::TERMINAL_SIGNAL
+                    .store(signal as u32, std::sync::atomic::Ordering::SeqCst);
+            }
+            for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP] {
+                libc::signal(signal, typed as *const () as libc::sighandler_t);
+            }
+            linux.terminal = Some(0);
+            Some(Self { saved })
+        }
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        // SAFETY: restoring the settings tcgetattr returned
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &self.saved) };
+    }
 }
 
 /// An image from an OCI layout directory, or from the store by reference.

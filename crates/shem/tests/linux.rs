@@ -38,6 +38,10 @@ const STATFS64: u32 = 43;
 const SYSINFO: u32 = 179;
 const CLONE: u32 = 220;
 const MMAP: u32 = 222;
+const MUNMAP: u32 = 215;
+const MSYNC: u32 = 227;
+const IOCTL: u32 = 29;
+const PPOLL_TIME64: u32 = 414;
 const EXECVE: u32 = 221;
 const WAIT4: u32 = 260;
 const RENAMEAT2: u32 = 276;
@@ -52,6 +56,7 @@ const AT_REMOVEDIR: u32 = 0x200;
 const AT_EMPTY_PATH: u32 = 0x1000;
 const O_RDONLY: u32 = 0;
 const O_WRONLY: u32 = 1;
+const O_RDWR: u32 = 2;
 const O_CREAT: u32 = 0o100;
 const O_EXCL: u32 = 0o200;
 const O_NONBLOCK: u32 = 0o4000;
@@ -84,6 +89,7 @@ const EAGAIN: i32 = -11;
 const EPIPE: i32 = -32;
 const EBUSY: i32 = -16;
 const ENODEV: i32 = -19;
+const ENOTTY: i32 = -25;
 
 const MEM: u32 = 1 << 20;
 
@@ -534,7 +540,11 @@ fn files_map_as_private_copies() {
     let shared = g.call(MMAP, &[0, 4096, PROT_READ, MAP_SHARED, fd, 0]) as u32;
     assert_eq!(g.get(shared, 4096), &data[..4096]);
     let writable = [0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0];
-    assert_eq!(g.call(MMAP, &writable), ENODEV);
+    assert_eq!(
+        g.call(MMAP, &writable),
+        EACCES,
+        "a shared writable mapping needs O_RDWR"
+    );
 
     let write_only = g.open("/data", O_WRONLY) as u32;
     assert_eq!(
@@ -545,6 +555,143 @@ fn files_map_as_private_copies() {
         g.call(MMAP, &[0, 4096, PROT_READ, MAP_PRIVATE, 0, 0]),
         ENODEV,
         "stdin"
+    );
+}
+
+#[test]
+fn shared_mappings_write_back_to_their_files() {
+    let mut g = Guest::new();
+    fs::write(g.host("data"), vec![b'.'; 6000]).unwrap();
+    let fd = g.open("/data", O_RDWR) as u32;
+    let shared = [0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0];
+    let at = g.call(MMAP, &shared) as u32;
+
+    g.vcpu.write_mem(at + 10, b"synced").unwrap();
+    assert_eq!(
+        &fs::read(g.host("data")).unwrap()[10..16],
+        b"......",
+        "not before msync"
+    );
+    assert_eq!(g.call(MSYNC, &[at, 4096, 4]), 0);
+    assert_eq!(&fs::read(g.host("data")).unwrap()[10..16], b"synced");
+
+    // munmap writes back too; and only the file's length, which never grows
+    g.vcpu.write_mem(at + 5998, b"edge!").unwrap();
+    assert_eq!(g.call(MUNMAP, &[at, 8192]), 0);
+    let data = fs::read(g.host("data")).unwrap();
+    assert_eq!((data.len(), &data[5998..]), (6000, &b"ed"[..]));
+
+    // A process that exits with a mapping writes it back when it is released
+    let at = g.call(MMAP, &shared) as u32;
+    g.vcpu.write_mem(at, b"exit").unwrap();
+    g.process.sync_shared(&g.vcpu, None);
+    assert_eq!(&fs::read(g.host("data")).unwrap()[..4], b"exit");
+}
+
+/// A pseudo-terminal: the host's side, and the side the guest gets.
+fn pty() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    // SAFETY: the usual posix_openpt sequence, on descriptors this test owns
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(master >= 0);
+        assert_eq!(libc::grantpt(master), 0);
+        assert_eq!(libc::unlockpt(master), 0);
+        let mut name = [0 as libc::c_char; 128];
+        assert_eq!(libc::ptsname_r(master, name.as_mut_ptr(), name.len()), 0);
+        let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        assert!(slave >= 0);
+        (
+            std::fs::File::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        )
+    }
+}
+
+#[test]
+fn terminals_pass_through_to_the_host_terminal() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    let mut g = Guest::new();
+    let buf = g.buf(64);
+    assert_eq!(
+        g.call(IOCTL, &[0, 0x5401, buf]),
+        ENOTTY,
+        "no terminal: not a tty"
+    );
+
+    let (mut host, guest_side) = pty();
+    g.linux.terminal = Some(guest_side.as_raw_fd());
+    assert_eq!(g.call(IOCTL, &[0, 0x5401, buf]), 0, "TCGETS");
+    let termios = g.get(buf, 36);
+    // SAFETY: tcgetattr into a zeroed termios
+    let lflag = unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(guest_side.as_raw_fd(), &mut t);
+        t.c_lflag
+    };
+    assert_eq!(word(&termios, 12), lflag, "the host terminal's settings");
+
+    // Settings and window size go to the host terminal
+    let mut raw = termios.clone();
+    raw[12..16].copy_from_slice(&(lflag & !(libc::ICANON | libc::ECHO)).to_le_bytes());
+    let raw = g.put(&raw);
+    assert_eq!(g.call(IOCTL, &[1, 0x5402, raw]), 0, "TCSETS");
+    let size = g.put(&[30, 0, 100, 0, 0, 0, 0, 0]);
+    assert_eq!(g.call(IOCTL, &[1, 0x5414, size]), 0, "TIOCSWINSZ");
+    assert_eq!(g.call(IOCTL, &[2, 0x5413, buf]), 0, "TIOCGWINSZ");
+    assert_eq!(g.get(buf, 4), [30, 0, 100, 0]);
+    // SAFETY: as above
+    let now = unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(guest_side.as_raw_fd(), &mut t);
+        t.c_lflag
+    };
+    assert_eq!(now & (libc::ICANON | libc::ECHO), 0, "raw mode on the host");
+
+    // The foreground process group is the container's
+    let group = g.put(&7u32.to_le_bytes());
+    assert_eq!(g.call(IOCTL, &[0, 0x5410, group]), 0, "TIOCSPGRP");
+    assert_eq!(g.call(IOCTL, &[0, 0x540f, buf]), 0, "TIOCGPGRP");
+    assert_eq!(word(&g.get(buf, 4), 0), 7);
+
+    // ppoll waits on the host terminal: nothing typed, then a key
+    let fds = g.put(&[0, 0, 0, 0, 1, 0, 0, 0]); // fd 0, POLLIN
+    let zero = g.put(&[0; 16]);
+    assert_eq!(g.call(PPOLL_TIME64, &[fds, 1, zero, 0, 8]), 0);
+    host.write_all(b"x").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(g.call(PPOLL_TIME64, &[fds, 1, zero, 0, 8]), 1);
+    assert_eq!(&g.get(fds, 8)[6..8], &[1, 0], "POLLIN");
+}
+
+#[test]
+fn ppoll_reports_pipes_and_sleeps_through_timeouts() {
+    let mut g = Guest::new();
+    let (read_end, write_end) = g.pipe(0);
+    let fds = g.put(
+        &[
+            &read_end.to_le_bytes()[..],
+            &[1, 0, 0, 0],
+            &write_end.to_le_bytes(),
+            &[4, 0, 0, 0],
+        ]
+        .concat(),
+    );
+    let second = g.put(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // The empty pipe can be written but not read
+    assert_eq!(g.call(PPOLL_TIME64, &[fds, 2, second, 0, 8]), 1);
+    assert_eq!(&g.get(fds, 16)[6..8], &[0, 0]);
+    assert_eq!(&g.get(fds, 16)[14..16], &[4, 0], "POLLOUT");
+    assert_eq!(g.write(write_end as i32, b"hi"), 2);
+    assert_eq!(g.call(PPOLL_TIME64, &[fds, 2, second, 0, 8]), 2);
+    // With nothing ready and no timeout, the call waits to be retried
+    let read_only = g.put(&[&read_end.to_le_bytes()[..], &[1, 0, 0, 0]].concat());
+    g.read(read_end as i32, 2);
+    assert_eq!(
+        g.action(PPOLL_TIME64, &[read_only, 1, 0, 0, 8]),
+        Action::Block
     );
 }
 

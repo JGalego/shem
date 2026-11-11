@@ -179,6 +179,11 @@ pub struct Linux {
     /// The container's processes, for `/proc`, which the container fills in
     /// before a system call that might look (see `needs_processes`).
     pub processes: Vec<ProcEntry>,
+    /// The host terminal behind the standard streams, if they are one: its
+    /// file descriptor, which terminal requests pass through to.
+    pub terminal: Option<i32>,
+    /// The terminal's foreground process group, which typed signals go to.
+    pub foreground: u32,
 }
 
 /// What each process owns.
@@ -204,6 +209,20 @@ pub struct Process {
     pub cpu_ns: u64,
     /// When the process started, in ns since boot.
     pub started_ns: u64,
+    /// File mappings whose writes go back to their files.
+    shared: Vec<SharedMapping>,
+}
+
+/// A shared, writable mapping of a file: the guest's bytes at `start ..
+/// start + len` are the file's from `offset`, written back on `msync`,
+/// `munmap`, `execve` and exit. A forked child shares the mapping, but each
+/// process writes back its own copy of the bytes, so the last to sync wins.
+#[derive(Debug, Clone)]
+struct SharedMapping {
+    start: u32,
+    len: u32,
+    file: Arc<std::fs::File>,
+    offset: u64,
 }
 
 impl Default for Linux {
@@ -219,6 +238,8 @@ impl Linux {
             random: RANDOM_SEED,
             unsupported: BTreeMap::new(),
             processes: Vec::new(),
+            terminal: None,
+            foreground: 1,
         }
     }
 
@@ -235,6 +256,8 @@ impl Linux {
             random: frozen.random,
             unsupported: BTreeMap::new(),
             processes: Vec::new(),
+            terminal: None,
+            foreground: 1,
         }
     }
 
@@ -339,11 +362,20 @@ impl Linux {
             nr::DUP3 => p.dup3(a[0], a[1], a[2]),
             nr::FCNTL64 => p.fcntl(a[0], a[1], a[2]),
             nr::FSYNC => p.fsync(a[0]),
-            nr::IOCTL => Err(Errno::ENOTTY), // no terminals
+            nr::IOCTL => self.ioctl(p, vcpu, a[0], a[1], a[2]),
+            nr::PPOLL_TIME64 => self.ppoll(p, vcpu, a[0], a[1], a[2]),
             nr::UMASK => Ok(std::mem::replace(&mut p.umask, a[0] & 0o777)),
             nr::BRK => Ok(p.mm.set_brk(vcpu, a[0])),
             nr::MMAP => p.mmap(vcpu, a[0], a[1], a[2], a[3], (a[4], a[5])),
-            nr::MUNMAP => p.mm.unmap(a[0], a[1]).map(|()| 0).map_err(Errno::from),
+            nr::MUNMAP => {
+                p.sync_shared(vcpu, Some((a[0], a[1])));
+                p.unshare(a[0], a[1]);
+                p.mm.unmap(a[0], a[1]).map(|()| 0).map_err(Errno::from)
+            }
+            nr::MSYNC => {
+                p.sync_shared(vcpu, Some((a[0], a[1])));
+                Ok(0)
+            }
             nr::MREMAP => Err(Errno::ENOMEM), // callers fall back to map, copy, unmap
             nr::MPROTECT | nr::MADVISE => Ok(0), // guest memory has no protection bits
             nr::CLOCK_GETTIME64 => self.clock_gettime(vcpu, a[0], a[1], retired),
@@ -405,6 +437,154 @@ impl Linux {
             },
             Err(Errno(errno)) => Action::Return(errno.wrapping_neg()),
         }
+    }
+
+    /// Terminal requests on the standard streams, when they are a host
+    /// terminal: its settings and window size are the host terminal's, and
+    /// the foreground process group is the container's own. Anything else is
+    /// not a terminal.
+    fn ioctl(
+        &mut self,
+        p: &mut Process,
+        vcpu: &mut dyn Vcpu,
+        fd: u32,
+        request: u32,
+        arg: u32,
+    ) -> Result<u32, Errno> {
+        // Linux's terminal requests, the same on RV32 as on the host
+        const TCGETS: u32 = 0x5401;
+        const TCSETS: u32 = 0x5402;
+        const TCSETSW: u32 = 0x5403;
+        const TCSETSF: u32 = 0x5404;
+        const TIOCSCTTY: u32 = 0x540e;
+        const TIOCGPGRP: u32 = 0x540f;
+        const TIOCSPGRP: u32 = 0x5410;
+        const TIOCGWINSZ: u32 = 0x5413;
+        const TIOCSWINSZ: u32 = 0x5414;
+        /// `struct termios` without speeds, and `struct winsize`
+        const TERMIOS: usize = 36;
+        const WINSIZE: usize = 8;
+        let Some(host) = self.terminal.filter(|_| p.is_stdio_stream(fd)) else {
+            return Err(Errno::ENOTTY);
+        };
+        let pass = |request: u32, buf: &mut [u8]| -> Result<(), Errno> {
+            // SAFETY: the buffer is at least as large as the request's struct
+            let done = unsafe { libc::ioctl(host, request as _, buf.as_mut_ptr()) };
+            if done < 0 {
+                Err(Errno::from(std::io::Error::last_os_error()))
+            } else {
+                Ok(())
+            }
+        };
+        match request {
+            TCGETS | TIOCGWINSZ => {
+                let size = if request == TCGETS { TERMIOS } else { WINSIZE };
+                let mut buf = [0u8; 64];
+                pass(request, &mut buf)?;
+                vcpu.write_mem(arg, &buf[..size])?;
+            }
+            TCSETS | TCSETSW | TCSETSF | TIOCSWINSZ => {
+                let size = if request == TIOCSWINSZ {
+                    WINSIZE
+                } else {
+                    TERMIOS
+                };
+                let mut buf = [0u8; 64];
+                vcpu.read_mem(arg, &mut buf[..size])?;
+                pass(request, &mut buf)?;
+            }
+            TIOCGPGRP => vcpu.write_mem(arg, &self.foreground.to_le_bytes())?,
+            TIOCSPGRP => {
+                let mut pgid = [0u8; 4];
+                vcpu.read_mem(arg, &mut pgid)?;
+                self.foreground = u32::from_le_bytes(pgid);
+            }
+            TIOCSCTTY => {}
+            _ => return Err(Errno::ENOTTY),
+        }
+        Ok(0)
+    }
+
+    /// `ppoll`: which descriptors are ready. With none ready, a terminal is
+    /// polled on the host, for as long as the timeout says; otherwise the
+    /// call blocks, to be retried, or with a finite timeout, sleeps through
+    /// it on the virtual clock and returns 0.
+    fn ppoll(
+        &mut self,
+        p: &mut Process,
+        vcpu: &mut dyn Vcpu,
+        fds: u32,
+        nfds: u32,
+        timeout: u32,
+    ) -> Result<u32, Errno> {
+        const POLLIN: u16 = 0x1;
+        if nfds > MAX_FDS {
+            return Err(Errno::EINVAL);
+        }
+        let mut entries = vec![0u8; nfds as usize * 8];
+        vcpu.read_mem(fds, &mut entries)?;
+        let wait_ns = if timeout == 0 {
+            None
+        } else {
+            let mut ts = [0u8; 16];
+            vcpu.read_mem(timeout, &mut ts)?;
+            let sec = i64::from_le_bytes(ts[..8].try_into().unwrap());
+            let nsec = i64::from_le_bytes(ts[8..].try_into().unwrap());
+            if sec < 0 || !(0..NS_PER_SEC as i64).contains(&nsec) {
+                return Err(Errno::EINVAL);
+            }
+            Some(
+                (sec as u64)
+                    .saturating_mul(NS_PER_SEC)
+                    .saturating_add(nsec as u64),
+            )
+        };
+        let poll = |p: &Process, entries: &mut [u8], host_ready: bool| -> (u32, bool) {
+            let (mut ready, mut terminal) = (0, false);
+            for entry in entries.chunks_mut(8) {
+                let fd = i32::from_le_bytes(entry[..4].try_into().unwrap());
+                let events = u16::from_le_bytes(entry[4..6].try_into().unwrap());
+                let mut revents = 0;
+                if fd >= 0 {
+                    let is_terminal = self.terminal.is_some() && p.is_stdio_stream(fd as u32);
+                    let (found, on_terminal) = p.poll_ready(fd as u32, events, is_terminal);
+                    revents = if on_terminal && host_ready {
+                        events & POLLIN
+                    } else {
+                        found
+                    };
+                    terminal |= on_terminal;
+                }
+                entry[6..8].copy_from_slice(&revents.to_le_bytes());
+                ready += u32::from(revents != 0);
+            }
+            (ready, terminal)
+        };
+        let (mut ready, terminal) = poll(p, &mut entries, false);
+        if ready == 0
+            && terminal
+            && let Some(host) = self.terminal
+        {
+            // Wait on the host terminal itself, as a read of it would
+            let millis = wait_ns.map_or(-1, |ns| (ns / 1_000_000).min(i32::MAX as u64) as i32);
+            let mut watch = libc::pollfd {
+                fd: host,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd, on the stack
+            let host_ready = unsafe { libc::poll(&mut watch, 1, millis) } > 0;
+            ready = poll(p, &mut entries, host_ready).0;
+        }
+        if ready == 0 {
+            match wait_ns {
+                None => return Err(Errno::WOULD_BLOCK),
+                Some(ns) if !terminal => self.slept_ns = self.slept_ns.saturating_add(ns),
+                Some(_) => {}
+            }
+        }
+        vcpu.write_mem(fds, &entries)?;
+        Ok(ready)
     }
 
     fn now_ns(&self, clock: u32, retired: u64) -> Result<u64, Errno> {
@@ -496,6 +676,7 @@ impl Process {
             exe: Vec::new(),
             cpu_ns: 0,
             started_ns: 0,
+            shared: Vec::new(),
         }
     }
 
@@ -527,7 +708,7 @@ impl Process {
 
     /// Capture what a warm image needs to resume this process.
     pub fn freeze(&self) -> Result<FrozenProcess, FreezeError> {
-        if !self.files.only_stdio() {
+        if !self.files.only_stdio() || !self.shared.is_empty() {
             return Err(FreezeError::OpenFiles);
         }
         Ok(FrozenProcess {
@@ -595,20 +776,25 @@ impl Process {
             exe: self.exe.clone(),
             cpu_ns: 0,
             started_ns: self.now.saturating_sub(EPOCH_NS),
+            shared: self.shared.clone(),
         }
     }
 
     /// Start a new program: a fresh address space, close-on-exec files closed,
     /// and handlers reset to the default. Ignored signals stay ignored.
+    /// Shared file mappings must have been synced (`sync_shared`) first.
     pub fn exec(&mut self, brk: u32, top: u32) {
         self.mm = AddressSpace::new(brk, top);
+        self.shared.clear();
         self.files.close_on_exec();
         self.signals.exec();
     }
 
-    /// Close everything the process holds, as when it exits.
+    /// Close everything the process holds, as when it exits. Shared file
+    /// mappings must have been synced (`sync_shared`) first.
     pub fn release(&mut self) {
         self.files.close_all();
+        self.shared.clear();
     }
 
     fn sigaction(
@@ -682,13 +868,82 @@ impl Process {
         if flags & MAP_ANONYMOUS != 0 {
             return Ok(self.mm.map(vcpu, addr, len, fixed)?);
         }
-        if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 {
-            return Err(Errno::ENODEV);
-        }
-        let data = self.mapped_bytes(fd, pgoff as u64 * MMAP_UNIT, len)?;
+        let offset = pgoff as u64 * MMAP_UNIT;
+        let shared = flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0;
+        let file = if shared {
+            Some(self.shared_file(fd)?)
+        } else {
+            None
+        };
+        let data = self.mapped_bytes(fd, offset, len)?;
         let at = self.mm.map(vcpu, addr, len, fixed)?;
         vcpu.write_mem(at, &data)?;
+        if let Some(file) = file {
+            self.unshare(at, len); // a fixed mapping replaces what was there
+            self.shared.push(SharedMapping {
+                start: at,
+                len,
+                file: Arc::new(file),
+                offset,
+            });
+        }
         Ok(at)
+    }
+
+    /// Write the guest's bytes in shared file mappings back to their files:
+    /// those overlapping `range` (address, length), or all of them. Only the
+    /// part of a mapping that lies within its file is written, as on Linux.
+    pub fn sync_shared(&mut self, vcpu: &dyn Vcpu, range: Option<(u32, u32)>) {
+        use std::os::unix::fs::FileExt;
+        for map in &self.shared {
+            let (from, to) = match range {
+                Some((addr, len)) => (
+                    map.start.max(addr),
+                    (map.start + map.len).min(addr.saturating_add(len)),
+                ),
+                None => (map.start, map.start + map.len),
+            };
+            let file_len = map.file.metadata().map_or(0, |m| m.len());
+            let at = map.offset + (from - map.start) as u64;
+            let to =
+                to.min(map.start + file_len.saturating_sub(map.offset).min(map.len as u64) as u32);
+            if from >= to || at >= file_len {
+                continue;
+            }
+            let mut data = vec![0; (to - from) as usize];
+            if vcpu.read_mem(from, &mut data).is_ok() {
+                let _ = map.file.write_at(&data, at);
+            }
+        }
+    }
+
+    /// Forget shared file mappings within `addr .. addr + len`, keeping the
+    /// parts outside it.
+    fn unshare(&mut self, addr: u32, len: u32) {
+        let end = addr.saturating_add(len);
+        let mut kept = Vec::new();
+        for map in self.shared.drain(..) {
+            let map_end = map.start + map.len;
+            if map_end <= addr || map.start >= end {
+                kept.push(map);
+                continue;
+            }
+            if map.start < addr {
+                kept.push(SharedMapping {
+                    len: addr - map.start,
+                    ..map.clone()
+                });
+            }
+            if map_end > end {
+                kept.push(SharedMapping {
+                    start: end,
+                    len: map_end - end,
+                    offset: map.offset + (end - map.start) as u64,
+                    file: map.file.clone(),
+                });
+            }
+        }
+        self.shared = kept;
     }
 }
 

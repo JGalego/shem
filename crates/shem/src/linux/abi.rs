@@ -58,6 +58,7 @@ pub mod nr {
     pub const EXECVE: u32 = 221;
     pub const MMAP: u32 = 222;
     pub const MPROTECT: u32 = 226;
+    pub const MSYNC: u32 = 227;
     pub const MADVISE: u32 = 233;
     pub const WAIT4: u32 = 260;
     pub const PRLIMIT64: u32 = 261;
@@ -72,6 +73,7 @@ pub mod nr {
     pub const STATX: u32 = 291;
     pub const CLOCK_GETTIME64: u32 = 403;
     pub const CLOCK_NANOSLEEP_TIME64: u32 = 407;
+    pub const PPOLL_TIME64: u32 = 414;
     pub const UTIMENSAT_TIME64: u32 = 412;
     pub const FACCESSAT2: u32 = 439;
     pub const STATFS64: u32 = 43;
@@ -171,6 +173,7 @@ pub const AT_EMPTY_PATH: u32 = 0x1000;
 pub const O_ACCMODE: u32 = 0o3;
 pub const O_RDONLY: u32 = 0o0;
 pub const O_WRONLY: u32 = 0o1;
+pub const O_RDWR: u32 = 0o2;
 pub const O_CREAT: u32 = 0o100;
 pub const O_EXCL: u32 = 0o200;
 pub const O_TRUNC: u32 = 0o1000;

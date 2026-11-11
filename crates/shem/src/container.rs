@@ -51,6 +51,11 @@ pub enum StartError {
     Stack(#[from] MemoryFault),
 }
 
+/// A signal the host's terminal sent, such as SIGINT for Ctrl-C, for the
+/// container to deliver to the guest's foreground process group: the host
+/// catches it and stores its number here, so it does not kill the host.
+pub static TERMINAL_SIGNAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Where `run_until` should stop before init exits, as `WARM --until` asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pause {
@@ -233,6 +238,12 @@ impl<V: Vcpu + Clone> Container<V> {
     ) -> Result<Stop, RunError> {
         (self.pause, self.paused) = (pause, false);
         loop {
+            // A signal typed at the terminal goes to its foreground process group
+            let typed = TERMINAL_SIGNAL.swap(0, std::sync::atomic::Ordering::SeqCst);
+            if typed != 0 {
+                let group = self.linux.foreground as i32;
+                self.kill(INIT, -group, typed);
+            }
             let mut progress = false;
             let pids: Vec<u32> = self.tasks.keys().copied().collect();
             for pid in pids {
@@ -420,6 +431,7 @@ impl<V: Vcpu + Clone> Container<V> {
     /// That is past the point of no return, and Linux kills the process then too.
     fn exec(&mut self, pid: u32, exec: Exec) {
         let task = self.tasks.get_mut(&pid).unwrap();
+        task.process.sync_shared(&task.vcpu, None);
         task.vcpu.reset();
         task.emulator = Emulator::default();
         task.state = State::Runnable;
@@ -549,6 +561,7 @@ impl<V: Vcpu + Clone> Container<V> {
     fn terminate(&mut self, pid: u32, termination: Termination) {
         let task = self.tasks.get_mut(&pid).unwrap();
         task.state = State::Zombie(termination);
+        task.process.sync_shared(&task.vcpu, None);
         task.process.release();
         let ppid = task.process.ppid;
         if let Some(parent) = self.tasks.get_mut(&ppid) {

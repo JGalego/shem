@@ -510,6 +510,66 @@ impl Process {
     /// The bytes a mapping of `len` bytes of the file open on `fd`, from
     /// `offset`, starts with: the file's, as far as it goes. The rest of the
     /// mapping is zeros.
+    /// The `poll` events `fd` is ready for, of those in `events`, and
+    /// whether it is the standard input of a terminal, whose readiness only
+    /// the host knows. Files are always ready; a standard stream that is no
+    /// terminal is taken to be, since reading it blocks on the host anyway.
+    pub(super) fn poll_ready(&self, fd: u32, events: u16, terminal: bool) -> (u16, bool) {
+        const POLLIN: u16 = 0x1;
+        const POLLOUT: u16 = 0x4;
+        const POLLERR: u16 = 0x8;
+        const POLLHUP: u16 = 0x10;
+        const POLLNVAL: u16 = 0x20;
+        let Ok(description) = self.files.get(fd) else {
+            return (POLLNVAL, false);
+        };
+        let description = description.lock().unwrap();
+        let ready = match &description.kind {
+            Kind::Input(_) if terminal => return (0, true),
+            Kind::Pipe(end) => {
+                let pipe = end.pipe.lock().unwrap();
+                if end.writer {
+                    match pipe.readers {
+                        0 => POLLERR,
+                        _ if pipe.buffer.len() < PIPE_CAPACITY => POLLOUT,
+                        _ => 0,
+                    }
+                } else {
+                    let data = if pipe.buffer.is_empty() { 0 } else { POLLIN };
+                    data | if pipe.writers == 0 { POLLHUP } else { 0 }
+                }
+            }
+            Kind::Input(_) => POLLIN,
+            Kind::Output(_) => POLLOUT,
+            _ => POLLIN | POLLOUT,
+        };
+        (ready & (events | POLLERR | POLLHUP), false)
+    }
+
+    /// Whether `fd` is one of the container's standard streams, which are a
+    /// terminal when the host's are.
+    pub(super) fn is_stdio_stream(&self, fd: u32) -> bool {
+        let Ok(description) = self.files.get(fd) else {
+            return false;
+        };
+        matches!(
+            description.lock().unwrap().kind,
+            Kind::Input(_) | Kind::Output(_)
+        )
+    }
+
+    /// The file open on `fd`, for a shared writable mapping, which needs it
+    /// open for reading and writing, as Linux does.
+    pub(super) fn shared_file(&self, fd: u32) -> Result<File, Errno> {
+        let description = self.files.get(fd)?;
+        let description = description.lock().unwrap();
+        match &description.kind {
+            Kind::File(_) if description.flags & O_ACCMODE != O_RDWR => Err(Errno::EACCES),
+            Kind::File(file) => Ok(file.try_clone()?),
+            _ => Err(Errno::ENODEV),
+        }
+    }
+
     pub(super) fn mapped_bytes(&self, fd: u32, offset: u64, len: u32) -> Result<Vec<u8>, Errno> {
         let description = self.files.get(fd)?;
         let description = description.lock().unwrap();
