@@ -224,7 +224,7 @@ jobs:
       - name: Export, upload and tag the weights
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_REPO: ${{ vars.HF_REPO || 'JGalego/shem-rv32im' }}
+          HF_REPO: ${{ vars.HF_REPO || 'jgalego/shem-rv32im' }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           uv run --project neural python -m shem_neural.export weights --version "$VERSION"
