@@ -34,20 +34,29 @@ pub fn hf_reference(from: &str) -> Option<(&str, Option<&str>)> {
     })
 }
 
-/// The neural package, which imports and runs models: `SHEM_NEURAL_PROJECT`,
-/// or the copy next to the source this binary was built from.
-pub fn neural_project() -> PathBuf {
-    std::env::var_os("SHEM_NEURAL_PROJECT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../neural"))
+/// The neural package's source, which imports and runs models:
+/// `SHEM_NEURAL_PROJECT`, or the copy next to the source this binary was
+/// built from, if there is one.
+pub fn neural_project() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("SHEM_NEURAL_PROJECT") {
+        return Some(PathBuf::from(dir));
+    }
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../neural");
+    checkout.join("pyproject.toml").is_file().then_some(checkout)
 }
 
+/// Run a module of the neural package with uv: from its source when there
+/// is one, otherwise the release on PyPI that matches this binary.
 fn python(module: &str) -> Command {
     let mut command = Command::new("uv");
-    command
-        .args(["run", "--quiet", "--project"])
-        .arg(neural_project())
-        .args(["python", "-m", module]);
+    command.args(["run", "--quiet"]);
+    match neural_project() {
+        Some(project) => command.arg("--project").arg(project),
+        None => command
+            .args(["--no-project", "--with"])
+            .arg(concat!("shem-neural==", env!("CARGO_PKG_VERSION"))),
+    };
+    command.args(["python", "-m", module]);
     command
 }
 
