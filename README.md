@@ -187,7 +187,7 @@ The slower suites are ignored tests that need inputs built first: guest programs
 
 ### Release
 
-A release publishes the `shem` and `containerd-shim-shem` crates on crates.io, the `shem-neural` package on PyPI, binaries for Linux (x86_64 and arm64) and macOS (arm64) with build provenance on the GitHub release, and the guest toolchain image on GHCR, with release notes from the commit messages ([`release.yml`](.github/workflows/release.yml)). CI packages everything on every push, so a release does not fail on packaging.
+A release publishes the `shem` and `containerd-shim-shem` crates on crates.io, the `shem-neural` package on PyPI, binaries for Linux (x86_64 and arm64) and macOS (arm64) with build provenance on the GitHub release, the guest toolchain and `shem-neural` runtime images on GHCR with SBOMs and provenance, and every example as a shem image on GHCR (`ghcr.io/jgalego/shem/qwen3`, `…/golem`, `…/linux` and so on), with release notes from the commit messages ([`release.yml`](.github/workflows/release.yml)). CI packages everything on every push, so a release does not fail on packaging.
 
 Set the same version in [`Cargo.toml`](Cargo.toml) and [`neural/pyproject.toml`](neural/pyproject.toml), and commit it.
 
@@ -206,6 +206,7 @@ Before the first release, set up publishing once:
 - **crates.io**: add a `CARGO_REGISTRY_TOKEN` secret for the first publish, then configure trusted publishing for both crates (repository `JGalego/shem`, workflow `release.yml`, environment `release`) and delete the secret.
 - **PyPI**: add a pending trusted publisher for `shem-neural` (repository `JGalego/shem`, workflow `release.yml`, environment `pypi`).
 - **GitHub**: create the `release` and `pypi` environments, with required reviewers if you want to approve each publish.
+- **GHCR**: after the first release, make the new packages public (each package's settings, then "Change visibility"): `shem-toolchain`, `shem-neural` and the examples under `shem/`.
 
 ### Contribute
 
