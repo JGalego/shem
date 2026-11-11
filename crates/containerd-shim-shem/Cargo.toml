@@ -1,0 +1,24 @@
+[package]
+name = "containerd-shim-shem"
+version = "0.1.0"
+description = "A containerd shim that runs containers on shem"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "containerd-shim-shem-v1"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+shem = { path = "../shem" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+containerd-shim = "0.12"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

@@ -222,7 +222,7 @@ fn linux_boots_to_a_shell_and_powers_off() {
 
     let type_line = |line: &str| {
         line.bytes()
-            .chain([b'\n'])
+            .chain(*b"\n")
             .for_each(|b| keys.send(b).unwrap())
     };
     let mut seen = wait_for(&output, "~ # ", 0);

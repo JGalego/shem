@@ -84,3 +84,14 @@ linux-image:
 # Boot Linux in VM mode, run commands in its shell, and power it off
 vm-tests: linux-image
     cargo test --release --test vm -- --ignored
+
+# Run an RV32 container through containerd with the shem shim; needs Docker, containerd and sudo
+containerd-test: toolchain
+    cargo build --release -p containerd-shim-shem
+    sudo install -m 0755 target/release/containerd-shim-shem-v1 /usr/local/bin/
+    mkdir -p target/oci-hello
+    just cc -O2 -o target/oci-hello/hello guests/hello.c
+    printf 'FROM scratch\nCOPY hello /hello\nENTRYPOINT ["/hello"]\n' | docker build -q -t shem-hello:latest -f - target/oci-hello
+    docker save shem-hello:latest | sudo ctr images import -
+    sudo ctr run --rm --runtime io.containerd.shem.v1 docker.io/library/shem-hello:latest shem-test one two | tee target/oci-hello/out.txt
+    grep -q "sum of squares below 100000" target/oci-hello/out.txt

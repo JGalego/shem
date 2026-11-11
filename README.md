@@ -23,6 +23,7 @@ Early, but both halves exist: the host, and a model to run guests on.
 - `shem run`, which runs an executable as a container (`--trace` prints each system call)
 - images: `shem build` turns a [Shemfile](docs/shemfile.md) into a reproducible OCI image, and `WARM` freezes a running guest into it, so `shem run` resumes it where the build left off
 - VM mode: `shem boot` boots a no-MMU Linux kernel to a shell, with the host emulating the privileged architecture and the devices ([docs/vm.md](docs/vm.md))
+- a containerd shim: `ctr run --runtime io.containerd.shem.v1` runs RV32 programs from ordinary OCI images on shem ([docs/containerd.md](docs/containerd.md))
 - a neural vCPU: an RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state, that matches the reference exactly on the official riscv-tests; it batches every running guest into one forward pass and shares memory pages between them ([docs/neural.md](docs/neural.md))
 
 See the [roadmap](docs/architecture.md#roadmap) for what comes next.
@@ -85,6 +86,7 @@ crates/shem/src/
   fdt.rs         device tree writer
   main.rs        the shem CLI
 crates/shem/tests/  unit, integration and guest-program tests
+crates/containerd-shim-shem/  the containerd shim
 neural/         the neural vCPU: ISA table, weight compiler, network, executor, server
 toolchain/      the guest toolchain image and the riscv-tests environment
 guests/         C guest programs
@@ -93,6 +95,7 @@ docs/
   architecture.md  design, tech stack and roadmap
   neural.md        how the neural vCPU works, and its protocol
   vm.md            VM mode
+  containerd.md    the containerd shim
   shemfile.md      the Shemfile and the image format
 ```
 

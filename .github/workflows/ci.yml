@@ -88,3 +88,14 @@ jobs:
       - uses: extractions/setup-just@v4
       - name: Boot a no-MMU Linux to a shell and power it off
         run: just vm-tests
+
+  containerd:
+    name: containerd shim (ctr run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v4
+      - name: Run an RV32 container through containerd on shem
+        run: just containerd-test
