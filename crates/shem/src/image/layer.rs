@@ -176,6 +176,51 @@ pub fn files(layer: &[u8]) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
 }
 
 /// A layer of in-memory files, for metadata layers such as frozen state.
+/// The files of the flat layer `files` (as `from_files` makes) moved under
+/// the directory `dir`, which the layer also creates.
+pub fn under(flat: &[u8], dir: &str) -> anyhow::Result<Vec<u8>> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_ustar();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_mtime(0);
+    header.set_mode(0o700);
+    header.set_size(0);
+    builder.append_data(&mut header, format!("{dir}/"), std::io::empty())?;
+    for (name, data) in files(flat)? {
+        let mut header = tar::Header::new_ustar();
+        header.set_mtime(0);
+        header.set_mode(0o600);
+        header.set_size(data.len() as u64);
+        builder.append_data(&mut header, format!("{dir}/{name}"), &data[..])?;
+    }
+    Ok(builder.into_inner()?)
+}
+
+/// The reverse of `under`: if every entry of `layer` is `dir` or in it, the
+/// files in it as a flat layer; otherwise None.
+pub fn strip(layer: &[u8], dir: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut flat = Vec::new();
+    for entry in tar::Archive::new(layer).entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_string_lossy().into_owned();
+        let path = path.trim_start_matches("./").trim_end_matches('/');
+        if path == dir {
+            continue;
+        }
+        let Some(name) = path.strip_prefix(&format!("{dir}/")) else {
+            return Ok(None);
+        };
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut data)?;
+        flat.push((name.to_string(), data));
+    }
+    if flat.is_empty() {
+        return Ok(None);
+    }
+    let files: Vec<(&str, &[u8])> = flat.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    Ok(Some(from_files(&files)?))
+}
+
 pub fn from_files(files: &[(&str, &[u8])]) -> anyhow::Result<Vec<u8>> {
     let mut builder = tar::Builder::new(Vec::new());
     for (name, data) in files {

@@ -110,7 +110,9 @@ The state layer holds `machine.state` and `vm.json`, the host's half of the hard
 
 ## Image format
 
-A shem image is an [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) whose manifest has:
+A shem image is a standard [OCI image](https://github.com/opencontainers/image-spec) for the platform `linux/riscv32`, stored as an [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), so registries, Docker and containerd handle it like any other image: `docker pull --platform linux/riscv32` pulls what `shem push` pushed. shem's own settings are labels: `dev.shem.machine`, and where they apply `dev.shem.memory` (a warm image's memory), `dev.shem.kernel` and `dev.shem.bootargs` (a VM image's) and `dev.shem.model` (a model image's). A warm image's state is its last layer, whose files are all under `/.shem`.
+
+Layouts in shem's earlier format, with these media types, can still be read:
 
 | Media type | Contents |
 |---|---|
