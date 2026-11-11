@@ -13,6 +13,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 
 FROM scratch
 COPY --from=build /shem-frontend /bin/shem-frontend
+LABEL org.opencontainers.image.source="https://github.com/JGalego/shem"
 LABEL moby.buildkit.frontend.network.none="true"
 LABEL moby.buildkit.frontend.caps="moby.buildkit.frontend.inputs,moby.buildkit.frontend.subrequests,moby.buildkit.frontend.contexts"
 ENTRYPOINT ["/bin/shem-frontend"]

@@ -9,7 +9,7 @@ shem push qwen3 ghcr.io/me/qwen3:0.6b       # to a registry
 shem run ghcr.io/me/qwen3:0.6b "Olá"        # elsewhere: pulled on first use, then run
 ```
 
-`docker build` builds model images too, through shem's BuildKit frontend: add `# syntax=ghcr.io/jgalego/shem/dockerfile:latest` as the first line ([shemfile.md](shemfile.md#with-docker-build)).
+`docker build` builds model images too, through shem's BuildKit frontend: add `# syntax=ghcr.io/jgalego/shem/dockerfile:latest` as the first line ([shemfile.md](shemfile.md#with-docker-build)). The [Qwen3](../examples/qwen3/Dockerfile), [Qwen3.5](../examples/qwen3.5/Dockerfile) and [golem](../examples/golem/Dockerfile) examples include Dockerfiles.
 
 ## Shemfile
 

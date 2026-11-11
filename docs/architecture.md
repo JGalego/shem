@@ -4,6 +4,8 @@ shem treats the host as a hypervisor and a model as the machine it runs. The mod
 
 The starting point is [Qwenputer](https://divagr.com/blog/qwenputer), which compiles an RV32IM CPU into Qwen3.5-4B and uses the model's Gated DeltaNet state as addressable memory. shem's neural vCPU is a standalone compiled network, not part of a pretrained language model. Language-model images can call programs on it as tools ([models.md](models.md#compiled-layers-and-tools)). The host uses the same [vCPU interface](#the-vcpu-interface) for the neural executor and the reference interpreter.
 
+![OCI registries store the images. Docker reaches the host through the containerd shim; the shem CLI drives it directly. The host provides container syscalls or VM devices and drives either the neural or reference vCPU.](assets/architecture.svg)
+
 ## How virtualization maps onto a model
 
 | Virtualization | shem |

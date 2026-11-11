@@ -9,11 +9,13 @@
 
 shem treats the host as a hypervisor and a model as the machine. The model supplies a CPU, compiled into its weights, and RAM, which is its recurrent state, as in [Qwenputer](https://divagr.com/blog/qwenputer). The host supplies everything else: system calls, devices, scheduling and storage. [Shemfiles](docs/shemfile.md) build OCI images that can include a frozen process, a booted kernel or a language-model session.
 
-> 📜 **Why shem?** The name comes from the golem legend: a clay figure comes to life when a *shem*, a slip of paper with words on it, is placed in its mouth. Here the weights are the clay and the program is the shem.
+> 📜 **Why shem?** The name comes from the golem legend: a clay figure comes to life when a *shem*, a slip of paper with words on it, is placed in its mouth. Here the weights are the clay and the program is the shem. It's also a fun play on Docker's [containerd shims](https://docs.docker.com/engine/daemon/alternative-runtimes/#use-containerd-shims).
+
+![An RV32 program runs one instruction per forward pass. On ecall, the host handles the write system call, updates the return value and program counter, then resumes the guest.](https://raw.githubusercontent.com/JGalego/shem/main/docs/assets/execution.gif)
 
 ## What works
 
-The project is experimental. Current features:
+The project is experimental. Current features include:
 
 - **Model images.** Import Qwen3-0.6B or Qwen3.5-0.8B from Hugging Face, run text-generation sessions on a CPU or GPU, and save primed sessions with `WARM`. Models can call RV32 programs as tools on a compiled CPU layer ([models](docs/models.md)).
 - **Containers.** Run static musl programs and [🧰 BusyBox](https://busybox.net) with a root filesystem, processes, threads, pipes, signals, file mappings and a virtual clock. `shem run` supports host terminals; `--trace` prints system calls.
@@ -49,6 +51,32 @@ shem run ghcr.io/<you>/qwen3:0.6b "Say hi in Portuguese"
 
 [`examples/qwen3.5`](examples/qwen3.5/Shemfile) builds Qwen3.5-0.8B, whose Gated DeltaNet layers keep a fixed-size memory in place of a growing cache. [docs/models.md](docs/models.md) explains model images, and the `shem` CLI also runs RV32 programs and Linux ([docs/shemfile.md](docs/shemfile.md), [docs/vm.md](docs/vm.md)).
 
+### With Docker
+
+![A Dockerfile imports a Hugging Face model into an OCI image. docker push and pull exchange it with a registry; docker run starts a model session through the shem containerd shim.](https://raw.githubusercontent.com/JGalego/shem/main/docs/assets/docker-workflow.svg)
+
+The [🤗 Qwen3 Dockerfile](examples/qwen3/Dockerfile) uses `FROM hf.co/Qwen/Qwen3-0.6B` and selects shem's BuildKit frontend with its first line:
+
+```dockerfile
+# syntax=ghcr.io/jgalego/shem/dockerfile:latest
+FROM hf.co/Qwen/Qwen3-0.6B
+CMD ["Introduce yourself in one sentence."]
+```
+
+There are also Dockerfiles for [Qwen3.5](examples/qwen3.5/Dockerfile) and a [primed golem session](examples/golem/Dockerfile). [Install the containerd shim](docs/containerd.md#with-docker) and [start the model server](docs/models.md#sessions-under-docker). Replace `your-user` with your registry namespace:
+
+```sh
+image=ghcr.io/your-user/qwen3:0.6b
+docker build --platform linux/riscv32 -t "$image" examples/qwen3
+docker login ghcr.io
+docker push "$image"
+docker pull --platform linux/riscv32 "$image"
+docker run --rm --platform linux/riscv32 \
+  --runtime io.containerd.shem.v1 "$image" "What is a golem?"
+```
+
+For RV32 programs, the [hello Dockerfile](examples/hello/Dockerfile) cross-compiles a static executable and copies it into `FROM scratch`. These use the reference vCPU by default; add `--annotation dev.shem.vcpu=neural` with the [neural vCPU server](docs/neural.md) running to execute on the compiled CPU instead. Language-model images use their session driver, not the vCPU.
+
 ### Cleaning up
 
 Remove the images and their unpacked copies.
@@ -68,6 +96,10 @@ Uninstall shem.
 ```sh
 cargo uninstall shem
 ```
+
+## Architecture
+
+[![OCI registries store the images. Docker reaches the host through the containerd shim; the shem CLI drives it directly. The host provides syscalls or VM devices and runs a neural or reference vCPU.](https://raw.githubusercontent.com/JGalego/shem/main/docs/assets/architecture.svg)](https://github.com/JGalego/shem/blob/main/docs/architecture.md)
 
 ## Layout
 
@@ -196,7 +228,7 @@ Before the first release, set up publishing once:
 - **Hugging Face**: create a `huggingface` environment with an `HF_TOKEN` secret, a fine-grained token that can write to `jgalego/shem-rv32im` (or set the `HF_REPO` variable to publish elsewhere).
 - **Homebrew** (optional): create the repository `JGalego/homebrew-shem` and a `HOMEBREW_TAP_TOKEN` secret that can push to it; without them the formula is only attached to the release.
 - **GitHub Pages**: in the repository's settings, set Pages to deploy from GitHub Actions, and set the repository variable `DOCS_SITE` to `true`, for the docs site.
-- **GHCR**: after the first release, make the new packages public (each package's settings, then "Change visibility"): `shem-toolchain`, `shem-neural` and the examples under `shem/`.
+- **GHCR**: after the first release, make the new packages public (each package's settings, then "Change visibility"): `shem-toolchain`, `shem-neural`, the BuildKit frontend `shem/dockerfile` and the example images under `shem/`.
 
 Install a release's binaries without compiling, with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) (`cargo binstall shem`) or Homebrew (`brew install jgalego/shem/shem`, once the tap exists).
 

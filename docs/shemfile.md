@@ -23,6 +23,8 @@ CMD ["Who are you?"]
 WARM --until=prompt
 ```
 
+The published frontend and runtime images currently target `linux/amd64`.
+
 ```sh
 docker build --platform linux/riscv32 -t golem .
 ```

@@ -4,6 +4,8 @@
 
 ## With Docker
 
+![A Dockerfile imports a Hugging Face model into an OCI image. docker push and pull exchange it with a registry; docker run starts a model session through the shem containerd shim.](assets/docker-workflow.svg)
+
 ```sh
 cargo build --release -p containerd-shim-shem
 sudo install target/release/containerd-shim-shem-v1 /usr/local/bin/

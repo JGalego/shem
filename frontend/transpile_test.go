@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -71,6 +73,45 @@ func TestModelsBecomeOneLayerPerBlock(t *testing.T) {
 	}
 	if strings.Count(out, "COPY") != 5 {
 		t.Errorf("want one COPY for the small files and one per weights file:\n%s", out)
+	}
+}
+
+func TestModelDockerfileExamples(t *testing.T) {
+	for _, example := range []struct {
+		directory string
+		model     string
+	}{
+		{"qwen3", "Qwen/Qwen3-0.6B"},
+		{"qwen3.5", "Qwen/Qwen3.5-0.8B"},
+		{"golem", "Qwen/Qwen3.5-0.8B"},
+	} {
+		t.Run(example.directory, func(t *testing.T) {
+			directory := filepath.Join("..", "examples", example.directory)
+			src, err := os.ReadFile(filepath.Join(directory, "Dockerfile"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(string(src), "# syntax=ghcr.io/jgalego/shem/dockerfile:latest\n") {
+				t.Fatal("model Dockerfile must select shem's BuildKit frontend")
+			}
+			imports, err := Imports(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(imports) != 1 || imports[0] != (Import{"shem-import-0", example.model, ""}) {
+				t.Fatalf("imports %+v", imports)
+			}
+			shemfile, err := os.ReadFile(filepath.Join(directory, "Shemfile"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			imported := map[string]Imported{"shem-import-0": {Files: []string{"shem.json"}}}
+			got := transpile(t, string(src), imported)
+			want := transpile(t, string(shemfile), imported)
+			if got != want {
+				t.Errorf("Dockerfile and Shemfile differ:\nDockerfile:\n%s\nShemfile:\n%s", got, want)
+			}
+		})
 	}
 }
 

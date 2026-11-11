@@ -10,5 +10,6 @@ RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-ins
 COPY src src
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
 ENV PATH=/opt/shem-neural/.venv/bin:$PATH
+LABEL org.opencontainers.image.source="https://github.com/JGalego/shem"
 ENTRYPOINT ["shem-neural-server"]
 CMD ["--socket", "/run/shem/neural.sock"]
