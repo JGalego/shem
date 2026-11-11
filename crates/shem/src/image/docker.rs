@@ -27,7 +27,8 @@ impl Image {
         self.write_layout(dir.path(), tag)?;
         let path = dir.path().join("index.json");
         let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-        index["manifests"][0]["annotations"]["io.containerd.image.name"] = docker_name(name)?.into();
+        index["manifests"][0]["annotations"]["io.containerd.image.name"] =
+            docker_name(name)?.into();
         std::fs::write(&path, serde_json::to_vec(&index)?)?;
 
         let mut files = vec!["oci-layout".to_string(), "index.json".to_string()];
@@ -40,7 +41,10 @@ impl Image {
             .into_iter()
             .map(|name| Ok((name.clone(), std::fs::read(dir.path().join(&name))?)))
             .collect::<anyhow::Result<_>>()?;
-        let entries: Vec<(&str, &[u8])> = contents.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+        let entries: Vec<(&str, &[u8])> = contents
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
         layer::from_files(&entries)
     }
 }
@@ -50,8 +54,8 @@ impl Image {
 fn docker_name(reference: &str) -> anyhow::Result<String> {
     let (name, tag) = super::parse_reference(reference)?;
     let first = name.split('/').next().unwrap_or_default();
-    let has_host = name.contains('/')
-        && (first.contains('.') || first.contains(':') || first == "localhost");
+    let has_host =
+        name.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost");
     let full = if has_host {
         name.to_string()
     } else if name.contains('/') {
