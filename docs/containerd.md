@@ -49,4 +49,3 @@ The part that turns a bundle into a container ([`bundle.rs`](../crates/container
 ## Not yet
 
 - `ctr exec` and `docker exec`, pausing, checkpoints and resource statistics, and `-t` terminals.
-- A Kubernetes `RuntimeClass` example.

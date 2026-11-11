@@ -1,0 +1,12 @@
+# An RV32 program, built for linux/riscv32, running on shem in a Pod.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shem-hello
+spec:
+  runtimeClassName: shem
+  restartPolicy: Never
+  containers:
+    - name: hello
+      image: ghcr.io/jgalego/shem/hello:latest
+      imagePullPolicy: IfNotPresent

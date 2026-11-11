@@ -133,6 +133,35 @@ docker-test: toolchain
     fi
     timeout 10 docker rm shem-docker-test >/dev/null
 
+# Run an RV32 program in a Pod on shem, in a kind cluster; needs Docker, kind and kubectl
+kubernetes-test:
+    #!/bin/sh
+    set -e
+    # A static shim, since the kind node's C library may be older than this one
+    cargo build --release --target x86_64-unknown-linux-musl -p containerd-shim-shem
+    docker build -q --platform linux/riscv32 -t shem-k8s-hello:latest examples/hello
+    kind delete cluster --name shem >/dev/null 2>&1 || true
+    kind create cluster --name shem --wait 120s
+    node=shem-control-plane
+    docker cp target/x86_64-unknown-linux-musl/release/containerd-shim-shem-v1 "$node:/usr/local/bin/"
+    printf '%s\n' "" \
+        "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.shem]" \
+        "  runtime_type = 'io.containerd.shem.v1'" \
+        "[plugins.'io.containerd.cri.v1.images'.runtime_platforms.shem]" \
+        "  platform = 'linux/riscv32'" | docker exec -i "$node" sh -c 'cat >> /etc/containerd/config.toml'
+    docker exec "$node" systemctl restart containerd
+    docker save shem-k8s-hello:latest | docker exec -i "$node" ctr -n k8s.io images import --all-platforms -
+    kubectl apply -f examples/kubernetes/runtimeclass.yaml
+    sed 's#image: .*#image: docker.io/library/shem-k8s-hello:latest#; s#imagePullPolicy: .*#imagePullPolicy: Never#' examples/kubernetes/hello.yaml | kubectl apply -f -
+    if ! kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/shem-hello --timeout=120s; then
+        kubectl describe pod shem-hello | tail -25
+        docker exec "$node" journalctl -u containerd --no-pager | tail -40
+        exit 1
+    fi
+    kubectl logs shem-hello | tee target/k8s.out
+    grep -q "hello from a shem image" target/k8s.out
+    kind delete cluster --name shem
+
 # Push and pull an image through a local registry; needs Docker and oras
 registry-test:
     #!/bin/sh
