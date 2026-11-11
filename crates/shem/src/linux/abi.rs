@@ -31,6 +31,9 @@ pub mod nr {
     pub const READLINKAT: u32 = 78;
     pub const FSYNC: u32 = 82;
     pub const EXIT: u32 = 93;
+    pub const FUTEX: u32 = 98;
+    pub const SET_ROBUST_LIST: u32 = 99;
+    pub const SCHED_YIELD: u32 = 124;
     pub const EXIT_GROUP: u32 = 94;
     pub const WAITID: u32 = 95;
     pub const SET_TID_ADDRESS: u32 = 96;
@@ -74,6 +77,7 @@ pub mod nr {
     pub const CLOCK_GETTIME64: u32 = 403;
     pub const CLOCK_NANOSLEEP_TIME64: u32 = 407;
     pub const PPOLL_TIME64: u32 = 414;
+    pub const FUTEX_TIME64: u32 = 422;
     pub const UTIMENSAT_TIME64: u32 = 412;
     pub const FACCESSAT2: u32 = 439;
     pub const STATFS64: u32 = 43;
@@ -117,6 +121,7 @@ impl Errno {
     pub const ERANGE: Self = Self(34);
     pub const ENAMETOOLONG: Self = Self(36);
     pub const ENOSYS: Self = Self(38);
+    pub const ETIMEDOUT: Self = Self(110);
     pub const ENOTEMPTY: Self = Self(39);
     pub const ELOOP: Self = Self(40);
     /// Not a real errno: the call cannot finish yet, so the process blocks and
@@ -221,6 +226,9 @@ pub const CLONE_VM: u32 = 0x100;
 pub const CLONE_VFORK: u32 = 0x4000;
 pub const CLONE_THREAD: u32 = 0x10000;
 pub const CLONE_PARENT_SETTID: u32 = 0x100000;
+pub const CLONE_SETTLS: u32 = 0x80000;
+pub const CLONE_CHILD_CLEARTID: u32 = 0x200000;
+pub const CLONE_CHILD_SETTID: u32 = 0x1000000;
 
 pub const SIGKILL: u32 = 9;
 pub const SIGPIPE: u32 = 13;

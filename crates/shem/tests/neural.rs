@@ -94,7 +94,7 @@ fn run_container<V: Vcpu + Clone>(vcpu: V, elf: &[u8], argv: &[&str]) -> Outcome
         result,
         steps: container.steps,
         stdout: stdout.contents(),
-        state: container.init().vcpu.snapshot(),
+        state: container.init().vcpu().snapshot(),
     }
 }
 
@@ -467,4 +467,37 @@ fn booted_linux_runs_identically_on_both_vcpus() {
     );
     assert_eq!(neural.1.host, reference.1.host);
     assert_same("linux", &reference.1.machine, &neural.1.machine);
+}
+
+/// Run the threads guest for two rounds: four threads that take turns on one
+/// vCPU, swapping registers. musl gives each an 8 MiB stack.
+fn run_threads<V: Vcpu + Clone>(vcpu: V, elf: &[u8]) -> (Result<u8, RunError>, u64, Vec<u8>) {
+    let stdout = SharedBuf::default();
+    let argv = ["threads".to_string(), "2".to_string()];
+    let mut container = Container::from_elf(vcpu, elf, &argv, &[], stdio(&stdout)).unwrap();
+    (
+        container.run(Some(MAX_STEPS)),
+        container.steps,
+        stdout.contents(),
+    )
+}
+
+#[test]
+#[ignore = "needs uv, PyTorch and the guest programs: run `just neural-tests`"]
+fn threads_run_identically_on_both_vcpus() {
+    const THREAD_MEM: u32 = 64 << 20;
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/guests/threads");
+    let elf = std::fs::read(&path).expect("build the guests first: just guest-tests");
+    let reference = run_threads(ReferenceVcpu::new(THREAD_MEM), &elf);
+    assert_eq!(reference.0, Ok(0));
+    assert_eq!(
+        String::from_utf8_lossy(&reference.2),
+        "locked 20 atomic 8 thread-local 8 main 0\n"
+    );
+    let server = Server::start();
+    let neural = run_threads(
+        NeuralVcpu::connect(&server.socket, THREAD_MEM).unwrap(),
+        &elf,
+    );
+    assert_eq!(neural, reference);
 }

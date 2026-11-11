@@ -115,8 +115,22 @@ pub enum Action {
     Return(u32),
     /// The call cannot finish yet: park the process and retry the call later.
     Block,
-    /// The process ends.
+    /// The process ends, all its threads with it.
     Exit(Termination),
+    /// The calling thread ends; the process ends with its last thread.
+    ExitThread(Termination),
+    /// Start a thread in the calling process: it shares the process's memory,
+    /// files and signal handlers, starts on `stack` with its thread pointer
+    /// at `tls` (if `settls`), and has its id stored at `parent_tid` and at
+    /// `child_tid` (when not 0), and `child_tid` cleared when it ends (if
+    /// `clear_child_tid`).
+    Thread {
+        stack: u32,
+        tls: Option<u32>,
+        parent_tid: u32,
+        child_tid: u32,
+        clear_child_tid: bool,
+    },
     /// Fork the process. The child gets `stack` as its stack pointer if it is
     /// not 0, and its pid is stored at `parent_tid` if that is not 0.
     Fork { stack: u32, parent_tid: u32 },
@@ -211,6 +225,11 @@ pub struct Process {
     pub started_ns: u64,
     /// File mappings whose writes go back to their files.
     shared: Vec<SharedMapping>,
+    /// The thread making the current system call: the container sets it,
+    /// since the threads of a process share this state.
+    pub tid: u32,
+    /// Where each thread's id is cleared when it ends, by thread id.
+    pub clear_child_tid: BTreeMap<u32, u32>,
 }
 
 /// A shared, writable mapping of a file: the guest's bytes at `start ..
@@ -292,7 +311,30 @@ impl Linux {
             mem_total: vcpu.mem_size() as u64,
         };
         let result = match nr {
-            nr::EXIT | nr::EXIT_GROUP => return Action::Exit(Termination::Exited(a[0] as u8)),
+            nr::EXIT => return Action::ExitThread(Termination::Exited(a[0] as u8)),
+            nr::EXIT_GROUP => return Action::Exit(Termination::Exited(a[0] as u8)),
+            // clone(flags, stack, parent_tid, tls, child_tid)
+            nr::CLONE if a[0] & CLONE_THREAD != 0 => {
+                if a[0] & CLONE_VM == 0 {
+                    Err(Errno::EINVAL)
+                } else {
+                    return Action::Thread {
+                        stack: a[1],
+                        tls: (a[0] & CLONE_SETTLS != 0).then_some(a[3]),
+                        parent_tid: if a[0] & CLONE_PARENT_SETTID != 0 {
+                            a[2]
+                        } else {
+                            0
+                        },
+                        child_tid: if a[0] & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 {
+                            a[4]
+                        } else {
+                            0
+                        },
+                        clear_child_tid: a[0] & CLONE_CHILD_CLEARTID != 0,
+                    };
+                }
+            }
             nr::CLONE => match clone(a[0]) {
                 Ok(()) => {
                     return Action::Fork {
@@ -401,7 +443,14 @@ impl Linux {
             nr::RT_SIGPROCMASK => p.sigprocmask(vcpu, a[0], a[1], a[2]),
             nr::PRLIMIT64 => prlimit(vcpu, a[1], a[3]),
             nr::SCHED_GETAFFINITY => sched_getaffinity(vcpu, a[1], a[2]),
-            nr::SET_TID_ADDRESS | nr::GETPID | nr::GETTID => Ok(p.pid),
+            nr::SET_TID_ADDRESS => {
+                p.clear_child_tid.insert(p.tid, a[0]);
+                Ok(p.tid)
+            }
+            nr::GETPID => Ok(p.pid),
+            nr::GETTID => Ok(p.tid),
+            nr::FUTEX | nr::FUTEX_TIME64 => self.futex(vcpu, a[0], a[1], a[2], a[3]),
+            nr::SET_ROBUST_LIST | nr::SCHED_YIELD => Ok(0),
             nr::GETPPID => Ok(p.ppid),
             nr::GETPGID if a[0] == 0 || a[0] == p.pid => Ok(p.pgid),
             nr::GETPGID => return Action::GetPgid { pid: a[0] },
@@ -436,6 +485,51 @@ impl Linux {
                 None => Action::Return(Errno::EPIPE.0.wrapping_neg()),
             },
             Err(Errno(errno)) => Action::Return(errno.wrapping_neg()),
+        }
+    }
+
+    /// `futex`, for threads: a wait blocks while the word at `addr` holds
+    /// `value`, and is retried until it changes, so a wake needs no record of
+    /// who waits; it returns EAGAIN once the word has moved on, which callers
+    /// treat as a wake. A wait with a timeout sleeps through it on the virtual
+    /// clock instead, as nothing else can change the word meanwhile without
+    /// running. Wakes and requeues report no one woken, which is allowed.
+    fn futex(
+        &mut self,
+        vcpu: &mut dyn Vcpu,
+        addr: u32,
+        op: u32,
+        value: u32,
+        timeout: u32,
+    ) -> Result<u32, Errno> {
+        const FUTEX_WAIT: u32 = 0;
+        const FUTEX_WAKE: u32 = 1;
+        const FUTEX_REQUEUE: u32 = 3;
+        const FUTEX_CMP_REQUEUE: u32 = 4;
+        const FUTEX_WAIT_BITSET: u32 = 9;
+        const FUTEX_WAKE_BITSET: u32 = 10;
+        const PRIVATE_AND_CLOCK: u32 = 128 | 256;
+        match op & !PRIVATE_AND_CLOCK {
+            FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+                let mut word = [0u8; 4];
+                vcpu.read_mem(addr, &mut word)?;
+                if u32::from_le_bytes(word) != value {
+                    return Err(Errno::EAGAIN);
+                }
+                if timeout == 0 {
+                    return Err(Errno::WOULD_BLOCK);
+                }
+                let mut ts = [0u8; 16];
+                vcpu.read_mem(timeout, &mut ts)?;
+                let sec = i64::from_le_bytes(ts[..8].try_into().unwrap()).max(0) as u64;
+                let nsec = i64::from_le_bytes(ts[8..].try_into().unwrap()).max(0) as u64;
+                self.slept_ns = self
+                    .slept_ns
+                    .saturating_add(sec.saturating_mul(NS_PER_SEC).saturating_add(nsec));
+                Err(Errno::ETIMEDOUT)
+            }
+            FUTEX_WAKE | FUTEX_WAKE_BITSET | FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => Ok(0),
+            _ => Err(Errno::ENOSYS),
         }
     }
 
@@ -677,6 +771,8 @@ impl Process {
             cpu_ns: 0,
             started_ns: 0,
             shared: Vec::new(),
+            tid: pid,
+            clear_child_tid: BTreeMap::new(),
         }
     }
 
@@ -777,6 +873,8 @@ impl Process {
             cpu_ns: 0,
             started_ns: self.now.saturating_sub(EPOCH_NS),
             shared: self.shared.clone(),
+            tid: pid,
+            clear_child_tid: BTreeMap::new(),
         }
     }
 
@@ -950,11 +1048,11 @@ impl Process {
 /// `struct rusage` with 32-bit `timeval`s and 14 longs.
 const RUSAGE_SIZE: u32 = 72;
 
-/// Forks are supported, threads are not. `vfork` children get a copy of memory
-/// instead of sharing it, which is safe for the usual pattern of calling
-/// `execve` or `_exit` straight away.
+/// Forks, and threads (handled before this). `vfork` children get a copy of
+/// memory instead of sharing it, which is safe for the usual pattern of
+/// calling `execve` or `_exit` straight away.
 fn clone(flags: u32) -> Result<(), Errno> {
-    if flags & CLONE_THREAD != 0 || (flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0) {
+    if flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0 {
         return Err(Errno::EINVAL);
     }
     Ok(())

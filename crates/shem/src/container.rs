@@ -1,15 +1,19 @@
 //! Container mode: a set of guest processes, each on its own vCPU, with the host
 //! as their kernel.
 //!
-//! The scheduler runs each runnable process for a slice of instructions in
-//! turn, which is all the preemption a guest needs (design rule 3). A process
+//! The scheduler runs each runnable thread for a slice of instructions in
+//! turn, which is all the preemption a guest needs (design rule 3). A thread
 //! whose system call cannot finish yet, such as a read from an empty pipe, is
 //! parked with its pc still on the `ecall`, and the call is retried on its next
-//! turn. `fork` copies the vCPU (design rule 4). The container ends when its
-//! first process, init, exits.
+//! turn. `fork` copies the vCPU (design rule 4). The threads of a process share
+//! its vCPU, and so its memory: each keeps its registers aside while another
+//! runs, so threads work on any vCPU. The container ends when its first
+//! process, init, exits.
 
-use std::collections::BTreeMap;
+use std::cell::{Ref, RefCell, RefMut};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::rc::Rc;
 
 use thiserror::Error;
 
@@ -20,6 +24,9 @@ use crate::linux::{
     Report, Stdio, Termination, Wait,
 };
 use crate::vcpu::{A0, A7, Exit, ExitReason, MachineState, MemoryFault, SP, SnapshotError, Vcpu};
+
+/// The thread pointer register, which holds a thread's TLS.
+const TP: usize = 4;
 use serde::{Deserialize, Serialize};
 
 /// Memory kept free for the stack at the top of guest memory, above the heap and mappings.
@@ -101,12 +108,95 @@ pub enum RunError {
     Deadlock,
 }
 
-/// One guest process: its kernel state, its vCPU, and where it is in its life.
+/// One guest thread: its process's kernel state and vCPU, which it shares
+/// with the process's other threads, and where it is in its life.
 pub struct Task<V> {
-    pub process: Process,
-    pub vcpu: V,
+    /// The thread's id. A process's id is its first thread's.
+    pub tid: u32,
+    process: Rc<RefCell<Process>>,
+    core: Rc<RefCell<Core<V>>>,
     emulator: Emulator,
     pub state: State,
+}
+
+impl<V: Vcpu> Task<V> {
+    fn new(tid: u32, process: Process, vcpu: V, emulator: Emulator) -> Self {
+        let core = Core {
+            vcpu,
+            loaded: tid,
+            saved: HashMap::new(),
+        };
+        Self {
+            tid,
+            process: Rc::new(RefCell::new(process)),
+            core: Rc::new(RefCell::new(core)),
+            emulator,
+            state: State::Runnable,
+        }
+    }
+
+    /// The thread's process, shared with its other threads.
+    pub fn process(&self) -> Ref<'_, Process> {
+        self.process.borrow()
+    }
+
+    /// The process's vCPU, holding this thread's registers.
+    pub fn vcpu(&self) -> RefMut<'_, V> {
+        cpu(&self.core, self.tid)
+    }
+
+    /// Whether this is its process's first thread, which stands for the
+    /// process: it is the one that `wait`, `kill` and `/proc` see.
+    fn is_leader(&self) -> bool {
+        self.tid == self.process.borrow().pid
+    }
+
+    fn same_process(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.process, &other.process)
+    }
+}
+
+/// A thread's registers while another thread of its process has the vCPU.
+struct Context {
+    pc: u32,
+    regs: [u32; 32],
+}
+
+/// A process's vCPU, which its threads take turns on: memory is the vCPU's,
+/// so they share it, and each keeps its registers here while another runs.
+struct Core<V> {
+    vcpu: V,
+    /// The thread whose registers the vCPU holds, or `NOBODY`.
+    loaded: u32,
+    saved: HashMap<u32, Context>,
+}
+
+/// No thread: the one whose registers the vCPU held has ended.
+const NOBODY: u32 = u32::MAX;
+
+/// The vCPU of `core` with `tid`'s registers in it, switching threads if
+/// another's are there.
+fn cpu<V: Vcpu>(core: &RefCell<Core<V>>, tid: u32) -> RefMut<'_, V> {
+    RefMut::map(core.borrow_mut(), |core| {
+        if core.loaded != tid {
+            let vcpu = &mut core.vcpu;
+            if core.loaded != NOBODY {
+                let outgoing = Context {
+                    pc: vcpu.pc(),
+                    regs: std::array::from_fn(|i| vcpu.reg(i)),
+                };
+                core.saved.insert(core.loaded, outgoing);
+            }
+            if let Some(incoming) = core.saved.remove(&tid) {
+                vcpu.set_pc(incoming.pc);
+                for (i, &value) in incoming.regs.iter().enumerate().skip(1) {
+                    vcpu.set_reg(i, value);
+                }
+            }
+            core.loaded = tid;
+        }
+        &mut core.vcpu
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +204,8 @@ pub enum State {
     Runnable,
     /// Parked on a system call that will be retried.
     Blocked,
+    /// A process's first thread, ended while its other threads go on.
+    Gone,
     /// Exited, and not yet reaped by its parent.
     Zombie(Termination),
 }
@@ -141,24 +233,15 @@ impl<V: Vcpu + Clone> Container<V> {
         envp: &[String],
         stdio: Stdio,
     ) -> Result<Self, StartError> {
-        let mut task = Task {
-            process: Process::new(INIT, stdio, 0, 0),
+        let mut task = Task::new(
+            INIT,
+            Process::new(INIT, stdio, 0, 0),
             vcpu,
-            emulator: Emulator::default(),
-            state: State::Runnable,
-        };
+            Emulator::default(),
+        );
         let exe = argv.first().map_or(&b""[..], |arg| arg.as_bytes());
         load(&mut task, elf, exe, argv, envp)?;
-        Ok(Self {
-            linux: Linux::new(),
-            tasks: BTreeMap::from([(INIT, task)]),
-            next_pid: INIT + 1,
-            steps: 0,
-            faults: Vec::new(),
-            trace: false,
-            pause: None,
-            paused: false,
-        })
+        Ok(Self::with_init(task, Linux::new(), 0))
     }
 
     /// Resume a frozen container: init picks up exactly where it was frozen,
@@ -166,37 +249,42 @@ impl<V: Vcpu + Clone> Container<V> {
     /// separately, from the image's layers.
     pub fn thaw(mut vcpu: V, frozen: &Frozen, stdio: Stdio) -> Result<Self, SnapshotError> {
         vcpu.restore(&frozen.machine)?;
-        let task = Task {
-            process: Process::thaw(&frozen.host.process, stdio),
-            vcpu,
-            emulator: Emulator::with_reservation(frozen.host.reservation),
-            state: State::Runnable,
-        };
-        Ok(Self {
-            linux: Linux::thaw(&frozen.host.linux),
+        let process = Process::thaw(&frozen.host.process, stdio);
+        let emulator = Emulator::with_reservation(frozen.host.reservation);
+        let task = Task::new(INIT, process, vcpu, emulator);
+        Ok(Self::with_init(
+            task,
+            Linux::thaw(&frozen.host.linux),
+            frozen.host.steps,
+        ))
+    }
+
+    fn with_init(task: Task<V>, linux: Linux, steps: u64) -> Self {
+        Self {
+            linux,
             tasks: BTreeMap::from([(INIT, task)]),
             next_pid: INIT + 1,
-            steps: frozen.host.steps,
+            steps,
             faults: Vec::new(),
             trace: false,
             pause: None,
             paused: false,
-        })
+        }
     }
 
     /// Freeze the container for a warm image. Only a lone init can be frozen,
-    /// holding nothing but its standard streams.
+    /// with a single thread, holding nothing but its standard streams.
     pub fn freeze(&self) -> Result<Frozen, FreezeError> {
         if self.tasks.len() != 1 {
             return Err(FreezeError::Processes(self.tasks.len()));
         }
         let init = &self.tasks[&INIT];
         Ok(Frozen {
-            machine: init.vcpu.snapshot(),
+            machine: init.vcpu().snapshot(),
             host: FrozenHost {
                 steps: self.steps,
                 linux: self.linux.freeze(),
-                process: init.process.freeze()?,
+                process: init.process().freeze()?,
                 reservation: init.emulator.reservation(),
             },
         })
@@ -204,12 +292,12 @@ impl<V: Vcpu + Clone> Container<V> {
 
     /// Set init's working directory, a directory in its root filesystem.
     pub fn set_cwd(&mut self, path: &str) -> Result<(), crate::linux::Errno> {
-        self.tasks.get_mut(&INIT).unwrap().process.set_cwd(path)
+        self.tasks[&INIT].process.borrow_mut().set_cwd(path)
     }
 
     /// Give the guest a filesystem: the host directory `root` becomes `/`.
     pub fn set_root(&mut self, root: &Path) -> std::io::Result<()> {
-        self.tasks.get_mut(&INIT).unwrap().process.set_root(root)
+        self.tasks[&INIT].process.borrow_mut().set_root(root)
     }
 
     /// The first process, which lives as long as the container.
@@ -217,8 +305,8 @@ impl<V: Vcpu + Clone> Container<V> {
         &self.tasks[&INIT]
     }
 
-    pub fn task(&self, pid: u32) -> Option<&Task<V>> {
-        self.tasks.get(&pid)
+    pub fn task(&self, tid: u32) -> Option<&Task<V>> {
+        self.tasks.get(&tid)
     }
 
     /// Run until init exits, and return its exit status: the exit code, or 128
@@ -245,9 +333,9 @@ impl<V: Vcpu + Clone> Container<V> {
                 self.kill(INIT, -group, typed);
             }
             let mut progress = false;
-            let pids: Vec<u32> = self.tasks.keys().copied().collect();
-            for pid in pids {
-                progress |= self.turn(pid, max_steps)?;
+            let tids: Vec<u32> = self.tasks.keys().copied().collect();
+            for tid in tids {
+                progress |= self.turn(tid, max_steps)?;
                 if self.paused {
                     return Ok(Stop::Paused);
                 }
@@ -261,23 +349,30 @@ impl<V: Vcpu + Clone> Container<V> {
         }
     }
 
-    /// Give `pid` one turn, and report whether it got anywhere.
-    fn turn(&mut self, pid: u32, max_steps: Option<u64>) -> Result<bool, RunError> {
-        let Some(task) = self.tasks.get_mut(&pid) else {
+    /// Give thread `tid` one turn, and report whether it got anywhere.
+    fn turn(&mut self, tid: u32, max_steps: Option<u64>) -> Result<bool, RunError> {
+        let Some(task) = self.tasks.get_mut(&tid) else {
             return Ok(false);
         };
-        if let State::Zombie(_) = task.state {
+        if matches!(task.state, State::Zombie(_) | State::Gone) {
             return Ok(false);
         }
         // Pending signals come first: a handler runs, or a default action kills.
         let parked = task.state == State::Blocked;
-        match task.process.signals.deliver(&mut task.vcpu, parked) {
+        let delivery = {
+            let mut vcpu = cpu(&task.core, tid);
+            task.process
+                .borrow_mut()
+                .signals
+                .deliver(&mut *vcpu, parked)
+        };
+        match delivery {
             Delivery::Killed(termination) => {
-                self.terminate(pid, termination);
+                self.terminate(tid, termination);
                 return Ok(true);
             }
             Delivery::Handler => task.state = State::Runnable,
-            Delivery::Nothing if parked => return Ok(self.syscall(pid)),
+            Delivery::Nothing if parked => return Ok(self.syscall(tid)),
             Delivery::Nothing => {}
         }
         let mut budget = match max_steps {
@@ -292,111 +387,160 @@ impl<V: Vcpu + Clone> Container<V> {
             }
             budget = budget.min(at - self.steps);
         }
-        let exit = task.vcpu.run(budget);
+        let exit = cpu(&task.core, tid).run(budget);
         self.steps += exit.steps;
-        task.process.cpu_ns += exit.steps;
-        let init = pid == INIT;
+        task.process.borrow_mut().cpu_ns += exit.steps;
+        let init = tid == INIT;
         match exit.reason {
             ExitReason::Budget => {}
             // Pause with the pc still on the ecall, so that resuming services
             // the call with the input it gets then.
-            ExitReason::Ecall if init && self.pause == Some(Pause::Syscall(task.vcpu.reg(A7))) => {
+            ExitReason::Ecall
+                if init && self.pause == Some(Pause::Syscall(task.vcpu().reg(A7))) =>
+            {
                 self.paused = true;
             }
             ExitReason::Ecall => {
-                self.syscall(pid);
+                self.syscall(tid);
             }
             ExitReason::Ebreak if init && self.pause == Some(Pause::Ebreak) => {
-                task.vcpu.set_pc(exit.pc.wrapping_add(4));
+                task.vcpu().set_pc(exit.pc.wrapping_add(4));
                 self.paused = true;
             }
             ExitReason::IllegalInstruction(ins) => {
-                let task = self.tasks.get_mut(&pid).unwrap();
-                match task.emulator.emulate(&mut task.vcpu, ins) {
+                let task = self.tasks.get_mut(&tid).unwrap();
+                let emulation = {
+                    let mut vcpu = cpu(&task.core, tid);
+                    task.emulator.emulate(&mut *vcpu, ins)
+                };
+                match emulation {
                     Emulation::Done => {}
-                    Emulation::Unsupported => self.fault(pid, exit)?,
+                    Emulation::Unsupported => self.fault(tid, exit)?,
                     Emulation::Fault(addr) => {
                         let reason = ExitReason::MemoryFault(addr);
-                        self.fault(pid, Exit { reason, ..exit })?;
+                        self.fault(tid, Exit { reason, ..exit })?;
                     }
                 }
             }
-            _ => self.fault(pid, exit)?,
+            _ => self.fault(tid, exit)?,
         }
         Ok(true)
     }
 
-    /// Service the system call `pid` is stopped on. Returns false if it blocked.
-    fn syscall(&mut self, pid: u32) -> bool {
-        let nr = self.tasks[&pid].vcpu.reg(A7);
+    /// Service the system call thread `tid` is stopped on. Returns false if it
+    /// blocked.
+    fn syscall(&mut self, tid: u32) -> bool {
+        let nr = self.tasks[&tid].vcpu().reg(A7);
         if Linux::needs_processes(nr) {
             self.linux.processes = self.proc_entries();
         }
-        let task = self.tasks.get_mut(&pid).unwrap();
-        let call = [17, 10, 11, 12, 13].map(|reg| task.vcpu.reg(reg));
-        let action = self
-            .linux
-            .handle(&mut task.process, &mut task.vcpu, self.steps);
+        let task = self.tasks.get_mut(&tid).unwrap();
+        let (call, action) = {
+            let mut vcpu = cpu(&task.core, tid);
+            let call = [17, 10, 11, 12, 13].map(|reg| vcpu.reg(reg));
+            let mut process = task.process.borrow_mut();
+            process.tid = tid;
+            (
+                call,
+                self.linux.handle(&mut process, &mut *vcpu, self.steps),
+            )
+        };
         if self.trace {
-            trace(pid, call, &action);
+            trace(tid, call, &action);
         }
         match action {
-            Action::Return(value) => self.finish(pid, value),
+            Action::Return(value) => self.finish(tid, value),
             Action::Block => {
                 task.state = State::Blocked;
                 return false;
             }
-            Action::Exit(termination) => self.terminate(pid, termination),
+            Action::Exit(termination) => self.terminate(tid, termination),
+            Action::ExitThread(termination) => self.exit_thread(tid, termination),
             Action::Fork { stack, parent_tid } => {
-                let result = self.fork(pid, stack, parent_tid);
-                self.finish(pid, result);
+                let result = self.fork(tid, stack, parent_tid);
+                self.finish(tid, result);
             }
-            Action::Exec(exec) => self.exec(pid, exec),
-            Action::Wait(wait) => return self.wait(pid, wait),
+            Action::Thread {
+                stack,
+                tls,
+                parent_tid,
+                child_tid,
+                clear_child_tid,
+            } => {
+                let result = self.thread(tid, stack, tls, (parent_tid, child_tid), clear_child_tid);
+                self.finish(tid, result);
+            }
+            Action::Exec(exec) => self.exec(tid, exec),
+            Action::Wait(wait) => return self.wait(tid, wait),
             Action::Kill {
                 pid: target,
                 signal,
-            } => self.kill(pid, target, signal),
-            Action::Resume => task_state(&mut self.tasks, pid, State::Runnable),
+            } => self.kill(tid, target, signal),
+            Action::Resume => task_state(&mut self.tasks, tid, State::Runnable),
             Action::SetPgid { pid: child, pgid } => {
-                let result = match self.tasks.get_mut(&child) {
-                    Some(task) if task.process.ppid == pid => {
-                        task.process.pgid = pgid;
+                let caller = self.pid_of(tid);
+                let result = match self.leader(child) {
+                    Some(task) if task.process().ppid == caller => {
+                        task.process.borrow_mut().pgid = pgid;
                         0
                     }
                     Some(_) => EPERM.wrapping_neg(),
                     None => ESRCH.wrapping_neg(),
                 };
-                self.finish(pid, result);
+                self.finish(tid, result);
             }
             Action::GetPgid { pid: target } => {
-                let result = (self.tasks.get(&target))
-                    .map_or(ESRCH.wrapping_neg(), |task| task.process.pgid);
-                self.finish(pid, result);
+                let result =
+                    (self.leader(target)).map_or(ESRCH.wrapping_neg(), |task| task.process().pgid);
+                self.finish(tid, result);
             }
         }
         true
     }
 
+    /// The process that thread `tid` belongs to.
+    fn pid_of(&self, tid: u32) -> u32 {
+        self.tasks[&tid].process().pid
+    }
+
+    /// The first thread of process `pid`, which stands for the process.
+    fn leader(&self, pid: u32) -> Option<&Task<V>> {
+        self.tasks.get(&pid).filter(|task| task.is_leader())
+    }
+
+    /// The other threads of `tid`'s process.
+    fn siblings(&self, tid: u32) -> Vec<u32> {
+        let task = &self.tasks[&tid];
+        (self.tasks.iter())
+            .filter(|&(&other, thread)| other != tid && thread.same_process(task))
+            .map(|(&other, _)| other)
+            .collect()
+    }
+
     /// The processes as `/proc` shows them.
     fn proc_entries(&self) -> Vec<ProcEntry> {
         (self.tasks.values())
+            .filter(|task| task.is_leader())
             .map(|task| {
                 let state = match task.state {
                     State::Runnable => b'R',
-                    State::Blocked => b'S',
+                    State::Blocked | State::Gone => b'S',
                     State::Zombie(_) => b'Z',
                 };
-                task.process.proc_entry(state)
+                task.process().proc_entry(state)
             })
             .collect()
     }
 
-    /// Return `value` from the system call `pid` is stopped on.
-    fn finish(&mut self, pid: u32, value: u32) {
-        let task = self.tasks.get_mut(&pid).unwrap();
-        task.vcpu.set_reg(A0, value);
-        task.vcpu.set_pc(task.vcpu.pc().wrapping_add(4));
+    /// Return `value` from the system call thread `tid` is stopped on.
+    fn finish(&mut self, tid: u32, value: u32) {
+        let task = self.tasks.get_mut(&tid).unwrap();
+        {
+            let mut vcpu = task.vcpu();
+            vcpu.set_reg(A0, value);
+            let pc = vcpu.pc();
+            vcpu.set_pc(pc.wrapping_add(4));
+        }
         task.state = State::Runnable;
     }
 
@@ -405,54 +549,162 @@ impl<V: Vcpu + Clone> Container<V> {
             return EAGAIN.wrapping_neg();
         }
         let pid = self.next_pid;
-        let task = self.tasks.get_mut(&parent).unwrap();
-        if parent_tid != 0 && task.vcpu.write_mem(parent_tid, &pid.to_le_bytes()).is_err() {
-            return EFAULT.wrapping_neg();
-        }
-        self.next_pid += 1;
-        let mut child = Task {
-            process: task.process.fork(pid),
-            vcpu: task.vcpu.clone(),
-            emulator: Emulator::default(),
-            state: State::Runnable,
+        let task = &self.tasks[&parent];
+        let (vcpu, process) = {
+            let mut vcpu = task.vcpu();
+            if parent_tid != 0 && vcpu.write_mem(parent_tid, &pid.to_le_bytes()).is_err() {
+                return EFAULT.wrapping_neg();
+            }
+            // Only the calling thread is copied, as on Linux
+            ((*vcpu).clone(), task.process().fork(pid))
         };
-        // The child returns 0 from the same `ecall`, on its own stack if given one.
-        child.vcpu.set_reg(A0, 0);
-        child.vcpu.set_pc(child.vcpu.pc().wrapping_add(4));
-        if stack != 0 {
-            child.vcpu.set_reg(SP, stack);
+        self.next_pid += 1;
+        let child = Task::new(pid, process, vcpu, Emulator::default());
+        {
+            // The child returns 0 from the same `ecall`, on its own stack if given one.
+            let mut vcpu = child.vcpu();
+            vcpu.set_reg(A0, 0);
+            let pc = vcpu.pc();
+            vcpu.set_pc(pc.wrapping_add(4));
+            if stack != 0 {
+                vcpu.set_reg(SP, stack);
+            }
         }
         self.tasks.insert(pid, child);
         pid
     }
 
-    /// Replace the image of `pid`. `Linux` has already checked that the program
-    /// loads, so the only failure left is arguments that overflow the stack.
-    /// That is past the point of no return, and Linux kills the process then too.
-    fn exec(&mut self, pid: u32, exec: Exec) {
-        let task = self.tasks.get_mut(&pid).unwrap();
-        task.process.sync_shared(&task.vcpu, None);
-        task.vcpu.reset();
+    /// Start a thread in `caller`'s process: the caller's registers, returning
+    /// 0 from the `ecall` on its own stack, with its own thread pointer.
+    fn thread(
+        &mut self,
+        caller: u32,
+        stack: u32,
+        tls: Option<u32>,
+        (parent_tid, child_tid): (u32, u32),
+        clear_child_tid: bool,
+    ) -> u32 {
+        if self.tasks.len() >= MAX_PROCESSES {
+            return EAGAIN.wrapping_neg();
+        }
+        let tid = self.next_pid;
+        let task = &self.tasks[&caller];
+        let context = {
+            let mut vcpu = task.vcpu();
+            for addr in [parent_tid, child_tid] {
+                if addr != 0 && vcpu.write_mem(addr, &tid.to_le_bytes()).is_err() {
+                    return EFAULT.wrapping_neg();
+                }
+            }
+            let mut regs: [u32; 32] = std::array::from_fn(|i| vcpu.reg(i));
+            regs[A0] = 0;
+            if stack != 0 {
+                regs[SP] = stack;
+            }
+            if let Some(tls) = tls {
+                regs[TP] = tls;
+            }
+            Context {
+                pc: vcpu.pc().wrapping_add(4),
+                regs,
+            }
+        };
+        self.next_pid += 1;
+        task.core.borrow_mut().saved.insert(tid, context);
+        if clear_child_tid {
+            task.process
+                .borrow_mut()
+                .clear_child_tid
+                .insert(tid, child_tid);
+        }
+        let thread = Task {
+            tid,
+            process: task.process.clone(),
+            core: task.core.clone(),
+            emulator: Emulator::default(),
+            state: State::Runnable,
+        };
+        self.tasks.insert(tid, thread);
+        tid
+    }
+
+    /// End thread `tid`. Its id is cleared where it asked, which wakes threads
+    /// that join it. The process ends with its last thread.
+    fn exit_thread(&mut self, tid: u32, termination: Termination) {
+        let live: Vec<u32> = (self.siblings(tid).into_iter())
+            .filter(|other| !matches!(self.tasks[other].state, State::Zombie(_) | State::Gone))
+            .collect();
+        if live.is_empty() {
+            self.terminate(tid, termination);
+            return;
+        }
+        let task = &self.tasks[&tid];
+        if let Some(addr) = task.process.borrow_mut().clear_child_tid.remove(&tid) {
+            let _ = task.vcpu().write_mem(addr, &[0; 4]);
+        }
+        {
+            let mut core = task.core.borrow_mut();
+            core.saved.remove(&tid);
+            if core.loaded == tid {
+                core.loaded = NOBODY;
+            }
+        }
+        if task.is_leader() {
+            self.tasks.get_mut(&tid).unwrap().state = State::Gone;
+        } else {
+            self.tasks.remove(&tid);
+        }
+    }
+
+    /// Replace the image of `tid`'s process. Its other threads end, and the
+    /// caller goes on as the process's only thread, with the process's id.
+    /// `Linux` has already checked that the program loads, so the only failure
+    /// left is arguments that overflow the stack. That is past the point of no
+    /// return, and Linux kills the process then too.
+    fn exec(&mut self, tid: u32, exec: Exec) {
+        let pid = self.pid_of(tid);
+        {
+            let task = &self.tasks[&tid];
+            let vcpu = task.vcpu();
+            task.process.borrow_mut().sync_shared(&*vcpu, None);
+        }
+        for other in self.siblings(tid) {
+            self.tasks.remove(&other);
+        }
+        let mut task = self.tasks.remove(&tid).unwrap();
+        task.tid = pid;
+        {
+            let mut core = task.core.borrow_mut();
+            core.saved.clear();
+            core.loaded = pid;
+            core.vcpu.reset();
+        }
+        task.process.borrow_mut().clear_child_tid.clear();
         task.emulator = Emulator::default();
         task.state = State::Runnable;
-        if load(task, &exec.elf, &exec.path, &exec.argv, &exec.envp).is_err() {
+        let loaded = load(&mut task, &exec.elf, &exec.path, &exec.argv, &exec.envp);
+        self.tasks.insert(pid, task);
+        if loaded.is_err() {
             self.terminate(pid, Termination::Killed(SIGSEGV));
         }
     }
 
-    /// Reap a zombie child of `pid`, or block until there is one. Returns false
-    /// if it blocked.
-    fn wait(&mut self, pid: u32, wait: Wait) -> bool {
+    /// Reap a zombie child of `tid`'s process, or block until there is one.
+    /// Returns false if it blocked.
+    fn wait(&mut self, tid: u32, wait: Wait) -> bool {
+        let pid = self.pid_of(tid);
         let children: Vec<(u32, State)> = self
             .tasks
             .iter()
             .filter(|(child, task)| {
-                task.process.ppid == pid && wait.pid.is_none_or(|wanted| wanted == **child)
+                task.is_leader()
+                    && task.process().ppid == pid
+                    && wait.pid.is_none_or(|wanted| wanted == **child)
             })
             .map(|(&child, task)| (child, task.state))
             .collect();
         if children.is_empty() {
-            self.finish(pid, ECHILD.wrapping_neg());
+            self.finish(tid, ECHILD.wrapping_neg());
             return true;
         }
         let zombie = children.iter().find_map(|&(child, state)| match state {
@@ -461,21 +713,21 @@ impl<V: Vcpu + Clone> Container<V> {
         });
         let Some((child, termination)) = zombie else {
             if !wait.nohang {
-                self.tasks.get_mut(&pid).unwrap().state = State::Blocked;
+                self.tasks.get_mut(&tid).unwrap().state = State::Blocked;
                 return false;
             }
             let cleared = match wait.report {
-                Report::Siginfo(info) => self.write(pid, info, &[0; 128]),
+                Report::Siginfo(info) => self.write(tid, info, &[0; 128]),
                 Report::Status(_) => true,
             };
-            self.finish(pid, if cleared { 0 } else { EFAULT.wrapping_neg() });
+            self.finish(tid, if cleared { 0 } else { EFAULT.wrapping_neg() });
             return true;
         };
         let (written, value) = match wait.report {
             Report::Status(0) => (true, child),
             Report::Status(status) => {
                 let word = termination.wait_status().to_le_bytes();
-                (self.write(pid, status, &word), child)
+                (self.write(tid, status, &word), child)
             }
             Report::Siginfo(info) => {
                 let (code, status) = match termination {
@@ -486,39 +738,39 @@ impl<V: Vcpu + Clone> Container<V> {
                 for (offset, field) in [(0, SIGCHLD), (8, code), (12, child), (20, status)] {
                     siginfo[offset..offset + 4].copy_from_slice(&field.to_le_bytes());
                 }
-                (self.write(pid, info, &siginfo), 0)
+                (self.write(tid, info, &siginfo), 0)
             }
         };
         if !written {
-            self.finish(pid, EFAULT.wrapping_neg());
+            self.finish(tid, EFAULT.wrapping_neg());
             return true;
         }
         self.tasks.remove(&child);
-        self.finish(pid, value);
+        self.finish(tid, value);
         true
     }
 
-    /// Send `signal` from `sender` to a pid, to a process group (0 for the
-    /// sender's, -g for group g), or to every process but init (-1). Handlers
-    /// never run, so a signal either kills its target or does nothing. Zombies
+    /// Send `signal` from thread `sender` to a pid, to a process group (0 for
+    /// the sender's, -g for group g), or to every process but init (-1). A
+    /// process's signals are its threads', so one of them handles it. Zombies
     /// count as targets, but are past killing.
     fn kill(&mut self, sender: u32, target: i32, signal: u32) {
         let group = |pgid: u32| -> Vec<u32> {
             let members = self
                 .tasks
                 .iter()
-                .filter(|(_, task)| task.process.pgid == pgid);
+                .filter(|(_, task)| task.is_leader() && task.process().pgid == pgid);
             members.map(|(&pid, _)| pid).collect()
         };
         let targets: Vec<u32> = match target {
-            1.. if self.tasks.contains_key(&(target as u32)) => vec![target as u32],
+            1.. if self.leader(target as u32).is_some() => vec![target as u32],
             1.. => Vec::new(),
-            0 => group(self.tasks[&sender].process.pgid),
+            0 => group(self.tasks[&sender].process().pgid),
             -1 => self
                 .tasks
-                .keys()
-                .copied()
-                .filter(|&pid| pid != INIT)
+                .iter()
+                .filter(|&(&pid, task)| pid != INIT && task.is_leader())
+                .map(|(&pid, _)| pid)
                 .collect(),
             _ => group(target.unsigned_abs()),
         };
@@ -527,57 +779,71 @@ impl<V: Vcpu + Clone> Container<V> {
             return;
         }
         for &pid in &targets {
-            let task = self.tasks.get_mut(&pid).unwrap();
+            let Some(task) = self.tasks.get(&pid) else {
+                continue;
+            };
             if matches!(task.state, State::Zombie(_)) {
                 continue;
             }
-            if let Some(termination) = task.process.signals.raise(signal) {
+            let killed = task.process.borrow_mut().signals.raise(signal);
+            if let Some(termination) = killed {
                 self.terminate(pid, termination);
             }
         }
-        if !matches!(self.tasks[&sender].state, State::Zombie(_)) {
+        if self
+            .tasks
+            .get(&sender)
+            .is_some_and(|task| !matches!(task.state, State::Zombie(_)))
+        {
             self.finish(sender, 0);
         }
     }
 
     /// A process other than init that faults is killed, as Linux would with
     /// SIGSEGV or SIGILL. A fault in init stops the container with the details.
-    fn fault(&mut self, pid: u32, exit: Exit) -> Result<(), RunError> {
-        if pid == INIT {
+    fn fault(&mut self, tid: u32, exit: Exit) -> Result<(), RunError> {
+        if self.pid_of(tid) == INIT {
             return Err(RunError::Fault(exit));
         }
-        self.faults.push((pid, exit));
+        self.faults.push((tid, exit));
         let signal = match exit.reason {
             ExitReason::IllegalInstruction(_) => SIGILL,
             ExitReason::Ebreak => SIGTRAP,
             _ => SIGSEGV,
         };
-        self.terminate(pid, Termination::Killed(signal));
+        self.terminate(tid, Termination::Killed(signal));
         Ok(())
     }
 
-    /// End `pid`: close its files, which closes pipe ends, and hand its children
-    /// to init.
-    fn terminate(&mut self, pid: u32, termination: Termination) {
+    /// End the process `tid` belongs to, all its threads with it: close its
+    /// files, which closes pipe ends, and hand its children to init.
+    fn terminate(&mut self, tid: u32, termination: Termination) {
+        let pid = self.pid_of(tid);
+        for other in self.siblings(pid) {
+            self.tasks.remove(&other);
+        }
         let task = self.tasks.get_mut(&pid).unwrap();
         task.state = State::Zombie(termination);
-        task.process.sync_shared(&task.vcpu, None);
-        task.process.release();
-        let ppid = task.process.ppid;
-        if let Some(parent) = self.tasks.get_mut(&ppid) {
-            // SIGCHLD is ignored by default, so this only queues it for a handler.
-            parent.process.signals.raise(SIGCHLD);
+        {
+            let vcpu = cpu(&task.core, pid);
+            let mut process = task.process.borrow_mut();
+            process.sync_shared(&*vcpu, None);
+            process.release();
         }
-        for task in self.tasks.values_mut() {
-            if task.process.ppid == pid {
-                task.process.ppid = INIT;
+        let ppid = task.process().ppid;
+        if let Some(parent) = self.leader(ppid) {
+            // SIGCHLD is ignored by default, so this only queues it for a handler.
+            parent.process.borrow_mut().signals.raise(SIGCHLD);
+        }
+        for task in self.tasks.values() {
+            if task.is_leader() && task.process().ppid == pid {
+                task.process.borrow_mut().ppid = INIT;
             }
         }
     }
 
-    fn write(&mut self, pid: u32, addr: u32, bytes: &[u8]) -> bool {
-        let task = self.tasks.get_mut(&pid).unwrap();
-        task.vcpu.write_mem(addr, bytes).is_ok()
+    fn write(&mut self, tid: u32, addr: u32, bytes: &[u8]) -> bool {
+        self.tasks[&tid].vcpu().write_mem(addr, bytes).is_ok()
     }
 }
 
@@ -590,19 +856,20 @@ fn load<V: Vcpu>(
     argv: &[impl AsRef<[u8]>],
     envp: &[impl AsRef<[u8]>],
 ) -> Result<(), StartError> {
-    let image = elf::load(&mut task.vcpu, elf)?;
-    let stack_top = task.vcpu.mem_size();
-    let sp = elf::setup_stack(&mut task.vcpu, &image, stack_top, argv, envp)?;
-    task.process
-        .exec(image.brk, stack_top.saturating_sub(STACK_SIZE));
-    task.process.set_command(argv, exe);
-    task.vcpu.set_reg(SP, sp);
-    task.vcpu.set_pc(image.entry);
+    let mut vcpu = task.vcpu();
+    let image = elf::load(&mut *vcpu, elf)?;
+    let stack_top = vcpu.mem_size();
+    let sp = elf::setup_stack(&mut *vcpu, &image, stack_top, argv, envp)?;
+    let mut process = task.process.borrow_mut();
+    process.exec(image.brk, stack_top.saturating_sub(STACK_SIZE));
+    process.set_command(argv, exe);
+    vcpu.set_reg(SP, sp);
+    vcpu.set_pc(image.entry);
     Ok(())
 }
 
 /// Print one system call the way `strace` would, more or less.
-fn trace(pid: u32, [nr, args @ ..]: [u32; 5], action: &Action) {
+fn trace(tid: u32, [nr, args @ ..]: [u32; 5], action: &Action) {
     let outcome = match action {
         Action::Return(value) => (*value as i32).to_string(),
         Action::Exec(exec) => {
@@ -616,7 +883,7 @@ fn trace(pid: u32, [nr, args @ ..]: [u32; 5], action: &Action) {
         other => format!("{other:?}"),
     };
     let [a0, a1, a2, a3] = args;
-    eprintln!("[{pid}] syscall {nr}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x}) -> {outcome}");
+    eprintln!("[{tid}] syscall {nr}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x}) -> {outcome}");
 }
 
 fn task_state<V>(tasks: &mut BTreeMap<u32, Task<V>>, pid: u32, state: State) {

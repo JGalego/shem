@@ -54,10 +54,13 @@ guest-tests: toolchain busybox-image
     docker build -q --target busybox --output type=local,dest=target/busybox toolchain
     mkdir -p target/guests
     just cc -O2 -o target/guests/hello guests/hello.c
+    just cc -O2 -o target/guests/threads guests/threads.c
     cargo test --release --test guests -- --ignored
 
 # Test the neural vCPU: its own unit tests, then against the reference vCPU; needs Docker and uv
 neural-tests: toolchain linux-image
+    mkdir -p target/guests
+    just cc -O2 -o target/guests/threads guests/threads.c
     docker build -q --target riscv-tests --output type=local,dest=target/riscv-tests toolchain
     uv run --project neural pytest -q neural/tests
     cargo test --release --test neural -- --ignored

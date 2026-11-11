@@ -409,11 +409,15 @@ def make_server(
                     response = bytes([Status.ERROR]) + f"{type(error).__name__}: {error}".encode()
                 write_frame(self.wfile, response)
 
-    socket_path.unlink(missing_ok=True)
-    server = socketserver.ThreadingUnixStreamServer(str(socket_path), Handler)
+    # Listen under a temporary name, then move the socket into place, so that
+    # clients waiting for it to appear never find it before it accepts them
+    staging = socket_path.with_name(f".{socket_path.name}.{os.getpid()}")
+    staging.unlink(missing_ok=True)
+    server = socketserver.ThreadingUnixStreamServer(str(staging), Handler)
     server.daemon_threads = True
     # Only this user, and root (as the containerd shim runs), may connect
-    os.chmod(socket_path, 0o600)
+    os.chmod(staging, 0o600)
+    os.replace(staging, socket_path)
     return server, registry
 
 

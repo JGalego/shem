@@ -30,6 +30,7 @@ const READ: u32 = 63;
 const WRITE: u32 = 64;
 const READV: u32 = 65;
 const READLINKAT: u32 = 78;
+const EXIT: u32 = 93;
 const EXIT_GROUP: u32 = 94;
 const KILL: u32 = 129;
 const RT_SIGACTION: u32 = 134;
@@ -589,6 +590,7 @@ fn shared_mappings_write_back_to_their_files() {
 }
 
 /// A pseudo-terminal: the host's side, and the side the guest gets.
+#[cfg(target_os = "linux")]
 fn pty() -> (std::fs::File, std::fs::File) {
     use std::os::fd::FromRawFd;
     // SAFETY: the usual posix_openpt sequence, on descriptors this test owns
@@ -609,6 +611,7 @@ fn pty() -> (std::fs::File, std::fs::File) {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn terminals_pass_through_to_the_host_terminal() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -827,9 +830,29 @@ fn process_calls_become_container_actions() {
         parent_tid: 0,
     };
     assert_eq!(g.action(CLONE, &[SIGCHLD, 0, 0, 0, 0]), fork);
+    // A thread: its stack, its TLS, and where its id goes
+    const CLONE_SETTLS: u32 = 0x80000;
+    const CLONE_PARENT_SETTID: u32 = 0x100000;
+    const CLONE_CHILD_CLEARTID: u32 = 0x200000;
+    let flags = CLONE_VM | CLONE_THREAD | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
     assert_eq!(
-        g.call(CLONE, &[CLONE_VM | CLONE_THREAD, 0, 0, 0, 0]),
-        EINVAL
+        g.action(CLONE, &[flags, 0x9000, 0x8100, 0x7000, 0x8100]),
+        Action::Thread {
+            stack: 0x9000,
+            tls: Some(0x7000),
+            parent_tid: 0x8100,
+            child_tid: 0x8100,
+            clear_child_tid: true,
+        }
+    );
+    assert_eq!(
+        g.call(CLONE, &[CLONE_THREAD, 0, 0, 0, 0]),
+        EINVAL,
+        "a thread shares memory"
+    );
+    assert_eq!(
+        g.action(EXIT, &[4]),
+        Action::ExitThread(Termination::Exited(4))
     );
 
     let status = g.buf(4);

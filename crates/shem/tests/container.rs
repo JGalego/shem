@@ -122,7 +122,7 @@ fn brk_grows_the_heap() {
     assert_eq!(out.result, Ok(99));
     // The whole file fits in one page, so the heap starts on the next one.
     assert_eq!(
-        out.container.init().process.mm.brk(),
+        out.container.init().process().mm.brk(),
         BASE + PAGE_SIZE + 256
     );
 }
@@ -197,7 +197,7 @@ fn mmap_returns_zeroed_pages_below_the_stack() {
         exit_a0(),
     ]);
     assert_eq!(out.result, Ok(0));
-    let addr = out.container.init().vcpu.reg(S0 as usize);
+    let addr = out.container.init().vcpu().reg(S0 as usize);
     assert_eq!(addr, MEM - STACK_SIZE - 2 * PAGE_SIZE);
 }
 
@@ -220,7 +220,7 @@ fn atomics_are_emulated_by_the_host() {
         &[],
     );
     assert_eq!(out.result, Ok(40));
-    let regs = [A1, A2, A3, A4].map(|r| out.container.init().vcpu.reg(r as usize));
+    let regs = [A1, A2, A3, A4].map(|r| out.container.init().vcpu().reg(r as usize));
     assert_eq!(regs, [40, 42, 0, 1]);
 }
 

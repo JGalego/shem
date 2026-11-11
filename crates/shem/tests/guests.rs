@@ -93,6 +93,23 @@ fn c_program_runs_against_musl() {
 
 #[test]
 #[ignore = "needs guest binaries: run `just guest-tests`"]
+fn pthreads_share_memory_and_take_turns() {
+    let path = built("guests/threads");
+    let elf = std::fs::read(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+    // musl gives each thread an 8 MiB stack
+    let (mut container, stdout) = start(&elf, &["threads"], &[], 64 << 20).unwrap();
+    assert_eq!(container.run(Some(MAX_STEPS)), Ok(0));
+    let out = String::from_utf8_lossy(&stdout.contents()).into_owned();
+    assert_eq!(out, "locked 10000 atomic 4000 thread-local 4000 main 0\n");
+    assert!(
+        container.linux.unsupported.is_empty(),
+        "{:?}",
+        container.linux.unsupported
+    );
+}
+
+#[test]
+#[ignore = "needs guest binaries: run `just guest-tests`"]
 fn busybox_applets_run_in_a_root_filesystem() {
     let busybox = built("busybox/bin/busybox");
     let root = tempfile::tempdir().unwrap();
