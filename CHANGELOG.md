@@ -29,12 +29,19 @@
 - Run model images in containers on the model server
 - A BuildKit frontend that lets docker build Shemfiles
 - Publish the compiled CPU's weights with a model card on Hugging Face
+- A Kubernetes RuntimeClass for shem, tested on kind
+- Live model sessions under docker run -i, docker exec and docker commit, and Kubernetes sandboxes
+- Programs as compiled layers, run exactly when a model calls them as tools
+- Shared writable file mappings, host terminals, and ppoll
+- List images under node platforms for Kubernetes on released containerd
+- Threads on any vCPU, futex, and a socket that appears only when it listens
 
 ### Fixes
 
 - Open the shim's stdin FIFO without waiting for a writer
 - Report a failed start on the container's stderr
 - Give docker a network namespace to configure, and end tasks killed before they start
+- Multi-turn sessions on every chat template, model sessions on GPUs, and the kubelet feature gate for riscv32 images
 
 ### Performance
 
@@ -74,3 +81,4 @@
 - Add MIT license
 - Format the shim's model test and the neural project lookup
 - Let the model card keep one line per paragraph
+- Licence notices for model images, SECURITY.md, a changelog, and a private model server socket
