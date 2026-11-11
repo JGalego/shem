@@ -12,6 +12,7 @@ import torch
 
 from .compile import compile_weights
 from .cpu import DTYPE, EBREAK, ECALL, FETCH_FAULT, ILLEGAL, MEMORY_FAULT, NeuralCpu, State
+from .memory import PagePool
 
 # Exit reasons on the wire, as `ExitReason` in the host
 BUDGET, EXIT_ECALL, EXIT_EBREAK, EXIT_ILLEGAL, EXIT_MEMORY_FAULT = range(5)
@@ -37,11 +38,13 @@ def _bits(value: int) -> torch.Tensor:
 
 
 class NeuralVcpu:
-    def __init__(self, mem_size: int, cpu: NeuralCpu | None = None, dense: bool = False):
+    def __init__(self, mem_size: int, cpu: NeuralCpu | None = None, dense: bool = False, pool: PagePool | None = None):
         """With `dense`, run the network as described, one-hot products and all;
-        otherwise use the fused executor, which computes the same thing faster."""
+        otherwise use the fused executor, which computes the same thing faster,
+        with memory paged from `pool`, shared with other vCPUs."""
         self.cpu = cpu or NeuralCpu(compile_weights(), fused=not dense)
-        self.state = State.zeros(1, mem_size, dense)
+        self.dense = dense
+        self.state = State.zeros(1, mem_size, dense, pool)
 
     @property
     def mem_size(self) -> int:
@@ -80,16 +83,21 @@ class NeuralVcpu:
         return slice(addr, addr + length)
 
     def read_mem(self, addr: int, length: int) -> bytes:
-        rows = self.state.mem.state[0, self._range(addr, length)]
-        return bytes(rows.to(torch.uint8).tolist())
+        self._range(addr, length)
+        return self.state.mem.get_bytes(0, addr, length)
 
     def write_mem(self, addr: int, data: bytes) -> None:
-        rows = self._range(addr, len(data))
-        self.state.mem.state[0, rows] = torch.tensor(list(data), dtype=DTYPE)
+        self._range(addr, len(data))
+        self.state.mem.set_bytes(0, addr, data)
 
     def reset(self) -> None:
-        dense = self.state.mem.dense
-        self.state = State.zeros(1, self.mem_size, dense)
+        pool = None if self.dense else self.state.mem.pool
+        self.state.mem.release()
+        self.state = State.zeros(1, self.mem_size, self.dense, pool)
+
+    def release(self) -> None:
+        """Give back this vCPU's memory, before dropping it."""
+        self.state.mem.release()
 
     def snapshot(self) -> bytes:
         regs = [self.reg(i) for i in range(32)]
@@ -121,6 +129,6 @@ class NeuralVcpu:
     def clone(self) -> "NeuralVcpu":
         """A copy for `fork`: same weights, copied state."""
         copy = NeuralVcpu.__new__(NeuralVcpu)
-        copy.cpu = self.cpu
+        copy.cpu, copy.dense = self.cpu, self.dense
         copy.state = self.state.clone()
         return copy

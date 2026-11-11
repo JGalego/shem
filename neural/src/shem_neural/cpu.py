@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from . import isa
-from .memory import DeltaMemory
+from .memory import DeltaMemory, PagedMemory, PagePool
 
 DTYPE = torch.float64
 TWO32 = 2.0**32
@@ -71,18 +71,41 @@ class State:
     pc: torch.Tensor  # (B,)
     pc_low: torch.Tensor  # (B, 2): the low bits of pc, for the alignment check
     regs: torch.Tensor  # (B, 32, 32): one row of bits per register
-    mem: DeltaMemory
+    mem: DeltaMemory | PagedMemory
     instret: torch.Tensor  # (B,)
 
     @classmethod
-    def zeros(cls, batch: int, mem_size: int, dense: bool = False) -> "State":
+    def zeros(cls, batch: int, mem_size: int, dense: bool = False, pool: PagePool | None = None) -> "State":
+        """Machines with zeroed registers and memory: a delta-rule state matrix
+        with `dense`, otherwise pages from `pool`."""
+        mem = DeltaMemory(batch, mem_size) if dense else PagedMemory(batch, mem_size, pool)
         return cls(
             pc=torch.zeros(batch, dtype=DTYPE),
             pc_low=torch.zeros(batch, 2, dtype=DTYPE),
             regs=torch.zeros(batch, 32, 32, dtype=DTYPE),
-            mem=DeltaMemory(batch, mem_size, dense),
+            mem=mem,
             instret=torch.zeros(batch, dtype=DTYPE),
         )
+
+    @classmethod
+    def stack(cls, states: list["State"]) -> "State":
+        """One batch of the given single machines, which hands their page
+        tables to the batch until `unstack` hands them back."""
+        return cls(
+            pc=torch.cat([s.pc for s in states]),
+            pc_low=torch.cat([s.pc_low for s in states]),
+            regs=torch.cat([s.regs for s in states]),
+            mem=PagedMemory.stack([s.mem for s in states]),
+            instret=torch.cat([s.instret for s in states]),
+        )
+
+    def unstack(self, states: list["State"]) -> None:
+        """Write each row of this batch back to the single machine it came from."""
+        for row, state in enumerate(states):
+            rows = slice(row, row + 1)
+            state.pc, state.pc_low = self.pc[rows].clone(), self.pc_low[rows].clone()
+            state.regs, state.instret = self.regs[rows].clone(), self.instret[rows].clone()
+            state.mem.table = self.mem.table[rows].clone()
 
     def clone(self) -> "State":
         return State(
@@ -127,11 +150,12 @@ class NeuralCpu:
         """The bits of x mod 2**32, for integers -2**34 < x < 2**34."""
         return self.decompose(x + 2.0**34, 35)[..., :32]
 
-    def step(self, s: State) -> tuple[torch.Tensor, torch.Tensor]:
+    def step(self, s: State, active: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Execute one instruction for every guest, updating `s` in place.
         Returns the exits, a (B, 5) one-hot or zero row in the order of the
         reason constants above, and each exit's detail: the faulting address,
-        or the instruction word for an illegal instruction."""
+        or the instruction word for an illegal instruction. Guests where the
+        optional 0/1 mask `active` is 0 are computed but commit nothing."""
         w = self.w
         batch = s.pc.shape[0]
         pc = s.pc
@@ -201,6 +225,8 @@ class NeuralCpu:
         ok = 1 - fetch_fault
         exits = torch.stack([ok * ecall, ok * ebreak, ok * (1 - legal), fetch_fault, ok * legal * memory_fault], -1)
         commit = 1 - exits.sum(-1)
+        if active is not None:
+            commit = commit * active
         info = exits[:, ILLEGAL] * word + exits[:, FETCH_FAULT] * pc + exits[:, MEMORY_FAULT] * addr
 
         # Results, wrapped to 32 bits

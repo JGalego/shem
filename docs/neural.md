@@ -57,7 +57,7 @@ The network as described, the **dense** executor, is the definition. The **fused
 
 | Unit | Dense | Fused |
 |---|---|---|
-| Memory read and write | One-hot keys and matrix products, O(memory) | Gather and accumulating scatter, O(1) |
+| Memory | A float64 delta-rule state, one row per byte; one-hot keys and matrix products, O(memory) per access | Bytes in shared 4 KiB pages with copy-on-write (see below); indexing, O(1) per access |
 | Bits of a value | 35 threshold layers | Shifts and masks |
 | Byte to bits, 5-bit index | One-hot times a table | Index into the table |
 | Division | 32 unrolled layers | Integer division, with RISC-V's rules for zero |
@@ -75,9 +75,33 @@ Tests check that the two agree unit by unit on random values, edge cases include
 
 `just neural-tests` runs them all, and CI runs them on every push.
 
+## Density
+
+Two things let one executor hold and run many guests.
+
+**Paged memory with copy-on-write** ([`memory.py`](../neural/src/shem_neural/memory.py)). The fused executor keeps memory as bytes in 4 KiB pages from a pool shared by every vCPU of the same memory size, with a page table per vCPU. A gated write with β = 1 is a store and β = 0 is nothing, exactly as in the delta rule, and tests check paged and delta-rule memory against each other on random traffic. Pages make guests cheap:
+
+- A fresh guest maps the zero page everywhere, so memory it never touches costs nothing.
+- `CLONE`, which is how `fork` reaches the model, copies the page table; a shared page is copied only when one of its holders first writes to it.
+- Whole pages the host writes, as `RESTORE` does with a snapshot, are interned by content. Containers resumed from the same warm image therefore share every page they have not written, as Linux's KSM would arrange.
+
+A test clones a vCPU 20 times and restores its snapshot into 20 more, and the pool holds no extra pages.
+
+**Continuous batching** ([`server.py`](../neural/src/shem_neural/server.py)). One executor thread steps every vCPU with a `RUN` in flight in the same forward pass. Their states stack cheaply, since registers and page tables are small and pages stay in the pool. A guest that exits or runs out of budget stops committing and gets its result; when another `RUN` arrives, the batch is rebuilt to include it. So independent containers, for example several `shem run --vcpu neural` processes, share forward passes without knowing about each other. A test runs six clients concurrently and checks every result, and that they shared a batch.
+
 ## Speed
 
-On one CPU core, the fused executor runs about 900 instructions per second for a single guest, measured on a loop. That is the same order as Qwenputer's published speed on a GPU. A forward pass is a few hundred small tensor operations, so the time goes to per-operation overhead rather than arithmetic, which is why batching many guests per pass is the way to throughput.
+On one CPU core, the fused executor runs about 900 instructions per second for one guest. That is the same order as Qwenputer's published speed on a GPU. A forward pass is a few hundred small tensor operations, so the time goes to per-operation overhead rather than arithmetic, and a batch of guests costs little more per step than one. [`bench.py`](../neural/bench.py), with every guest running a different loop:
+
+| Guests | Instructions/s, total | Per guest | Memory pages |
+|---|---|---|---|
+| 1 | 881 | 881 | 2 |
+| 8 | 5,725 | 716 | 9 |
+| 32 | 18,384 | 575 | 33 |
+| 64 | 27,985 | 437 | 65 |
+| 128 | 29,318 | 229 | 129 |
+
+Throughput grows almost linearly to 32 guests and keeps growing to 64, where one core runs 32 times as many instructions per second as with a single guest. This is design rule 2 measured: diverging guests do not slow each other down. The pages column counts the pool, the zero page included: each guest here holds one private page, 4 KiB, where a float64 delta-rule state for 1 MiB of memory would take 8 MiB.
 
 ## The protocol
 

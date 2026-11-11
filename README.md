@@ -22,7 +22,7 @@ Early, but both halves exist: the host, and a model to run guests on.
 - processes: `fork`, `execve`, `wait`, pipes, process groups and signal handlers, with the host as the kernel and a scheduler that gives each process a turn
 - `shem run`, which runs an executable as a container (`--trace` prints each system call)
 - images: `shem build` turns a [Shemfile](docs/shemfile.md) into a reproducible OCI image, and `WARM` freezes a running guest into it, so `shem run` resumes it where the build left off
-- a neural vCPU: an RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state, that matches the reference exactly on the official riscv-tests ([docs/neural.md](docs/neural.md))
+- a neural vCPU: an RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state, that matches the reference exactly on the official riscv-tests; it batches every running guest into one forward pass and shares memory pages between them ([docs/neural.md](docs/neural.md))
 
 See the [roadmap](docs/architecture.md#roadmap) for what comes next.
 

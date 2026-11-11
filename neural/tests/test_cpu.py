@@ -196,7 +196,7 @@ def test_a_batch_runs_different_programs_like_separate_vcpus():
 
     batch = State.zeros(len(programs), MEM)
     for k, code in enumerate(programs):
-        batch.mem.state[k, : len(code)] = torch.tensor(list(code), dtype=torch.float64)
+        batch.mem.set_bytes(k, 0, code)
     halted = torch.zeros(len(programs), dtype=torch.bool)
     for _ in range(100):
         exits, _ = CPU.step(batch)
@@ -205,5 +205,5 @@ def test_a_batch_runs_different_programs_like_separate_vcpus():
             break
     for k, vcpu in enumerate(alone):
         assert torch.equal(batch.regs[k], vcpu.state.regs[0])
-        assert torch.equal(batch.mem.state[k], vcpu.state.mem.state[0])
+        assert batch.mem.get_bytes(k, 0, MEM) == vcpu.read_mem(0, MEM)
         assert batch.pc[k] == vcpu.state.pc[0]
