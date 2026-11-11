@@ -4,7 +4,8 @@ name: Release
 #   - the shem and containerd-shim-shem crates on crates.io
 #   - the shem-neural package on PyPI
 #   - shem and containerd-shim-shem-v1 binaries, with build provenance, on the GitHub release
-#   - the guest toolchain image on GHCR, for amd64 and arm64
+#   - the guest toolchain image and the shem-neural runtime image on GHCR, for amd64 and arm64
+#   - the examples as shem images on GHCR: programs, a warm shell, a booted Linux, and models
 #   - release notes from the conventional commits since the last tag
 # Running it by hand builds and checks everything, and publishes nothing.
 
@@ -84,8 +85,13 @@ jobs:
           path: shem-*.tar.gz*
 
   images:
-    name: Toolchain image
+    name: Image (${{ matrix.image }})
     needs: verify
+    strategy:
+      matrix:
+        include:
+          - { image: shem-toolchain, context: toolchain, target: toolchain }
+          - { image: shem-neural, context: neural, target: "" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -95,7 +101,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shem-toolchain" >> "$GITHUB_OUTPUT"
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.image }}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -107,9 +113,11 @@ jobs:
       - uses: docker/build-push-action@v7
         id: build
         with:
-          context: toolchain
-          target: toolchain
+          context: ${{ matrix.context }}
+          target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
+          sbom: true
+          provenance: mode=max
           push: ${{ github.ref_type == 'tag' }}
           tags: |
             ${{ steps.image.outputs.name }}:${{ needs.verify.outputs.version }}
@@ -120,6 +128,46 @@ jobs:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+  examples:
+    name: Example images
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: oras-project/setup-oras@v2.0.3
+      - uses: docker/login-action@v4
+        if: github.ref_type == 'tag'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build shem and the images the examples copy from
+        run: |
+          cargo build --release --locked -p shem
+          docker build -q --target toolchain -t shem-toolchain toolchain
+          docker build -q --target busybox -t shem-busybox toolchain
+      - name: Build the examples, and push them on a release
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          PUSH: ${{ github.ref_type == 'tag' }}
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shem"
+          for example in hello warm-shell linux qwen3 qwen3.5 golem; do
+            target/release/shem build -t "$example" "examples/$example"
+            if [ "$PUSH" = true ]; then
+              target/release/shem push "$example" "$repo/$example:$VERSION"
+              target/release/shem push "$example" "$repo/$example:latest"
+            fi
+            # Models are big: drop each one's download and image once it is out
+            rm -rf ~/.cache/huggingface ~/.local/share/shem/images/"$example"
+          done
 
   crates:
     name: Publish to crates.io
@@ -162,7 +210,7 @@ jobs:
 
   release:
     name: GitHub release
-    needs: [verify, binaries, images, crates, pypi]
+    needs: [verify, binaries, images, examples, crates, pypi]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
