@@ -246,6 +246,9 @@ fn launch<V: Vcpu + Clone>(
             bail!("--root is for executables: an image brings its own filesystem");
         }
         let image = load_image(&args.target)?;
+        if image::model::is_driver(&image.config.entrypoint) {
+            return run_model(args, &image);
+        }
         let dir = tempfile::tempdir()?;
         if image.config.kernel.is_some() {
             return run_vm(args, &image, dir.path(), |mem| vcpu(mem, vm::RAM_BASE));
@@ -289,9 +292,21 @@ fn load_image(target: &str) -> anyhow::Result<Image> {
     }
     let path = Store::open()?.path(target)?;
     if !path.join("oci-layout").is_file() {
-        bail!("{target}: no such executable or image (see `shem images`)");
+        let Some(host) = registry_host(target) else {
+            bail!("{target}: no such executable or image (see `shem images`)");
+        };
+        // Like `docker run`, pull an image from a registry the first time
+        let plain_http = host.starts_with("localhost") || host.starts_with("127.0.0.1");
+        let digest = image::pull(target, &path, plain_http)?;
+        eprintln!("shem: pulled {target} {digest}");
     }
     Image::read_layout(&path)
+}
+
+/// The registry a reference names, such as ghcr.io in ghcr.io/me/app:1.0.
+fn registry_host(reference: &str) -> Option<&str> {
+    let (first, _) = reference.split_once('/')?;
+    (first.contains('.') || first.contains(':') || first == "localhost").then_some(first)
 }
 
 fn build(args: BuildArgs) -> anyhow::Result<u8> {
@@ -349,6 +364,19 @@ fn run_vm<V: Vcpu>(
     let machine = image::start_vm(image, vcpu, stdio_console(), root, mem)
         .with_context(|| format!("starting {}", args.target))?;
     finish_vm(machine, args.max_steps, args.stats)
+}
+
+/// Run an image whose entrypoint is a driver, such as a model's
+/// `shem:generate`, on its filesystem, unpacked once and cached.
+fn run_model(args: &RunArgs, image: &Image) -> anyhow::Result<u8> {
+    let digest = Image::layout_digest(&image_dir(&args.target)?)?;
+    let root = Store::open()?.rootfs(image, &digest)?;
+    let input = if args.args.is_empty() {
+        &image.config.cmd
+    } else {
+        &args.args
+    };
+    image::model::run_driver(&image.config.entrypoint, input, &root)
 }
 
 /// A console on this process's stdin and stdout.

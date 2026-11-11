@@ -14,6 +14,7 @@
 mod build;
 mod docker;
 mod layer;
+pub mod model;
 mod registry;
 pub mod shemfile;
 
@@ -42,7 +43,7 @@ const REF_NAME: &str = "org.opencontainers.image.ref.name";
 /// Layers are stored compressed with zstd, their media types suffixed as OCI
 /// has it; in memory they are plain tars.
 const COMPRESSED: &str = "+zstd";
-const ZSTD_LEVEL: i32 = 9;
+const ZSTD_LEVEL: i32 = 3;
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// How to run an image.
@@ -64,6 +65,9 @@ pub struct Config {
     /// The kernel command line, if not the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootargs: Option<String>,
+    /// A model image's model: the directory holding its `shem.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,6 +404,24 @@ impl Store {
         Ok(Self {
             root: home.join("images"),
         })
+    }
+
+    /// A directory holding the filesystem of the image whose manifest digest
+    /// is `digest`, unpacked once and kept: images are immutable, and a model
+    /// is too big to unpack for every run.
+    pub fn rootfs(&self, image: &Image, digest: &str) -> anyhow::Result<PathBuf> {
+        let hex = digest
+            .strip_prefix("sha256:")
+            .context("unsupported digest")?;
+        let cache = self.root.with_file_name("rootfs");
+        let dir = cache.join(hex);
+        if !dir.is_dir() {
+            std::fs::create_dir_all(&cache)?;
+            let staging = tempfile::tempdir_in(&cache)?;
+            image.unpack_rootfs(staging.path())?;
+            std::fs::rename(staging.keep(), &dir)?;
+        }
+        Ok(dir)
     }
 
     /// Where the image `reference` (`name` or `name:tag`) lives.

@@ -1,0 +1,4 @@
+# Qwen3-0.6B as an image: its weights, from Hugging Face, one layer per block.
+# shem:generate is the entrypoint the base sets; CMD is the default prompt.
+FROM hf.co/Qwen/Qwen3-0.6B
+CMD ["Introduce yourself in one sentence."]

@@ -15,6 +15,7 @@ shem treats the host as a hypervisor and a model as the machine. The model suppl
 
 Early, but every part of the design exists, from the reference vCPU to a model running guests.
 
+- **Model images** (`shem build`, `shem run`). `FROM hf.co/Qwen/Qwen3-0.6B` turns a Hugging Face model into an image, one layer per block, described by a model-agnostic manifest of typed blocks: attention, Gated DeltaNet and MLP. `shem run` starts a session with a prompt, and images push to and pull from OCI registries. Qwen3-0.6B and Qwen3.5-0.8B, with its Gated DeltaNet layers, match their transformers implementations ([docs/models.md](docs/models.md)).
 - **Containers** (`shem run`). The host is the guest's kernel: static RV32 Linux programs run with files from a host directory as their root, processes (`fork`, `execve`, `wait`, pipes, signal handlers), a virtual clock, and atomics emulated so the vCPU stays RV32IM. C programs linked against musl and a static [🧰 BusyBox](https://busybox.net) run, `sh` pipelines and job control included, and so do `ps`, `df` and `free`, on a `/proc` the host makes up. `--trace` prints each system call.
 - **Images** (`shem build`). A [Shemfile](docs/shemfile.md) becomes a reproducible OCI image. `WARM` freezes a running guest into the image at build time, so `shem run` resumes it where the build left off. `shem push` and `shem pull` move images through OCI registries.
 - **VM mode** (`shem boot`). The host is the machine around a guest kernel, emulating the privileged architecture, a timer, a UART and a syscon: a no-MMU [🐧 Linux](https://kernel.org) 6.8 boots to a shell in two seconds. A VM image can ship Linux already booted, so `shem run` starts at its prompt, on either vCPU ([docs/vm.md](docs/vm.md)).
@@ -26,70 +27,58 @@ See the [roadmap](docs/architecture.md#roadmap) for what is next.
 
 ## Getting started
 
-Run a container inside the model with Docker. You need [🦀 Rust](https://www.rust-lang.org) 1.88 or later, [🐳 Docker](https://www.docker.com) 23 or later, [⚡ uv](https://docs.astral.sh/uv/) and `sudo`.
+Build an image from a language model, run it, and share it through a registry. The base image is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B). You need [🦀 Rust](https://www.rust-lang.org) 1.88 or later and [⚡ uv](https://docs.astral.sh/uv/). Pushing needs [🗄️ ORAS](https://oras.land) and a registry login.
 
-Build the containerd shim.
-
-```sh
-cargo build --release -p containerd-shim-shem
-```
-
-Install it where containerd looks for shims.
+Install shem.
 
 ```sh
-sudo install target/release/containerd-shim-shem-v1 /usr/local/bin/
+cargo install --path crates/shem
 ```
 
-Start the model in the background.
+Build an image from the model's Shemfile.
 
 ```sh
-uv run --project neural python -m shem_neural.server --socket /tmp/shem-neural.sock &
+shem build -t qwen3 examples/qwen3
 ```
 
-Build an RV32 image.
+Run a session with a prompt.
 
 ```sh
-docker build --platform linux/riscv32 -t hello examples/hello
+shem run qwen3 "What is a golem?"
 ```
 
-Run it on shem's reference vCPU.
+Push the image to a registry.
 
 ```sh
-docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 hello
+shem push qwen3 ghcr.io/<you>/qwen3:0.6b
 ```
 
-Run it inside the model.
+Run it from the registry anywhere.
 
 ```sh
-docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 --annotation dev.shem.vcpu=neural hello
+shem run ghcr.io/<you>/qwen3:0.6b "Say hi in Portuguese"
 ```
 
-The `shem` CLI does more: Shemfiles with `WARM` ([docs/shemfile.md](docs/shemfile.md)), VM mode with Linux ([docs/vm.md](docs/vm.md)) and the neural vCPU on GPUs ([docs/neural.md](docs/neural.md)).
+[`examples/qwen3.5`](examples/qwen3.5/Shemfile) builds Qwen3.5-0.8B, whose Gated DeltaNet layers keep a fixed-size memory in place of a growing cache. [docs/models.md](docs/models.md) explains model images, and the `shem` CLI also runs RV32 programs and Linux ([docs/shemfile.md](docs/shemfile.md), [docs/vm.md](docs/vm.md)).
 
 ### Cleaning up
 
-Stop the model.
+Remove the images and their unpacked copies.
 
 ```sh
-kill %1
+rm -rf ~/.local/share/shem
 ```
 
-Remove the image.
+Remove the downloaded checkpoint.
 
 ```sh
-docker rmi hello
+rm -rf ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B
 ```
 
-Uninstall the shim.
+Uninstall shem.
 
 ```sh
-sudo rm /usr/local/bin/containerd-shim-shem-v1
-```
-
-Remove the build outputs.
-
-```sh
-cargo clean
+cargo uninstall shem
 ```
 
 ## Layout
@@ -109,13 +98,14 @@ crates/shem/src/
   mm.rs          the guest address space: heap and anonymous mappings
   container.rs   container mode: processes, the scheduler, fork, exec and wait
   neural.rs      the neural vCPU, as the host reaches it over a socket
-  image/         images: Shemfile parser, builder, OCI layouts, the local store
+  image/         images: Shemfile parser, builder, OCI layouts, the local store, model images
   vm.rs          VM mode: the machine around a guest kernel, and its snapshots
   fdt.rs         device tree writer
   main.rs        the shem CLI
 crates/shem/tests/  unit, integration and guest-program tests
 crates/containerd-shim-shem/  the containerd shim
 neural/         the neural vCPU: ISA table, weight compiler, network, executors, server
+  src/shem_neural/model/  model images: manifest, block types, importers, tokenizer, the generate driver
   jobs/gpu.py    GPU differential test and benchmark, for Hugging Face Jobs
 toolchain/      the guest toolchain image and the riscv-tests environment
 guests/         C guest programs
@@ -124,6 +114,7 @@ docs/
   architecture.md  design, tech stack and roadmap
   neural.md        how the neural vCPU works, and its protocol
   vm.md            VM mode
+  models.md        model images
   containerd.md    the containerd shim
   shemfile.md      the Shemfile and the image format
 ```

@@ -5,10 +5,20 @@ description = "A neural vCPU for shem: an RV32IM CPU compiled into network weigh
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["numpy>=2", "safetensors>=0.4", "torch>=2.5"]
+dependencies = [
+    "huggingface-hub>=2.4.0",
+    "jinja2>=3.1.6",
+    "numpy>=2",
+    "safetensors>=0.4",
+    "tokenizers>=0.23.3",
+    "torch>=2.5",
+]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "pytest>=8",
+    "transformers>=5.22.2",
+]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
