@@ -163,9 +163,13 @@ jobs:
           PUSH: ${{ github.ref_type == 'tag' }}
         run: |
           repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shem"
+          # Every example is built. Only those whose whole contents carry their
+          # licences are published: warm-shell and linux hold GPL binaries
+          # (BusyBox, a prebuilt kernel), so they stay build-it-yourself.
+          published=" hello qwen3 qwen3.5 golem "
           for example in hello warm-shell linux qwen3 qwen3.5 golem; do
             target/release/shem build -t "$example" "examples/$example"
-            if [ "$PUSH" = true ]; then
+            if [ "$PUSH" = true ] && [ "${published#* $example }" != "$published" ]; then
               target/release/shem push "$example" "$repo/$example:$VERSION"
               target/release/shem push "$example" "$repo/$example:latest"
             fi

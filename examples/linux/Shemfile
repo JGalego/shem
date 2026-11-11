@@ -8,5 +8,7 @@ RUN unzip /linux.zip -d /linux
 
 FROM scratch
 COPY --from=kernel /linux/Image /boot/Image
+# Linux and its BusyBox initramfs are GPL-2.0, prebuilt by mini-rv32ima-images
+LABEL org.opencontainers.image.licenses="GPL-2.0-only" org.opencontainers.image.source="https://github.com/cnlohr/mini-rv32ima-images"
 KERNEL /boot/Image
 WARM --until=output:"~ # "

@@ -37,6 +37,13 @@ type Import struct {
 	Name, Repo, Revision string
 }
 
+// An Imported model: its files, relative to the model's directory, and the
+// SPDX licence its model card declares, if any.
+type Imported struct {
+	Files   []string
+	License string
+}
+
 type stage struct {
 	from  *parser.Node
 	nodes []*parser.Node
@@ -95,10 +102,9 @@ func Imports(src []byte) ([]Import, error) {
 	return imports, nil
 }
 
-// Transpile writes the Dockerfile for a Shemfile, given the files of each
-// import (paths relative to the model's directory, by import name), and the
-// image that runs shem's neural side.
-func Transpile(src []byte, files map[string][]string, neuralImage string) (string, error) {
+// Transpile writes the Dockerfile for a Shemfile, given what each import
+// holds (by import name), and the image that runs shem's neural side.
+func Transpile(src []byte, imported map[string]Imported, neuralImage string) (string, error) {
 	globals, stages, err := parse(src)
 	if err != nil {
 		return "", err
@@ -143,15 +149,19 @@ func Transpile(src []byte, files map[string][]string, neuralImage string) (strin
 		case isModel:
 			name := fmt.Sprintf("shem-import-%d", imports)
 			imports++
-			list, ok := files[name]
+			model, ok := imported[name]
 			if !ok {
 				return "", fmt.Errorf("no files for the import of %s", repo)
 			}
 			write("FROM scratch%s", as(part(0)))
-			for _, line := range modelCopies(name, list) {
+			for _, line := range modelCopies(name, model.Files) {
 				write("%s", line)
 			}
 			write(`LABEL dev.shem.machine="rv32im" dev.shem.model="%s"`, modelDir)
+			write(`LABEL org.opencontainers.image.source=%s`, jsonString("https://huggingface.co/"+repo))
+			if model.License != "" {
+				write(`LABEL org.opencontainers.image.licenses=%s`, jsonString(model.License))
+			}
 			write(`ENTRYPOINT ["shem:generate"]`)
 			entrypoint = []string{"shem:generate"}
 		case !shem && !strings.Contains(flags, "--platform"):

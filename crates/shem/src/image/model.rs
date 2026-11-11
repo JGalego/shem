@@ -79,6 +79,24 @@ pub fn import(repo: &str, revision: Option<&str>, out: &Path) -> anyhow::Result<
     Ok(())
 }
 
+/// The standard OCI labels for an imported model: where it comes from, and
+/// the licence its model card declares, which also travels as the model's
+/// `LICENSE` and `NOTICE` files.
+pub fn labels(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(MODEL_DIR).join("shem.json"))?)?;
+    let source = &manifest["source"];
+    let mut labels = Vec::new();
+    if let Some(repo) = source["repo"].as_str() {
+        let url = format!("https://huggingface.co/{repo}");
+        labels.push(("org.opencontainers.image.source".into(), url));
+    }
+    if let Some(spdx) = source["spdx"].as_str() {
+        labels.push(("org.opencontainers.image.licenses".into(), spdx.into()));
+    }
+    Ok(labels)
+}
+
 /// The model's files under `root`, grouped into layers: the directories and
 /// small files first, then each weights file alone, or a few together when
 /// there would otherwise be too many layers. Paths are relative to `root`.

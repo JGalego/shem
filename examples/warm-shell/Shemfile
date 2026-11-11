@@ -6,5 +6,7 @@ FROM shem-busybox AS busybox
 FROM scratch
 COPY --from=busybox / /
 ENV PATH=/bin:/sbin:/usr/bin:/usr/sbin
+# BusyBox is GPL-2.0, built from its source by toolchain/Dockerfile
+LABEL org.opencontainers.image.licenses="GPL-2.0-only" org.opencontainers.image.source="https://busybox.net/downloads/busybox-1.38.0.tar.bz2"
 ENTRYPOINT ["/bin/sh"]
 WARM --until=syscall:read
