@@ -99,6 +99,8 @@ Its socket is open only to its user (and root). A CI job runs a prompt, piped tu
 
 ## Running
 
+Run the model server on a GPU when there is one: `--device auto` (the default) picks one, and `--device cpu` or `--device cuda` choose. [`jobs/models_gpu.py`](../neural/jobs/models_gpu.py) checks both models on a GPU against the CPU (logits, greedy replies, and a session saved on the GPU that continues identically) and times them, on Hugging Face Jobs.
+
 `shem run` unpacks a model image once, into `$SHEM_HOME/rootfs/<digest>`, and the driver loads the weights from there. The runtime computes in float32 on the CPU, so sessions are repeatable: Qwen3-0.6B replies at about five tokens a second.
 
 ## Next

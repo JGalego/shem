@@ -16,6 +16,23 @@ from shem_neural.model.tokenizer import Tokenizer
 pytestmark = pytest.mark.skipif(not os.environ.get("SHEM_MODEL_TESTS"), reason="set SHEM_MODEL_TESTS=1")
 
 REPOS = ["Qwen/Qwen3-0.6B", "Qwen/Qwen3.5-0.8B"]
+_IMPORTED: dict = {}
+
+
+@pytest.fixture(scope="module")
+def imports(tmp_path_factory):
+    """Each model imported once for the whole module: an import is a gigabyte."""
+
+    def get(repo):
+        if repo not in _IMPORTED:
+            out = tmp_path_factory.mktemp(repo.replace("/", "-"))
+            import_model(repo, out)
+            _IMPORTED[repo] = out
+        return _IMPORTED[repo]
+
+    return get
+
+
 MESSAGES = [{"role": "user", "content": "Name three uses of clay."}]
 
 
@@ -27,10 +44,10 @@ def reference(repo: str):
 
 
 @pytest.mark.parametrize("repo", REPOS)
-def test_imported_models_match_transformers(repo, tmp_path):
-    import_model(repo, tmp_path)
-    model = Model(tmp_path)
-    tokenizer = Tokenizer(tmp_path, model.manifest.tokenizer)
+def test_imported_models_match_transformers(repo, imports):
+    directory = imports(repo)
+    model = Model(directory)
+    tokenizer = Tokenizer(directory, model.manifest.tokenizer)
     prompt = tokenizer.chat(MESSAGES)
     ref = reference(repo)
 
@@ -53,12 +70,11 @@ def test_imported_models_match_transformers(repo, tmp_path):
 
 
 @pytest.mark.parametrize("repo", REPOS)
-def test_saved_sessions_continue_as_if_never_stopped(repo, tmp_path):
+def test_saved_sessions_continue_as_if_never_stopped(repo, imports, tmp_path):
     from shem_neural.model.generate import Session, reply
 
-    import_model(repo, tmp_path / "model")
-    model = Model(tmp_path / "model")
-    tokenizer = Tokenizer(tmp_path / "model", model.manifest.tokenizer)
+    model = Model(imports(repo))
+    tokenizer = Tokenizer(imports(repo), model.manifest.tokenizer)
     system = [{"role": "system", "content": "You are a golem. Answer in one sentence."}]
     conversation = tokenizer.chat(system + MESSAGES)
 
@@ -73,3 +89,34 @@ def test_saved_sessions_continue_as_if_never_stopped(repo, tmp_path):
     assert conversation[: len(resumed.tokens)] == resumed.tokens
     resumed.feed(conversation[len(resumed.tokens) :])
     assert reply(resumed, tokenizer, 16, out=open(os.devnull, "w")) == want
+
+
+@pytest.mark.parametrize("repo", REPOS)
+def test_conversations_take_turns_and_survive_a_save(repo, imports):
+    import io
+
+    from shem_neural.model.generate import Session, converse
+
+    model = Model(imports(repo))
+    tokenizer = Tokenizer(imports(repo), model.manifest.tokenizer)
+    end_of_turn = tokenizer.inner.token_to_id("<|im_end|>")
+    assert end_of_turn in tokenizer.eos, "replies stop at the end of the turn"
+
+    def turn(session, text):
+        out = io.StringIO()
+        converse(session, tokenizer, text, 24, out)
+        return out.getvalue()
+
+    turns = ["My name is Joana.", "What did I just tell you my name is?", "Say it once more."]
+    whole = Session(model)
+    whole.messages = [{"role": "system", "content": "Answer in one short sentence."}]
+    want = [turn(whole, text) for text in turns]
+
+    saved = Session(model)
+    saved.messages = list(whole.messages[:1])
+    got = [turn(saved, turns[0])]
+    for text in turns[1:]:
+        saved = Session.from_files(model, saved.to_files())
+        got.append(turn(saved, text))
+    assert got == want
+    assert "Joana" in want[1], want

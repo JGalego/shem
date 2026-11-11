@@ -15,7 +15,9 @@ owns, one per block per session: the host's to inspect, snapshot and restore.
 
 RMSNorms take an `offset` added to their weights: 0 for the usual norm, 1
 for zero-centred weights. Weights load in their stored type and compute in
-`dtype`, float32 by default, so runs are repeatable on a CPU.
+`dtype`, float32 by default, on the CPU or a GPU (`device`, where `auto`
+picks a GPU if there is one). TF32 is off on GPUs, so a prompt gets the same
+reply each time on the same device.
 """
 
 from pathlib import Path
@@ -180,6 +182,13 @@ BLOCKS: dict[str, type[Block]] = {
 }
 
 
+def resolve_device(device: str) -> torch.device:
+    """`auto` is a GPU when there is one, and the CPU otherwise."""
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    return torch.device(device)
+
+
 class Model:
     """A model loaded from its manifest's directory, ready to run sessions."""
 
@@ -187,6 +196,11 @@ class Model:
         self.directory = Path(directory)
         self.manifest = Manifest.load(self.directory)
         self.dtype = dtype
+        self.device = resolve_device(device)
+        device = str(self.device)
+        if self.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
 
         def tensors(spec: BlockSpec) -> dict[str, torch.Tensor]:
             loaded = load_file(str(self.directory / spec.file), device=device)
@@ -211,7 +225,7 @@ class Model:
     def forward(self, tokens: torch.Tensor, state: list, start: int) -> torch.Tensor:
         """Next-token logits (batch, tokens, vocabulary) for `tokens`, which
         continue a session at position `start` whose blocks' state is `state`."""
-        x = self.embed[tokens]
+        x = self.embed[tokens.to(self.device)]
         for block, block_state in zip(self.blocks, state, strict=True):
             x = block.forward(x, block_state, start)
         p = self.head_params

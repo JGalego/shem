@@ -6,6 +6,9 @@ updates:
     directory: /
     schedule: { interval: weekly }
     commit-message: { prefix: ci }
+    ignore:
+      # Its ref is a Rust version, not the action's: @1.88 is the MSRV job's toolchain
+      - dependency-name: dtolnay/rust-toolchain
     groups:
       actions: { patterns: ["*"] }
   - package-ecosystem: cargo

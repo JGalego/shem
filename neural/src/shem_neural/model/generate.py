@@ -51,7 +51,7 @@ class Session:
 
     def tensors(self) -> dict[str, torch.Tensor]:
         return {
-            f"{i}.{name}": tensor.contiguous()
+            f"{i}.{name}": tensor.contiguous().cpu()
             for i, block in enumerate(self.state)
             if block
             for name, tensor in block.items()
@@ -90,16 +90,18 @@ class Session:
         session.messages = meta.get("messages", [])
         for key, tensor in tensors.items():
             block, name = key.split(".", 1)
-            session.state[int(block)][name] = tensor.to(model.dtype)
+            session.state[int(block)][name] = tensor.to(device=model.device, dtype=model.dtype)
         return session
 
 
 def next_turn(session: Session, tokenizer: Tokenizer, text: str) -> list[int]:
     """The tokens that take `session` from where it is to the start of the
     model's reply to the user's `text`. A conversation that has not replied
-    yet must be the start of the new one, token for token; after a reply, the
-    turn is the chat template's text after that reply, which works whatever
-    the template does to earlier turns, such as dropping their reasoning."""
+    yet must be the start of the new one, token for token. After a reply, the
+    turn is the chat template's text after that reply, found before the new
+    message, which works whatever the template does to earlier turns, such as
+    trimming them or dropping their reasoning. If the reply cannot be found,
+    the session starts over and reads the whole conversation again."""
     messages = session.messages + [{"role": "user", "content": text}]
     if not session.messages or session.messages[-1]["role"] != "assistant":
         tokens = tokenizer.chat(messages)
@@ -109,10 +111,12 @@ def next_turn(session: Session, tokenizer: Tokenizer, text: str) -> list[int]:
             )
         return tokens[len(session.tokens) :]
     rendered = tokenizer.render(messages)
-    last = session.messages[-1]["content"]
-    at = rendered.rfind(last)
+    last = session.messages[-1]["content"].strip()
+    end = rendered.rfind(text) if text else len(rendered)
+    at = rendered.rfind(last, 0, end if end >= 0 else len(rendered)) if last else -1
     if at < 0:
-        raise ValueError("the chat template does not repeat the last reply")
+        session.state, session.tokens = session.model.init_state(), []
+        return tokenizer.chat(messages)
     return tokenizer.encode(rendered[at + len(last) :])
 
 
@@ -123,7 +127,7 @@ def converse(session: Session, tokenizer: Tokenizer, text: str, max_tokens: int,
     replied = reply(session, tokenizer, max_tokens, out)
     session.messages += [
         {"role": "user", "content": text},
-        {"role": "assistant", "content": tokenizer.decode(replied)},
+        {"role": "assistant", "content": tokenizer.decode(replied).strip()},
     ]
     return replied
 
@@ -157,6 +161,7 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
     parser.add_argument("--session", type=Path, help="continue the session saved here")
     parser.add_argument("--stats", action="store_true", help="print the token rate to stderr")
     parser.add_argument("--keep", action="store_true", help="in a container, keep the session open for docker exec")
+    parser.add_argument("--device", default="auto", help="cpu, cuda, or auto: a GPU if there is one")
     if model is not None:
         parser.add_argument("prompt", nargs="*")
         args = parser.parse_intermixed_args(argv)
@@ -201,7 +206,7 @@ def run(model: Model, tokenizer: Tokenizer, args: argparse.Namespace, prompt: st
 
 def main() -> None:
     args = options(sys.argv[1:])
-    model = Model(args.model)
+    model = Model(args.model, device=args.device)
     tokenizer = Tokenizer(args.model, model.manifest.tokenizer)
     prompt = " ".join(args.prompt) or ("" if args.warm else sys.stdin.read())
     try:

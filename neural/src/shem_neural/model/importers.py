@@ -153,11 +153,21 @@ IMPORTERS: dict[str, Callable[[Writer], tuple[BlockSpec, BlockSpec, dict]]] = {
 
 
 def eos_tokens(checkpoint: Checkpoint, cfg: dict) -> list[int]:
+    """The tokens that end a reply: the generation config's and the model
+    config's end-of-sequence tokens, and the tokenizer's `eos_token`, which
+    for chat models is the end of a turn (`<|im_end|>`) and is sometimes
+    declared nowhere else."""
     ids = []
     generation = checkpoint.directory / "generation_config.json"
     for source in (json.loads(generation.read_text()) if generation.exists() else {}, cfg, checkpoint.config):
         value = source.get("eos_token_id")
         ids += value if isinstance(value, list) else [value] if value is not None else []
+    settings = checkpoint.directory / "tokenizer_config.json"
+    if settings.exists():
+        token = json.loads(settings.read_text()).get("eos_token")
+        token = token.get("content") if isinstance(token, dict) else token
+        added = json.loads((checkpoint.directory / "tokenizer.json").read_text()).get("added_tokens", [])
+        ids += [entry["id"] for entry in added if token and entry["content"] == token]
     return sorted(set(ids))
 
 

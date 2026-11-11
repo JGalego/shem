@@ -70,7 +70,8 @@ class Models:
     model share its weights, however many containers unpack it; and the live
     sessions of running containers, by the ID the shim gives them."""
 
-    def __init__(self):
+    def __init__(self, device: str = "auto"):
+        self.device = device
         self.loaded: dict[str, tuple] = {}
         self.sessions: dict[str, Live] = {}
         self.lock = threading.Lock()
@@ -82,7 +83,7 @@ class Models:
         key = hashlib.sha256((directory / "shem.json").read_bytes()).hexdigest()
         with self.lock:
             if key not in self.loaded:
-                model = Model(directory)
+                model = Model(directory, device=self.device)
                 self.loaded[key] = (model, Tokenizer(directory, model.manifest.tokenizer))
             return self.loaded[key]
 
@@ -347,11 +348,13 @@ def write_frame(stream, payload: bytes) -> None:
     stream.flush()
 
 
-def make_server(socket_path: Path, dense: bool = False) -> tuple[socketserver.BaseServer, Registry]:
+def make_server(
+    socket_path: Path, dense: bool = False, device: str = "auto"
+) -> tuple[socketserver.BaseServer, Registry]:
     """A server on `socket_path`, not yet serving, and its registry of vCPUs."""
     torch.set_num_threads(1)  # tiny tensors: threads only add overhead
     registry = Registry(dense)
-    models = Models()
+    models = Models(device)
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
@@ -386,8 +389,8 @@ def make_server(socket_path: Path, dense: bool = False) -> tuple[socketserver.Ba
     return server, registry
 
 
-def serve(socket_path: Path, dense: bool = False) -> None:
-    server, _ = make_server(socket_path, dense)
+def serve(socket_path: Path, dense: bool = False, device: str = "auto") -> None:
+    server, _ = make_server(socket_path, dense, device)
     with server:
         print(f"shem-neural: serving vCPUs on {socket_path}", file=sys.stderr, flush=True)
         server.serve_forever()
@@ -397,9 +400,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--socket", type=Path, required=True, help="Unix socket to listen on")
     parser.add_argument("--dense", action="store_true", help="run the network densely, without fused kernels")
+    parser.add_argument("--device", default="auto", help="where models run: cpu, cuda, or auto (a GPU if there is one)")
     args = parser.parse_args()
     try:
-        serve(args.socket, args.dense)
+        serve(args.socket, args.dense, args.device)
     except KeyboardInterrupt:
         pass
 

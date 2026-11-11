@@ -26,6 +26,8 @@ Restart containerd.
 sudo systemctl restart containerd
 ```
 
+The kubelet must ask for images by runtime class, or it looks for `linux/amd64` ones and reports `ErrImageNeverPull` or pulls the wrong platform: turn on the `RuntimeClassInImageCriApi` feature gate (in the kubelet's configuration, `featureGates: {RuntimeClassInImageCriApi: true}`).
+
 ## In the cluster
 
 Create the RuntimeClass.

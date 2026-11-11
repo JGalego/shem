@@ -151,16 +151,18 @@ model-containers-test:
 
     echo "--- a prompt"
     check "." "$(timeout 300 $run --rm qwen3 --max-tokens 16 'Say hello in Portuguese.')"
+    # A system prompt keeps a 0.6B model on task; each check reads one reply
+    sys="Answer in one short sentence."
     echo "--- turns on stdin"
-    check "joana" "$(printf 'My name is Joana.\nWhat did I just tell you my name is?\n' | timeout 300 $run -i --rm qwen3 --max-tokens 24)"
+    check "joana" "$(printf 'My name is Joana.\nWhat did I just tell you my name is?\n' | timeout 300 $run -i --rm qwen3 --system "$sys" --max-tokens 24 | tail -1)"
     echo "--- a live session, exec and commit"
-    $run -d --name live qwen3 --keep --max-tokens 24 'My name is Joana.'
+    $run -d --name live qwen3 --keep --system "$sys" --max-tokens 24 'My name is Joana.'
     until [ -n "$(docker logs live 2>&1)" ]; do sleep 2; done
     sleep 8
     check "joana" "$(timeout 300 docker exec live shem:generate 'What did I just tell you my name is?')"
     docker commit live qwen3-remembers >/dev/null
     timeout 30 docker rm -f live >/dev/null
-    check "joana" "$(timeout 300 $run --rm qwen3-remembers --max-tokens 24 'Tell me my name again.')"
+    check "joana" "$(timeout 300 $run --rm qwen3-remembers --max-tokens 24 'What did I tell you my name is?')"
 
 # Run an RV32 program in a Pod on shem, in a kind cluster; needs Docker, kind and kubectl
 kubernetes-test:
@@ -170,7 +172,9 @@ kubernetes-test:
     cargo build --release --target x86_64-unknown-linux-musl -p containerd-shim-shem
     docker build -q --platform linux/riscv32 -t shem-k8s-hello:latest examples/hello
     kind delete cluster --name shem >/dev/null 2>&1 || true
-    kind create cluster --name shem --wait 120s
+    # The kubelet asks for images by runtime class, so it finds linux/riscv32 ones
+    printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nfeatureGates:\n  RuntimeClassInImageCriApi: true\n' > target/kind.yaml
+    kind create cluster --name shem --config target/kind.yaml --wait 120s
     node=shem-control-plane
     docker cp target/x86_64-unknown-linux-musl/release/containerd-shim-shem-v1 "$node:/usr/local/bin/"
     printf '%s\n' "" \
