@@ -185,6 +185,28 @@ The slower suites are ignored tests that need inputs built first: guest programs
 - **Docs have no hard wraps.** Each paragraph or list item is one line.
 - **Commit messages are one line**, in the form `<type>: <message>`, with a type such as `feat`, `fix`, `docs`, `test`, `ci`, `perf` or `refactor`.
 
+### Release
+
+A release publishes the `shem` and `containerd-shim-shem` crates on crates.io, the `shem-neural` package on PyPI, binaries for Linux (x86_64 and arm64) and macOS (arm64) with build provenance on the GitHub release, and the guest toolchain image on GHCR, with release notes from the commit messages ([`release.yml`](.github/workflows/release.yml)). CI packages everything on every push, so a release does not fail on packaging.
+
+Set the same version in [`Cargo.toml`](Cargo.toml) and [`neural/pyproject.toml`](neural/pyproject.toml), and commit it.
+
+```sh
+git commit -am "chore: release 0.2.0"
+```
+
+Tag the commit and push the tag.
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Before the first release, set up publishing once:
+
+- **crates.io**: add a `CARGO_REGISTRY_TOKEN` secret for the first publish, then configure trusted publishing for both crates (repository `JGalego/shem`, workflow `release.yml`, environment `release`) and delete the secret.
+- **PyPI**: add a pending trusted publisher for `shem-neural` (repository `JGalego/shem`, workflow `release.yml`, environment `pypi`).
+- **GitHub**: create the `release` and `pypi` environments, with required reviewers if you want to approve each publish.
+
 ### Contribute
 
 Fork the repository, make your change on a branch with its tests and docs, and open a pull request once CI is green. For a change to the design, open an issue first. Contributions are under the [MIT license](LICENSE).
