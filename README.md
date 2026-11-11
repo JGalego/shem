@@ -15,7 +15,7 @@ shem treats the host as a hypervisor and a model as the machine. The model suppl
 
 Early, but every part of the design exists, from the reference vCPU to a model running guests.
 
-- **Model images** (`shem build`, `shem run`). `FROM hf.co/Qwen/Qwen3-0.6B` turns a Hugging Face model into an image, one layer per block, described by a model-agnostic manifest of typed blocks: attention, Gated DeltaNet and MLP. `shem run` starts a session with a prompt, and images push to and pull from OCI registries. Qwen3-0.6B and Qwen3.5-0.8B, with its Gated DeltaNet layers, match their transformers implementations ([docs/models.md](docs/models.md)).
+- **Model images** (`shem build`, `shem run`). `FROM hf.co/Qwen/Qwen3-0.6B` turns a Hugging Face model into an image, one layer per block, described by a model-agnostic manifest of typed blocks: attention, Gated DeltaNet and MLP. `shem run` starts a session with a prompt, and images push to and pull from OCI registries. `docker build` builds them too, through shem's BuildKit frontend. Qwen3-0.6B and Qwen3.5-0.8B, with its Gated DeltaNet layers, match their transformers implementations ([docs/models.md](docs/models.md)).
 - **Containers** (`shem run`). The host is the guest's kernel: static RV32 Linux programs run with files from a host directory as their root, processes (`fork`, `execve`, `wait`, pipes, signal handlers), a virtual clock, and atomics emulated so the vCPU stays RV32IM. C programs linked against musl and a static [🧰 BusyBox](https://busybox.net) run, `sh` pipelines and job control included, and so do `ps`, `df` and `free`, on a `/proc` the host makes up. `--trace` prints each system call.
 - **Images** (`shem build`). A [Shemfile](docs/shemfile.md) becomes a reproducible OCI image. `WARM` freezes a running guest into the image at build time, so `shem run` resumes it where the build left off. `shem push` and `shem pull` move images through OCI registries.
 - **VM mode** (`shem boot`). The host is the machine around a guest kernel, emulating the privileged architecture, a timer, a UART and a syscon: a no-MMU [🐧 Linux](https://kernel.org) 6.8 boots to a shell in two seconds. A VM image can ship Linux already booted, so `shem run` starts at its prompt, on either vCPU ([docs/vm.md](docs/vm.md)).
@@ -104,6 +104,7 @@ crates/shem/src/
   main.rs        the shem CLI
 crates/shem/tests/  unit, integration and guest-program tests
 crates/containerd-shim-shem/  the containerd shim
+frontend/       the BuildKit frontend, in Go, that lets docker build Shemfiles
 neural/         the neural vCPU: ISA table, weight compiler, network, executors, server
   src/shem_neural/model/  model images: manifest, block types, importers, tokenizer, the generate driver
   jobs/gpu.py    GPU differential test and benchmark, for Hugging Face Jobs
@@ -129,6 +130,7 @@ docs/
 - [🐳 Docker](https://www.docker.com) for the guest toolchain image and the ordinary stages of a Shemfile ([`toolchain/`](toolchain/)).
 - [🦎 Zig](https://ziglang.org) to compile guest programs for RV32 against musl.
 - [📦 containerd](https://containerd.io) to run shem containers under Docker and containerd.
+- [🐹 Go](https://go.dev) for the BuildKit frontend, the language BuildKit's frontend API is written in ([`frontend/`](frontend/)).
 
 ### Set up
 

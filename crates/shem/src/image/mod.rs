@@ -318,11 +318,27 @@ impl Image {
             Ok(data)
         };
         let index: Index = serde_json::from_slice(&std::fs::read(dir.join("index.json"))?)?;
-        let entry = index
+        let mut entry = index
             .manifests
             .first()
-            .context("the image layout has no manifest")?;
-        let manifest: Manifest = serde_json::from_slice(&blob(entry)?)?;
+            .context("the image layout has no manifest")?
+            .clone();
+        // An index, such as the manifest list BuildKit writes beside its
+        // attestations, holds the image for linux/riscv32 among others
+        let mut data = blob(&entry)?;
+        while let Ok(nested) = serde_json::from_slice::<Index>(&data) {
+            let riscv = |d: &&Descriptor| {
+                d.platform
+                    .as_ref()
+                    .is_some_and(|p| p["architecture"] == "riscv32")
+            };
+            entry = (nested.manifests.iter().find(riscv))
+                .or(nested.manifests.first())
+                .context("an index in the image layout lists no manifests")?
+                .clone();
+            data = blob(&entry)?;
+        }
+        let manifest: Manifest = serde_json::from_slice(&data)?;
         let config = match manifest.config.media_type.as_str() {
             OCI_CONFIG_TYPE | DOCKER_CONFIG_TYPE => {
                 Config::from_oci(&serde_json::from_slice(&blob(&manifest.config)?)?)?

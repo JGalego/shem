@@ -103,6 +103,35 @@ jobs:
       - name: Build it with docker build and run it with docker run on shem
         run: just docker-test
 
+  frontend:
+    name: BuildKit frontend (docker build)
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: frontend/go.mod
+          cache-dependency-path: frontend/go.sum
+      - name: Vet and test the transpiler
+        working-directory: frontend
+        run: |
+          go vet ./...
+          go test ./...
+      - name: docker build a Shemfile through the frontend
+        run: |
+          docker build -q -t localhost:5000/shem-dockerfile:ci frontend
+          docker push -q localhost:5000/shem-dockerfile:ci
+          mkdir -p target/frontend-test
+          printf '# syntax=localhost:5000/shem-dockerfile:ci\nFROM alpine:3.22 AS build\nRUN echo built > /msg\nFROM scratch\nCOPY --from=build /msg /msg\nKERNEL /boot/Image console=ttyS0\nENTRYPOINT ["/bin/hello"]\n' > target/frontend-test/Dockerfile
+          docker build --platform linux/riscv32 -t frontend-test target/frontend-test
+          docker image inspect frontend-test --format '{{.Os}}/{{.Architecture}} {{json .Config.Labels}}' | tee target/frontend-test/out
+          grep -q 'linux/riscv32 .*"dev.shem.kernel":"/boot/Image"' target/frontend-test/out
+
   package:
     name: Package (dry run)
     runs-on: ubuntu-latest
