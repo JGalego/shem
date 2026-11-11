@@ -9,5 +9,6 @@ pub mod elf;
 pub mod emulate;
 pub mod linux;
 pub mod mm;
+pub mod neural;
 pub mod reference;
 pub mod vcpu;

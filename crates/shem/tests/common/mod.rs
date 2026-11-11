@@ -26,11 +26,11 @@ pub const A7: u32 = 17;
 pub const ECALL: u32 = 0x0000_0073;
 pub const EBREAK: u32 = 0x0010_0073;
 
-fn r(f7: u32, f3: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+pub fn r(f7: u32, f3: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
     f7 << 25 | rs2 << 20 | rs1 << 15 | f3 << 12 | rd << 7 | 0x33
 }
 
-fn i(op: u32, f3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
+pub fn i(op: u32, f3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
     (imm as u32 & 0xfff) << 20 | rs1 << 15 | f3 << 12 | rd << 7 | op
 }
 

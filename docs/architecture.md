@@ -65,13 +65,13 @@ Two requirements follow for a neural vCPU:
 | Part | Choice | Why |
 |---|---|---|
 | Runtime, CLI, system-call layer, reference vCPU, image store | Rust | The system-call layer is the security boundary; Firecracker, crosvm, youki and runwasi are Rust for the same reason. The reference vCPU has to be fast enough to run build-time snapshots. Ships as one static binary. |
-| Neural vCPU: weight compiler and GPU executor | Python, PyTorch, Triton (planned, in `neural/`) | The GPU ecosystem. Gated DeltaNet kernels already exist in Triton ([flash-linear-attention](https://github.com/fla-org/flash-linear-attention)). |
-| Host to neural vCPU | A small KVM-style RPC over a Unix socket (planned) | One GPU executor serves many containers. An RPC per exit is small next to about 1 ms per guest instruction. |
+| Neural vCPU: weight compiler and executor | Python and PyTorch, in [`neural/`](../neural/); Triton kernels for GPUs later | The GPU ecosystem. The executor runs on CPUs today; Gated DeltaNet kernels already exist in Triton ([flash-linear-attention](https://github.com/fla-org/flash-linear-attention)). |
+| Host to neural vCPU | A small KVM-style protocol over a Unix socket ([neural.md](neural.md#the-protocol)) | One executor serves many containers. A request per exit is small next to about 1 ms per guest instruction. |
 | Images | OCI image spec and registries | Digests, layer sharing, signing and existing registries for free |
 | Docker integration | A containerd shim, as runwasi does for Wasm (planned) | `docker run --runtime io.containerd.shem.v1` through Docker's containerd image store |
 | Builds | Own builder first, then a BuildKit frontend in Go (planned) | BuildKit frontends are written in Go |
 | Guest toolchain | Zig (`zig cc`) targeting `riscv32-linux-musl`, in [`toolchain/Dockerfile`](../toolchain/Dockerfile) | One hermetic binary that builds musl and compiler-rt for the exact target CPU. Works the same on x86-64 and arm64 hosts. |
-| Testing | `cargo test`; the official riscv-tests (`just guest-tests`); Spike as a golden model (planned); differential traces between neural and reference vCPUs (planned) | |
+| Testing | `cargo test`; the official riscv-tests (`just guest-tests`); differential tests of the neural vCPU against the reference (`just neural-tests`); Spike as a golden model (planned) | |
 
 ## Roadmap
 
@@ -79,7 +79,7 @@ Two requirements follow for a neural vCPU:
 2. **ISA compliance.** Done: all 60 tests in the official rv32ui, rv32um and rv32ua suites pass, the last through host emulation. Still to do: cross-check against Spike.
 3. **Real programs.** Done for single processes. C programs linked against musl run, and so does a static BusyBox with a host directory as its root filesystem (`shem run --root`): text tools, `sha256sum`, `awk`, `find`, file and directory operations, `date` and `sleep` on the virtual clock, and `sh` scripts that use only builtins. Not yet: `df` and anything else that reads `/proc`.
 4. **Processes.** Done. `fork` (and `vfork`, as a copy), `execve` with `#!` scripts, `wait4` and `waitid`, pipes, process groups, and signals delivered to real handlers: the host pushes a frame onto the guest stack and returns through an `rt_sigreturn` trampoline. A round-robin scheduler gives each process a slice of instructions in turn, and parks a process whose system call cannot finish yet, retrying the call on its next turn. BusyBox `sh` runs pipelines, command substitution, background jobs and `trap` handlers. Not yet: threads, file-backed `mmap`, `/proc` and terminals.
-5. **Neural vCPU.** A weight compiler and Triton executor behind the KVM-style RPC, with differential trace tests against the reference vCPU.
+5. **Neural vCPU.** Done. An RV32IM CPU compiled into network weights, one instruction per forward pass, with memory and registers in delta-rule state, served to the host over a Unix socket ([neural.md](neural.md)). It matches the reference vCPU exactly on all 60 riscv-tests, on random programs, on resuming a reference snapshot, and on forking containers. It runs about 900 instructions per second on one CPU core.
 6. **Images.** A Shemfile builder that writes OCI layouts, plus `WARM` snapshots. See [shemfile.md](shemfile.md).
 7. **Density.** Many guests batched on one GPU, and paged state with copy-on-write.
 8. **VM mode.** `shem boot`, virtual devices, a no-MMU Linux kernel.

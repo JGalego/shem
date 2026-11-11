@@ -13,7 +13,7 @@ The name comes from the golem legend: a clay figure comes to life when a *shem*,
 
 ## Status
 
-Early. What works today is the host side, running on a reference vCPU:
+Early, but both halves exist: the host, and a model to run guests on.
 
 - an RV32IM interpreter that defines correct behaviour for any neural vCPU, and passes the official riscv-tests suites
 - host emulation of the A extension (atomics), so the vCPU itself stays RV32IM
@@ -21,12 +21,13 @@ Early. What works today is the host side, running on a reference vCPU:
 - a Linux system-call layer: files and directories in a host directory used as the guest's root, `brk` and anonymous `mmap`, and a virtual clock, enough for C programs linked against musl and for a static BusyBox
 - processes: `fork`, `execve`, `wait`, pipes, process groups and signal handlers, with the host as the kernel and a scheduler that gives each process a turn
 - `shem run`, which runs an executable as a container (`--trace` prints each system call)
+- a neural vCPU: an RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state, that matches the reference exactly on the official riscv-tests ([docs/neural.md](docs/neural.md))
 
-There is no neural vCPU yet. See the [roadmap](docs/architecture.md#roadmap).
+See the [roadmap](docs/architecture.md#roadmap) for what comes next.
 
 ## Quickstart
 
-You need Rust 1.88 or later, [just](https://github.com/casey/just) and [pre-commit](https://pre-commit.com). Building guest programs also needs Docker.
+You need Rust 1.88 or later, [just](https://github.com/casey/just) and [pre-commit](https://pre-commit.com). Building guest programs also needs Docker, and the neural vCPU needs [uv](https://docs.astral.sh/uv/).
 
 ```sh
 just build                                  # build target/release/shem
@@ -36,10 +37,15 @@ just hooks                                  # install the git hooks
 just cc -O2 -o target/hello guests/hello.c  # compile a C guest with the toolchain image
 just run target/hello one two               # run it as a container
 just guest-tests                            # build and run riscv-tests, the C guests and BusyBox
+just neural-tests                           # test the neural vCPU, alone and against the reference
 
 # after `just guest-tests`, BusyBox and its rootfs are in target/busybox
 just run --root target/busybox target/busybox/bin/busybox ls -l /bin
 just run --root target/busybox target/busybox/bin/busybox sh -c 'ls /bin | wc -l'
+
+# run a guest on the neural vCPU
+just neural-server &
+just run --vcpu neural --neural-socket /tmp/shem-neural.sock --mem 1M target/riscv-tests/rv32ui-add
 ```
 
 Guest programs are static RV32 Linux executables. `just cc` builds them with Zig against musl, for RV32IMA with soft float; see [`toolchain/`](toolchain/).
@@ -60,12 +66,15 @@ crates/shem/src/
     abi.rs       system call numbers, errno values, flags and structs
   mm.rs          the guest address space: heap and anonymous mappings
   container.rs   container mode: processes, the scheduler, fork, exec and wait
+  neural.rs      the neural vCPU, as the host reaches it over a socket
   main.rs        the shem CLI
 crates/shem/tests/  unit, integration and guest-program tests
+neural/         the neural vCPU: ISA table, weight compiler, network, executor, server
 toolchain/      the guest toolchain image and the riscv-tests environment
 guests/         C guest programs
 docs/
   architecture.md  design, tech stack and roadmap
+  neural.md        how the neural vCPU works, and its protocol
   shemfile.md      the Shemfile and image format (draft)
 ```
 

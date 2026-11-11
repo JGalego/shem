@@ -62,3 +62,18 @@ jobs:
       - uses: extractions/setup-just@v4
       - name: Build guests in Docker and run them
         run: just guest-tests
+
+  neural:
+    name: Neural vCPU (against the reference)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: neural/uv.lock
+      - uses: extractions/setup-just@v4
+      - name: Unit tests, then riscv-tests and random programs on both vCPUs
+        run: just neural-tests

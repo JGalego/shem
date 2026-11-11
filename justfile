@@ -55,3 +55,13 @@ guest-tests: toolchain
     mkdir -p target/guests
     just cc -O2 -o target/guests/hello guests/hello.c
     cargo test --release --test guests -- --ignored
+
+# Test the neural vCPU: its own unit tests, then against the reference vCPU; needs Docker and uv
+neural-tests: toolchain
+    docker build -q --target riscv-tests --output type=local,dest=target/riscv-tests toolchain
+    uv run --project neural pytest -q neural/tests
+    cargo test --release --test neural -- --ignored
+
+# Serve neural vCPUs on a Unix socket, for `shem run --vcpu neural`
+neural-server socket="/tmp/shem-neural.sock":
+    uv run --project neural python -m shem_neural.server --socket {{ socket }}
