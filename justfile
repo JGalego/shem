@@ -100,6 +100,6 @@ containerd-test: toolchain
     cat target/oci-hello/out.txt
     echo "ctr run exited with status $status (the program exits with its argument count, 3)"
     if ! grep -q "sum of squares below 100000" target/oci-hello/out.txt; then
-        sudo journalctl -u containerd --no-pager -n 60 || true
+        sudo journalctl -u containerd --no-pager | grep -iE 'shem|error|warn' | tail -30 || true
         exit 1
     fi

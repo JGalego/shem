@@ -3,7 +3,7 @@
 //! kill and delete the container.
 
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
@@ -174,13 +174,20 @@ impl shim::Task for Service {
         let bundle = Bundle::load(&bundle_dir).map_err(error)?;
         let state = self.task.clone();
         std::thread::spawn(move || {
-            let status = stdio(&streams.0, &streams.1, &streams.2)
-                .map_err(anyhow::Error::from)
-                .and_then(|stdio| bundle::run(&bundle, stdio, &kill))
-                .unwrap_or_else(|err| {
+            let status = match stdio(&streams.0, &streams.1, &streams.2) {
+                Ok(stdio) => bundle::run(&bundle, stdio, &kill).unwrap_or_else(|err| {
+                    // Tell whoever reads the container's stderr, such as ctr.
                     warn!("the container failed: {err:#}");
+                    if let Ok(mut stderr) = OpenOptions::new().write(true).open(&streams.2) {
+                        let _ = writeln!(stderr, "containerd-shim-shem: {err:#}");
+                    }
                     125
-                });
+                }),
+                Err(err) => {
+                    warn!("opening the container's streams: {err}");
+                    125
+                }
+            };
             let (lock, exited) = &*state;
             if let Some(task) = lock.lock().unwrap().as_mut() {
                 task.status = api::Status::STOPPED;
