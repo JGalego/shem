@@ -215,7 +215,13 @@ Before the first release, set up publishing once:
 - **PyPI**: add a pending trusted publisher for `shem-neural` (repository `JGalego/shem`, workflow `release.yml`, environment `pypi`).
 - **GitHub**: create the `release` and `pypi` environments, with required reviewers if you want to approve each publish.
 - **Hugging Face**: create a `huggingface` environment with an `HF_TOKEN` secret, a fine-grained token that can write to `JGalego/shem-rv32im` (or set the `HF_REPO` variable to publish elsewhere).
+- **Homebrew** (optional): create the repository `JGalego/homebrew-shem` and a `HOMEBREW_TAP_TOKEN` secret that can push to it; without them the formula is only attached to the release.
+- **GitHub Pages**: in the repository's settings, set Pages to deploy from GitHub Actions, and set the repository variable `DOCS_SITE` to `true`, for the docs site.
 - **GHCR**: after the first release, make the new packages public (each package's settings, then "Change visibility"): `shem-toolchain`, `shem-neural` and the examples under `shem/`.
+
+### Contribute
+
+Install a release's binaries without compiling, with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) (`cargo binstall shem`) or Homebrew (`brew install jgalego/shem/shem`, once the tap exists).
 
 ### Contribute
 

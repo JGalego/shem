@@ -1,0 +1,47 @@
+name: Docs
+
+# The docs site: docs/ built with mdBook and published on GitHub Pages. Every
+# run builds the book; it deploys once Pages is on and the repository
+# variable DOCS_SITE is true.
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**", "book.toml", ".github/workflows/docs.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: latest
+      - name: Point links to source files at GitHub, then build
+        run: |
+          # Links that leave docs/ (../crates/..., ../examples/...) work on GitHub, not on the site
+          sed -i -E 's#\]\(\.\./([^)]*)\)#](https://github.com/JGalego/shem/blob/main/\1)#g' docs/*.md
+          mdbook build
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: book
+
+  deploy:
+    needs: build
+    if: vars.DOCS_SITE == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
