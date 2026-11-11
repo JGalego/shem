@@ -3,10 +3,10 @@
 A model image packages a language model's weights, tokenizer and optional session state in OCI layers. `shem run` starts or resumes a text-generation session; `shem push` and `shem pull` transfer the image through a registry.
 
 ```sh
-shem build -t qwen3 examples/qwen3          # Qwen3-0.6B from Hugging Face, one layer per block
-shem run qwen3 "What is a golem?"           # a session: the prompt in, the reply out
-shem push qwen3 ghcr.io/me/qwen3:0.6b       # to a registry
-shem run ghcr.io/me/qwen3:0.6b "Olá"        # elsewhere: pulled on first use, then run
+shem build -t qwen3 examples/qwen3             # Qwen3-0.6B from Hugging Face, one layer per block
+shem run qwen3 "What is a golem?"              # a session: the prompt in, the reply out
+shem push qwen3 ghcr.io/your-user/qwen3:0.6b   # to a registry
+shem run ghcr.io/your-user/qwen3:0.6b "Olá"    # elsewhere: pulled on first use, then run
 ```
 
 `docker build` builds model images too, through shem's BuildKit frontend: add `# syntax=ghcr.io/jgalego/shem/dockerfile:latest` as the first line ([shemfile.md](shemfile.md#with-docker-build)). The [Qwen3](../examples/qwen3/Dockerfile), [Qwen3.5](../examples/qwen3.5/Dockerfile) and [golem](../examples/golem/Dockerfile) examples include Dockerfiles.

@@ -3,12 +3,12 @@
 A Shemfile describes a shem image, the way a Dockerfile describes a container image. It uses Dockerfile syntax, keeps Docker's instructions where their meaning carries over, and adds `WARM`, which freezes a running guest into the image.
 
 ```sh
-shem build -t hello examples/hello       # build into the local image store
-shem run hello                           # run it
-shem images                              # list the store
-shem build -o hello.oci examples/hello   # or write an OCI image layout directory
-shem push hello ghcr.io/me/hello:1.0     # push to an OCI registry
-shem pull ghcr.io/me/hello:1.0           # pull into the store, and run it by that name
+shem build -t hello examples/hello            # build into the local image store
+shem run hello                                # run it
+shem images                                   # list the store
+shem build -o hello.oci examples/hello        # or write an OCI image layout directory
+shem push hello ghcr.io/your-user/hello:1.0   # push to an OCI registry
+shem pull ghcr.io/your-user/hello:1.0         # pull into the store, and run it by that name
 ```
 
 ## With docker build
@@ -23,7 +23,7 @@ CMD ["Who are you?"]
 WARM --until=prompt
 ```
 
-The published frontend and runtime images currently target `linux/amd64`.
+The published frontend and runtime images are built for `linux/amd64` and `linux/arm64`.
 
 ```sh
 docker build --platform linux/riscv32 -t golem .

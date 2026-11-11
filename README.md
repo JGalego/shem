@@ -40,13 +40,13 @@ shem run qwen3 "What is a golem?"
 To share the image, install [🗄️ ORAS](https://oras.land) and log in to your registry:
 
 ```sh
-shem push qwen3 ghcr.io/<you>/qwen3:0.6b
+shem push qwen3 ghcr.io/your-user/qwen3:0.6b
 ```
 
 On another machine with shem installed:
 
 ```sh
-shem run ghcr.io/<you>/qwen3:0.6b "Say hi in Portuguese"
+shem run ghcr.io/your-user/qwen3:0.6b "Say hi in Portuguese"
 ```
 
 [`examples/qwen3.5`](examples/qwen3.5/Shemfile) builds Qwen3.5-0.8B, whose Gated DeltaNet layers keep a fixed-size memory in place of a growing cache. [docs/models.md](docs/models.md) explains model images, and the `shem` CLI also runs RV32 programs and Linux ([docs/shemfile.md](docs/shemfile.md), [docs/vm.md](docs/vm.md)).
@@ -85,6 +85,12 @@ Remove the images and their unpacked copies.
 rm -rf ~/.local/share/shem
 ```
 
+Remove the Docker image.
+
+```sh
+docker rmi ghcr.io/your-user/qwen3:0.6b
+```
+
 Remove the downloaded checkpoint.
 
 ```sh
@@ -95,6 +101,12 @@ Uninstall shem.
 
 ```sh
 cargo uninstall shem
+```
+
+Uninstall the containerd shim.
+
+```sh
+sudo rm /usr/local/bin/containerd-shim-shem-v1
 ```
 
 ## Architecture
