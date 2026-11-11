@@ -103,6 +103,26 @@ jobs:
       - name: Build it with docker build and run it with docker run on shem
         run: just docker-test
 
+  model-containers:
+    name: Model containers (docker run, exec, commit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: neural/uv.lock
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-qwen3-0.6b-qwen3.5-0.8b
+      - uses: extractions/setup-just@v4
+      - name: Run, chat with, exec into and commit a model container
+        run: just model-containers-test
+
   kubernetes:
     name: Kubernetes (kind, RuntimeClass)
     runs-on: ubuntu-latest

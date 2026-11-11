@@ -2,7 +2,12 @@
 //! over ttrpc, and calls the task service below to create, start, wait for,
 //! kill and delete the container. The shim reports what happens to the task
 //! as events, which is how Docker learns that a container has exited.
+//!
+//! In a model container, `docker exec` runs exec processes, each a turn of the
+//! container's live session, and `docker commit`'s pause saves that session
+//! into the container's filesystem (see `session`).
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -12,7 +17,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use containerd_shim::event::Event;
-use containerd_shim::protos::events::task::{TaskCreate, TaskDelete, TaskExit, TaskStart};
+use containerd_shim::protos::events::task::{
+    TaskCreate, TaskDelete, TaskExecAdded, TaskExecStarted, TaskExit, TaskPaused, TaskResumed,
+    TaskStart,
+};
 use containerd_shim::protos::protobuf::well_known_types::timestamp::Timestamp;
 use containerd_shim::protos::protobuf::{EnumOrUnknown, MessageField};
 use containerd_shim::protos::ttrpc::{self, context::Context};
@@ -50,6 +58,17 @@ struct Task {
     /// The task's PID: its namespace holder's, or the shim's when there is none.
     pid: u32,
     holder: Option<Holder>,
+    execs: HashMap<String, ExecProcess>,
+}
+
+/// A process `docker exec` added to the container: in a model container, a
+/// turn of its live session.
+struct ExecProcess {
+    args: Vec<String>,
+    stdout: String,
+    stderr: String,
+    status: api::Status,
+    exited: Option<(u32, Timestamp)>,
 }
 
 /// Append a line to `/run/shem/shim.log` if that directory exists: an opt-in
@@ -116,6 +135,73 @@ impl shim::Shim for Service {
 }
 
 impl Service {
+    /// Start an exec process: one turn of a model container's live session,
+    /// streamed to the exec's stdout. It ends when the reply does.
+    fn start_exec(&self, exec_id: String) -> TtrpcResult<api::StartResponse> {
+        let (container_id, bundle_dir, task_pid, args, stdout, stderr) =
+            self.with_task(|task| {
+                let exec = (task.execs.get_mut(&exec_id))
+                    .ok_or_else(|| error(format!("no exec {exec_id}")))?;
+                exec.status = api::Status::RUNNING;
+                let streams = (exec.args.clone(), exec.stdout.clone(), exec.stderr.clone());
+                Ok::<_, ttrpc::Error>((
+                    task.id.clone(),
+                    task.bundle.clone(),
+                    task.pid,
+                    streams.0,
+                    streams.1,
+                    streams.2,
+                ))
+            })??;
+        self.publish(TaskExecStarted {
+            container_id: container_id.clone(),
+            exec_id: exec_id.clone(),
+            pid: task_pid,
+            ..Default::default()
+        });
+        let service = self.clone();
+        std::thread::spawn(move || {
+            let open = |path: &str| -> Box<dyn Write + Send> {
+                match OpenOptions::new().write(true).open(path) {
+                    Ok(file) if !path.is_empty() => Box::new(file),
+                    _ => Box::new(std::io::sink()),
+                }
+            };
+            let mut out = open(&stdout);
+            let status = match Bundle::load(&bundle_dir)
+                .and_then(|bundle| crate::session::exec(&bundle, &args, &mut out))
+            {
+                Ok(()) => 0,
+                Err(err) => {
+                    let _ = writeln!(open(&stderr), "shem: {err:#}");
+                    1
+                }
+            };
+            drop(out);
+            let at = Timestamp::now();
+            let (lock, exited) = &*service.task;
+            if let Some(task) = lock.lock().unwrap().as_mut()
+                && let Some(exec) = task.execs.get_mut(&exec_id)
+            {
+                exec.status = api::Status::STOPPED;
+                exec.exited = Some((status, at.clone()));
+            }
+            exited.notify_all();
+            service.publish(TaskExit {
+                container_id,
+                id: exec_id,
+                pid: task_pid,
+                exit_status: status,
+                exited_at: MessageField::some(at),
+                ..Default::default()
+            });
+        });
+        Ok(api::StartResponse {
+            pid: task_pid,
+            ..Default::default()
+        })
+    }
+
     /// Tell containerd what happened to the task, as runc's shim does.
     fn publish(&self, event: impl Event + 'static) {
         let Some(events) = &self.events else { return };
@@ -215,6 +301,7 @@ impl shim::Task for Service {
             kill: Arc::new(AtomicU32::new(0)),
             pid: task_pid,
             holder,
+            execs: HashMap::new(),
         });
         Ok(api::CreateTaskResponse {
             pid: task_pid,
@@ -225,9 +312,12 @@ impl shim::Task for Service {
     fn start(
         &self,
         _ctx: &TtrpcContext,
-        _req: api::StartRequest,
+        req: api::StartRequest,
     ) -> TtrpcResult<api::StartResponse> {
         trace("start");
+        if !req.exec_id.is_empty() {
+            return self.start_exec(req.exec_id);
+        }
         let (id, bundle_dir, streams, kill, task_pid) = self.with_task(|task| {
             task.status = api::Status::RUNNING;
             let streams = (task.stdin.clone(), task.stdout.clone(), task.stderr.clone());
@@ -286,24 +376,29 @@ impl shim::Task for Service {
         })
     }
 
-    fn wait(&self, _ctx: &TtrpcContext, _req: api::WaitRequest) -> TtrpcResult<api::WaitResponse> {
+    fn wait(&self, _ctx: &TtrpcContext, req: api::WaitRequest) -> TtrpcResult<api::WaitResponse> {
         trace("wait");
         let (lock, exited) = &*self.task;
         let mut task = lock.lock().unwrap();
         loop {
-            match task.as_ref() {
+            let done = match task.as_ref() {
                 None => return Err(error("no task has been created")),
-                Some(Task {
-                    exited: Some((status, at)),
-                    ..
-                }) => {
+                Some(task) if !req.exec_id.is_empty() => {
+                    let exec = (task.execs.get(&req.exec_id))
+                        .ok_or_else(|| error(format!("no exec {}", req.exec_id)))?;
+                    exec.exited.clone()
+                }
+                Some(task) => task.exited.clone(),
+            };
+            match done {
+                Some((status, at)) => {
                     return Ok(api::WaitResponse {
-                        exit_status: *status,
-                        exited_at: MessageField::some(at.clone()),
+                        exit_status: status,
+                        exited_at: MessageField::some(at),
                         ..Default::default()
                     });
                 }
-                Some(_) => task = exited.wait(task).unwrap(),
+                None => task = exited.wait(task).unwrap(),
             }
         }
     }
@@ -311,9 +406,29 @@ impl shim::Task for Service {
     fn state(
         &self,
         _ctx: &TtrpcContext,
-        _req: api::StateRequest,
+        req: api::StateRequest,
     ) -> TtrpcResult<api::StateResponse> {
         trace("state");
+        if !req.exec_id.is_empty() {
+            return self.with_task(|task| {
+                let exec = (task.execs.get(&req.exec_id))
+                    .ok_or_else(|| error(format!("no exec {}", req.exec_id)))?;
+                Ok::<_, ttrpc::Error>(api::StateResponse {
+                    id: req.exec_id.clone(),
+                    bundle: task.bundle.display().to_string(),
+                    pid: task.pid,
+                    status: EnumOrUnknown::new(exec.status),
+                    stdout: exec.stdout.clone(),
+                    stderr: exec.stderr.clone(),
+                    exit_status: exec.exited.as_ref().map_or(0, |(status, _)| *status),
+                    exited_at: MessageField::from_option(
+                        exec.exited.as_ref().map(|(_, at)| at.clone()),
+                    ),
+                    exec_id: req.exec_id.clone(),
+                    ..Default::default()
+                })
+            })?;
+        }
         self.with_task(|task| api::StateResponse {
             id: task.id.clone(),
             bundle: task.bundle.display().to_string(),
@@ -331,6 +446,9 @@ impl shim::Task for Service {
     fn kill(&self, _ctx: &TtrpcContext, req: api::KillRequest) -> TtrpcResult<api::Empty> {
         trace("kill");
         let signal = if req.signal == 0 { SIGKILL } else { req.signal };
+        if !req.exec_id.is_empty() {
+            return Ok(api::Empty::default()); // a turn runs to its end
+        }
         let (lock, exited) = &*self.task;
         let mut guard = lock.lock().unwrap();
         let task = guard
@@ -361,9 +479,21 @@ impl shim::Task for Service {
     fn delete(
         &self,
         _ctx: &TtrpcContext,
-        _req: api::DeleteRequest,
+        req: api::DeleteRequest,
     ) -> TtrpcResult<api::DeleteResponse> {
         trace("delete");
+        if !req.exec_id.is_empty() {
+            return self.with_task(|task| {
+                let exec = task.execs.remove(&req.exec_id);
+                let exited = exec.and_then(|e| e.exited);
+                api::DeleteResponse {
+                    pid: task.pid,
+                    exit_status: exited.as_ref().map_or(0, |(status, _)| *status),
+                    exited_at: MessageField::from_option(exited.map(|(_, at)| at)),
+                    ..Default::default()
+                }
+            });
+        }
         let (id, bundle, exited, task_pid, holder) = self.with_task(|task| {
             let holder = task.holder.take();
             (
@@ -420,6 +550,80 @@ impl shim::Task for Service {
             version: env!("CARGO_PKG_VERSION").into(),
             ..Default::default()
         })
+    }
+
+    fn exec(&self, _ctx: &TtrpcContext, req: api::ExecProcessRequest) -> TtrpcResult<api::Empty> {
+        trace("exec");
+        let spec: serde_json::Value = match req.spec.as_ref() {
+            Some(any) => serde_json::from_slice(&any.value).map_err(error)?,
+            None => return Err(error("an exec without a process spec")),
+        };
+        let args: Vec<String> = (spec["args"].as_array().into_iter().flatten())
+            .filter_map(|a| a.as_str().map(String::from))
+            .collect();
+        let container_id = self.with_task(|task| {
+            task.execs.insert(
+                req.exec_id.clone(),
+                ExecProcess {
+                    args,
+                    stdout: req.stdout.clone(),
+                    stderr: req.stderr.clone(),
+                    status: api::Status::CREATED,
+                    exited: None,
+                },
+            );
+            task.id.clone()
+        })?;
+        self.publish(TaskExecAdded {
+            container_id,
+            exec_id: req.exec_id,
+            ..Default::default()
+        });
+        Ok(api::Empty::default())
+    }
+
+    fn pause(&self, _ctx: &TtrpcContext, _req: api::PauseRequest) -> TtrpcResult<api::Empty> {
+        trace("pause");
+        // `docker commit` pauses first: a model container's session goes into
+        // its filesystem then, so the commit carries it
+        let (id, bundle_dir) = self.with_task(|task| {
+            task.status = api::Status::PAUSED;
+            (task.id.clone(), task.bundle.clone())
+        })?;
+        let bundle = Bundle::load(&bundle_dir).map_err(error)?;
+        if bundle.args[0].starts_with("shem:") {
+            crate::session::save(&bundle).map_err(error)?;
+        }
+        self.publish(TaskPaused {
+            container_id: id,
+            ..Default::default()
+        });
+        Ok(api::Empty::default())
+    }
+
+    fn resume(&self, _ctx: &TtrpcContext, _req: api::ResumeRequest) -> TtrpcResult<api::Empty> {
+        trace("resume");
+        let id = self.with_task(|task| {
+            task.status = api::Status::RUNNING;
+            task.id.clone()
+        })?;
+        self.publish(TaskResumed {
+            container_id: id,
+            ..Default::default()
+        });
+        Ok(api::Empty::default())
+    }
+
+    fn resize_pty(
+        &self,
+        _ctx: &TtrpcContext,
+        _req: api::ResizePtyRequest,
+    ) -> TtrpcResult<api::Empty> {
+        Ok(api::Empty::default()) // the session echoes what is typed; a size changes nothing
+    }
+
+    fn close_io(&self, _ctx: &TtrpcContext, _req: api::CloseIORequest) -> TtrpcResult<api::Empty> {
+        Ok(api::Empty::default()) // stdin ends when its writer closes the FIFO
     }
 
     fn shutdown(&self, _ctx: &TtrpcContext, _req: api::ShutdownRequest) -> TtrpcResult<api::Empty> {

@@ -48,4 +48,4 @@ The part that turns a bundle into a container ([`bundle.rs`](../crates/container
 
 ## Not yet
 
-- `ctr exec` and `docker exec`, pausing, checkpoints and resource statistics, and `-t` terminals.
+- `docker exec` and `docker commit` for program containers (model containers have both, see [models.md](models.md#sessions-under-docker)), checkpoints and resource statistics.

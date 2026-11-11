@@ -76,6 +76,27 @@ Supporting a new model family means writing an importer that maps its tensors on
 
 Qwen3.5's vision encoder and multi-token prediction layer are left out. [`tests/test_model.py`](../neural/tests/test_model.py) does the comparison; it downloads the checkpoints, so it runs with `SHEM_MODEL_TESTS=1`.
 
+## Sessions under Docker
+
+Model containers are live sessions, held by the model server (`shem-neural-server`) under the container's ID, so Docker's commands mean something for them:
+
+| Command | What it does |
+|---|---|
+| `docker run IMAGE "prompt"` | Answers the prompt, then exits |
+| `docker run -i IMAGE` | Takes each line of stdin as a turn of one conversation; with `-t`, the shim echoes typing and handles backspace, since there is no terminal inside |
+| `docker run -d --name c IMAGE --keep "prompt"` | Answers, then keeps the session open |
+| `docker exec c shem:generate "follow-up"` | Another turn of that session, which remembers the conversation |
+| `docker commit c IMAGE2` | Docker pauses the container first, and the shim saves the session (the conversation and every block's state) into `/.shem`, so `IMAGE2` resumes the conversation |
+| `docker logs`, `stop`, `rm`, `ps` | As for any container |
+
+The server must be able to read containers' root filesystems, which containerd mounts as root, so for Docker run it as root:
+
+```sh
+sudo shem-neural-server --socket /tmp/shem-neural.sock
+```
+
+Its socket is open only to its user (and root). A CI job runs a prompt, piped turns, a live session with `docker exec`, and a `docker commit` whose image remembers the conversation.
+
 ## Running
 
 `shem run` unpacks a model image once, into `$SHEM_HOME/rootfs/<digest>`, and the driver loads the weights from there. The runtime computes in float32 on the CPU, so sessions are repeatable: Qwen3-0.6B replies at about five tokens a second.
@@ -83,5 +104,4 @@ Qwen3.5's vision encoder and multi-token prediction layer are left out. [`tests/
 ## Next
 
 - **Compiled layers.** Exact circuits, such as the RV32IM CPU of the [neural vCPU](neural.md), as block types spliced into a model, and tool calls that run programs on them.
-- **`docker run`.** The containerd shim running `shem:` drivers, so Docker runs model images too.
 - **Speed.** The model server holding loaded models and batching sessions, on GPUs.

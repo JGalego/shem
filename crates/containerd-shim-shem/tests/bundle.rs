@@ -138,6 +138,26 @@ fn greeter(msg: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn kubernetes_sandboxes_wait_to_be_stopped() {
+    let dir = bundle_with(elf(&[0x0000_006f], &[]));
+    let config = r#"{"process": {"args": ["/pause"]}, "root": {"path": "rootfs"},
+        "annotations": {"io.kubernetes.cri.container-type": "sandbox"}}"#;
+    std::fs::write(dir.path().join("config.json"), config).unwrap();
+    let bundle = Bundle::load(dir.path()).unwrap();
+    assert!(bundle.sandbox);
+    let stdio = Stdio {
+        stdin: Box::new(std::io::empty()),
+        stdout: Box::new(std::io::sink()),
+        stderr: Box::new(std::io::sink()),
+    };
+    // /pause is no RV32 program, and the sandbox never runs it
+    assert_eq!(
+        bundle::run(&bundle, stdio, &AtomicU32::new(9)).unwrap(),
+        128 + 9
+    );
+}
+
+#[test]
 fn annotations_choose_the_vcpu() {
     use containerd_shim_shem::bundle::{DEFAULT_NEURAL_SOCKET, VcpuKind};
 
@@ -227,26 +247,65 @@ fn annotated_bundles_run_inside_the_model() {
 }
 
 #[test]
-#[ignore = "needs a model server and an unpacked model image: set SHEM_NEURAL_SOCKET and SHEM_MODEL_ROOT"]
-fn model_images_run_on_the_model_server() {
+#[ignore = "needs a model server and a model: set SHEM_NEURAL_SOCKET, and SHEM_MODEL to a model directory"]
+fn model_containers_hold_live_sessions() {
+    use std::sync::atomic::Ordering;
+
     let socket = std::env::var("SHEM_NEURAL_SOCKET").expect("SHEM_NEURAL_SOCKET");
-    let root = std::env::var("SHEM_MODEL_ROOT")
-        .expect("SHEM_MODEL_ROOT, the root of an unpacked model image");
+    let model =
+        std::env::var("SHEM_MODEL").expect("SHEM_MODEL, a model directory holding shem.json");
+    // The bundle's directory name is the container's ID, and so the session's
     let dir = tempfile::tempdir().unwrap();
+    let bundle_dir = dir.path().join("shem-session-test");
+    std::fs::create_dir_all(bundle_dir.join("rootfs")).unwrap();
+    std::os::unix::fs::symlink(&model, bundle_dir.join("rootfs/model")).unwrap();
     let config = serde_json::json!({
-        "process": {"args": ["shem:generate", "--max-tokens", "12", "Say hi in Portuguese."]},
-        "root": {"path": root},
+        "process": {"args": ["shem:generate", "--max-tokens", "24", "--keep",
+                             "--system", "Answer in one short sentence."]},
+        "root": {"path": "rootfs"},
         "annotations": {"dev.shem.vcpu": "neural", "dev.shem.neural-socket": socket},
     });
-    std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
-    let bundle = Bundle::load(dir.path()).unwrap();
+    std::fs::write(bundle_dir.join("config.json"), config.to_string()).unwrap();
+    let bundle = Bundle::load(&bundle_dir).unwrap();
+    assert_eq!(bundle.id, "shem-session-test");
+
+    // The main process: a turn from stdin, then the session stays open
     let out = Captured::default();
     let stdio = Stdio {
-        stdin: Box::new(std::io::empty()),
+        stdin: Box::new(std::io::Cursor::new(b"My name is Joana.\n".to_vec())),
         stdout: Box::new(out.clone()),
         stderr: Box::new(std::io::sink()),
     };
-    assert_eq!(bundle::run(&bundle, stdio, &AtomicU32::new(0)).unwrap(), 0);
-    let reply = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
-    assert!(reply.contains("Ol"), "{reply}");
+    let kill = Arc::new(AtomicU32::new(0));
+    let main = {
+        let (bundle, kill) = (bundle.clone(), kill.clone());
+        std::thread::spawn(move || bundle::run(&bundle, stdio, &kill).unwrap())
+    };
+    while out.0.lock().unwrap().is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(5)); // the rest of the first reply
+
+    // docker exec: another turn of the same session, which remembers the first
+    let mut reply = Vec::new();
+    let args = ["shem:generate", "What did I just tell you my name is?"].map(String::from);
+    containerd_shim_shem::session::exec(&bundle, &args, &mut reply).unwrap();
+    let reply = String::from_utf8(reply).unwrap();
+    assert!(reply.contains("Joana"), "{reply}");
+
+    // docker commit's pause: the session, conversation and all, into /.shem
+    containerd_shim_shem::session::save(&bundle).unwrap();
+    let meta = std::fs::read_to_string(bundle_dir.join("rootfs/.shem/session.json")).unwrap();
+    assert!(
+        meta.contains("What did I just tell you my name is?"),
+        "{meta}"
+    );
+    assert!(
+        bundle_dir
+            .join("rootfs/.shem/session.safetensors")
+            .is_file()
+    );
+
+    kill.store(15, Ordering::SeqCst);
+    assert_eq!(main.join().unwrap(), 128 + 15);
 }

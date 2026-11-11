@@ -52,6 +52,9 @@ class Op(IntEnum):
     SNAPSHOT = 12
     RESTORE = 13
     GENERATE = 14
+    TURN = 15
+    SAVE = 16
+    CLOSE = 17
 
 
 class Status(IntEnum):
@@ -64,10 +67,12 @@ class Status(IntEnum):
 
 class Models:
     """Loaded models, by their manifest's contents, so sessions of the same
-    model share its weights, however many containers unpack it."""
+    model share its weights, however many containers unpack it; and the live
+    sessions of running containers, by the ID the shim gives them."""
 
     def __init__(self):
         self.loaded: dict[str, tuple] = {}
+        self.sessions: dict[str, Live] = {}
         self.lock = threading.Lock()
 
     def get(self, directory: Path):
@@ -82,33 +87,93 @@ class Models:
             return self.loaded[key]
 
     def generate(self, request: dict, write) -> None:
-        """Run the driver for `request`, writing the reply with `write` as it
-        comes. The request has the model's directory, the driver's command
-        line (its options and the prompt, as a container's arguments), and
-        optionally a saved session to continue and stdin, the prompt when the
-        command line has none."""
+        """Start a session for `request` and reply to its prompt, writing the
+        reply with `write` as it comes. The request has the model's
+        directory, the driver's command line (its options and the prompt, as
+        a container's arguments), and optionally a saved session to continue,
+        stdin (the prompt when the command line has none) and a session ID,
+        under which the session stays open for more turns."""
         from .model import generate
 
         args = generate.options(request.get("argv", []), model=request["model"])
         if request.get("session"):
             args.session = Path(request["session"])
         model, tokenizer = self.get(Path(request["model"]))
+        session = generate.start(model, tokenizer, args, err=_Stream(write))
         prompt = " ".join(args.prompt) or request.get("stdin", "")
+        with _all_cores():
+            if session is not None and prompt:
+                generate.converse(session, tokenizer, prompt, args.max_tokens, out=_Stream(write))
+        if session is not None and request.get("session_id"):
+            self.sessions[request["session_id"]] = Live(tokenizer, args, session)
 
-        class Stream:
-            def write(self, text: str) -> None:
-                if text:
-                    write(text.encode())
+    def turn(self, request: dict, write) -> None:
+        """Another turn of a live session: the user's text, from the command
+        line in `argv` (as `docker exec` gives it) or `text`."""
+        from .model import generate
 
-            def flush(self) -> None:
-                pass
+        live = self._live(request)
+        args = generate.options(request.get("argv", []), model="-")
+        text = " ".join(args.prompt) or request.get("text", "")
+        if not text.strip():
+            return
+        max_tokens = args.max_tokens if "--max-tokens" in request.get("argv", []) else live.args.max_tokens
+        with live.lock, _all_cores():
+            generate.converse(live.session, live.tokenizer, text, max_tokens, out=_Stream(write))
 
-        threads = torch.get_num_threads()
-        torch.set_num_threads(os.cpu_count() or 1)  # a model's matrices are big: use every core
+    def save(self, request: dict) -> bytes:
+        """A live session's files, as `docker commit` freezes them into the
+        container's /.shem: each as a u32 name length, the name, a u32 data
+        length and the data."""
+        live = self._live(request)
+        with live.lock:
+            files = live.session.to_files()
+        out = b""
+        for name, data in files.items():
+            out += struct.pack("<I", len(name)) + name.encode() + struct.pack("<I", len(data)) + data
+        return out
+
+    def close(self, request: dict) -> None:
+        self.sessions.pop(request["session_id"], None)
+
+    def _live(self, request: dict) -> "Live":
         try:
-            generate.run(model, tokenizer, args, prompt, out=Stream(), err=Stream())
-        finally:
-            torch.set_num_threads(threads)
+            return self.sessions[request["session_id"]]
+        except KeyError:
+            raise ValueError(f"no live session {request.get('session_id')!r}: is the container running?") from None
+
+
+class Live:
+    """A container's session, open for more turns."""
+
+    def __init__(self, tokenizer, args, session):
+        self.tokenizer, self.args, self.session = tokenizer, args, session
+        self.lock = threading.Lock()
+
+
+class _Stream:
+    """Text written to it goes to the client as it comes."""
+
+    def __init__(self, write):
+        self._write = write
+
+    def write(self, text: str) -> None:
+        if text:
+            self._write(text.encode())
+
+    def flush(self) -> None:
+        pass
+
+
+class _all_cores:
+    """Use every core for a model's big matrices; vCPUs' tiny tensors use one."""
+
+    def __enter__(self):
+        self.threads = torch.get_num_threads()
+        torch.set_num_threads(os.cpu_count() or 1)
+
+    def __exit__(self, *_):
+        torch.set_num_threads(self.threads)
 
 
 class Job:
@@ -292,9 +357,18 @@ def make_server(socket_path: Path, dense: bool = False) -> tuple[socketserver.Ba
         def handle(self):
             while (payload := read_frame(self.rfile)) is not None:
                 try:
-                    if payload[0] == Op.GENERATE:
-                        chunk = lambda data: write_frame(self.wfile, bytes([Status.CHUNK]) + data)  # noqa: E731
-                        models.generate(json.loads(payload[1:]), chunk)
+                    op, request = payload[0], payload[1:]
+                    chunk = lambda data: write_frame(self.wfile, bytes([Status.CHUNK]) + data)  # noqa: E731
+                    if op == Op.GENERATE:
+                        models.generate(json.loads(request), chunk)
+                        response = bytes([Status.OK])
+                    elif op == Op.TURN:
+                        models.turn(json.loads(request), chunk)
+                        response = bytes([Status.OK])
+                    elif op == Op.SAVE:
+                        response = bytes([Status.OK]) + models.save(json.loads(request))
+                    elif op == Op.CLOSE:
+                        models.close(json.loads(request))
                         response = bytes([Status.OK])
                     else:
                         response = bytes([Status.OK]) + registry.handle(payload)

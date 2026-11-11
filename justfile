@@ -133,6 +133,35 @@ docker-test: toolchain
     fi
     timeout 10 docker rm shem-docker-test >/dev/null
 
+# Model containers under Docker: run, run -i, exec into a live session, and commit it; needs Docker, uv and sudo
+model-containers-test:
+    #!/bin/sh
+    set -e
+    cargo build --release -p shem -p containerd-shim-shem
+    sudo install -m 0755 target/release/containerd-shim-shem-v1 /usr/local/bin/
+    uv sync -q --project neural
+    # As root, to read the containers' root filesystems, which containerd mounts
+    sudo neural/.venv/bin/python -m shem_neural.server --socket /tmp/shem-neural.sock > target/model-server.log 2>&1 &
+    trap 'sudo pkill -f "shem_neural[.]server" || true' EXIT
+    until [ -S /tmp/shem-neural.sock ]; do sleep 1; done
+    target/release/shem build -t qwen3 examples/qwen3
+    target/release/shem save qwen3 | docker load
+    run="docker run --runtime io.containerd.shem.v1 --platform linux/riscv32"
+    check() { echo "$2" | tee -a target/model-containers.out; echo "$2" | grep -qi "$1" || { echo "expected $1"; tail -20 target/model-server.log; exit 1; }; }
+
+    echo "--- a prompt"
+    check "." "$(timeout 300 $run --rm qwen3 --max-tokens 16 'Say hello in Portuguese.')"
+    echo "--- turns on stdin"
+    check "joana" "$(printf 'My name is Joana.\nWhat did I just tell you my name is?\n' | timeout 300 $run -i --rm qwen3 --max-tokens 24)"
+    echo "--- a live session, exec and commit"
+    $run -d --name live qwen3 --keep --max-tokens 24 'My name is Joana.'
+    until [ -n "$(docker logs live 2>&1)" ]; do sleep 2; done
+    sleep 8
+    check "joana" "$(timeout 300 docker exec live shem:generate 'What did I just tell you my name is?')"
+    docker commit live qwen3-remembers >/dev/null
+    timeout 30 docker rm -f live >/dev/null
+    check "joana" "$(timeout 300 $run --rm qwen3-remembers --max-tokens 24 'Tell me my name again.')"
+
 # Run an RV32 program in a Pod on shem, in a kind cluster; needs Docker, kind and kubectl
 kubernetes-test:
     #!/bin/sh

@@ -32,7 +32,13 @@ class Tokenizer:
 
     def chat(self, messages: list[dict], thinking: bool = False) -> list[int]:
         """The tokens of `messages`, ready for the assistant's reply."""
-        text = self.template.render(messages=messages, add_generation_prompt=True, enable_thinking=thinking)
+        return self.encode(self.render(messages, thinking))
+
+    def render(self, messages: list[dict], thinking: bool = False) -> str:
+        """The text of `messages` in the chat template, ready for the reply."""
+        return self.template.render(messages=messages, add_generation_prompt=True, enable_thinking=thinking)
+
+    def encode(self, text: str) -> list[int]:
         return self.inner.encode(text, add_special_tokens=False).ids
 
     def prefix(self, messages: list[dict]) -> list[int]:
