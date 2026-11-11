@@ -35,6 +35,16 @@ class Tokenizer:
         text = self.template.render(messages=messages, add_generation_prompt=True, enable_thinking=thinking)
         return self.inner.encode(text, add_special_tokens=False).ids
 
+    def prefix(self, messages: list[dict]) -> list[int]:
+        """The tokens every conversation that starts with `messages` and
+        continues with a user turn begins with. Found by rendering two such
+        conversations and keeping what they share, so it works with any
+        template, including ones that refuse a conversation with no user turn."""
+        a = self.chat(messages + [{"role": "user", "content": "A"}])
+        b = self.chat(messages + [{"role": "user", "content": "?"}])
+        shared = next((i for i, (x, y) in enumerate(zip(a, b, strict=False)) if x != y), min(len(a), len(b)))
+        return a[:shared]
+
     def decode(self, ids: list[int]) -> str:
         return self.inner.decode(ids, skip_special_tokens=True)
 

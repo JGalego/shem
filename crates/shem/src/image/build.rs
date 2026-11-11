@@ -130,7 +130,9 @@ impl Builder<'_> {
             Base::Image(dir) => {
                 self.image = Image::read_layout(&dir)?;
                 self.image.unpack_rootfs(&self.root)?;
-                if self.image.config.kernel.is_some() {
+                if self.image.config.model.is_some() {
+                    // A model's session is rebuilt by its own WARM, if any
+                } else if self.image.config.kernel.is_some() {
                     self.frozen_vm = self.image.warm_machine()?;
                 } else {
                     self.frozen = self.image.warm_state()?;
@@ -196,8 +198,11 @@ impl Builder<'_> {
                 }
                 Ok(())
             }
-            Instruction::Warm { .. } if self.image.config.model.is_some() => {
-                bail!("WARM in a model image is not supported yet")
+            Instruction::Warm { until, .. } if self.image.config.model.is_some() => {
+                if *until != Until::Prompt {
+                    bail!("a model image can WARM --until=prompt");
+                }
+                self.warm_model()
             }
             Instruction::Warm { until, max_steps } => {
                 let max_steps = max_steps.unwrap_or(WARM_MAX_STEPS);
@@ -440,6 +445,7 @@ impl Builder<'_> {
             Until::Output(_) => {
                 bail!("WARM --until=output: is for VM images, which have a console")
             }
+            Until::Prompt => bail!("WARM --until=prompt is for model images"),
         };
         match container.run_until(Some(max_steps), Some(pause))? {
             Stop::Paused => {}
@@ -471,7 +477,7 @@ impl Builder<'_> {
         let pause = match until {
             Until::Steps(n) => vm::Pause::Steps(*n),
             Until::Output(bytes) => vm::Pause::Output(bytes.clone()),
-            Until::Syscall(_) | Until::Ebreak => {
+            Until::Syscall(_) | Until::Ebreak | Until::Prompt => {
                 bail!("a VM image can WARM --until=steps:N or output:TEXT")
             }
         };
@@ -512,6 +518,26 @@ impl Builder<'_> {
         });
         self.image.config.memory = Some(frozen.machine.mem.len() as u32);
         self.frozen_vm = Some(frozen);
+        Ok(())
+    }
+
+    /// `WARM --until=prompt` in a model image: prime a session with the
+    /// entrypoint's options, such as its system prompt, and freeze every
+    /// block's state into the state layer.
+    fn warm_model(&mut self) -> anyhow::Result<()> {
+        let out = tempfile::tempdir()?;
+        model::warm(&self.image.config.entrypoint, &self.root, out.path())?;
+        let mut files = Vec::new();
+        for name in ["session.json", "session.safetensors"] {
+            files.push((name, std::fs::read(out.path().join(name))?));
+        }
+        let files: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (*n, d.as_slice())).collect();
+        let state = layer::from_files(&files)?;
+        self.image.layers.retain(|l| l.media_type != STATE_TYPE);
+        self.image.layers.push(Layer {
+            media_type: STATE_TYPE.into(),
+            data: state,
+        });
         Ok(())
     }
 

@@ -55,6 +55,8 @@ pub enum Until {
     Ebreak,
     /// A VM's console output ends with these bytes.
     Output(Vec<u8>),
+    /// A model session is primed, up to where the user's prompt goes.
+    Prompt,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -283,6 +285,9 @@ fn parse_until(value: &str) -> Result<Until, String> {
     if value == "ebreak" {
         return Ok(Until::Ebreak);
     }
+    if value == "prompt" {
+        return Ok(Until::Prompt);
+    }
     if let Some(steps) = value.strip_prefix("steps:") {
         return steps
             .parse()
@@ -313,7 +318,7 @@ fn parse_until(value: &str) -> Result<Until, String> {
             ));
     }
     Err(format!(
-        "expected --until=syscall:NAME, steps:N, ebreak or output:TEXT, got {value:?}"
+        "expected --until=syscall:NAME, steps:N, ebreak, output:TEXT or prompt, got {value:?}"
     ))
 }
 
