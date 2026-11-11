@@ -61,3 +61,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The model card is Markdown, one line per paragraph
+"src/shem_neural/export.py" = ["E501"]
