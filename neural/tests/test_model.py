@@ -50,3 +50,26 @@ def test_imported_models_match_transformers(repo, tmp_path):
         reply.append(token)
         logits = model.forward(torch.tensor([[token]]), state, position)
     assert reply == want, (tokenizer.decode(reply), tokenizer.decode(want))
+
+
+@pytest.mark.parametrize("repo", REPOS)
+def test_saved_sessions_continue_as_if_never_stopped(repo, tmp_path):
+    from shem_neural.model.generate import Session, reply
+
+    import_model(repo, tmp_path / "model")
+    model = Model(tmp_path / "model")
+    tokenizer = Tokenizer(tmp_path / "model", model.manifest.tokenizer)
+    system = [{"role": "system", "content": "You are a golem. Answer in one sentence."}]
+    conversation = tokenizer.chat(system + MESSAGES)
+
+    fresh = Session(model)
+    fresh.feed(conversation)
+    want = reply(fresh, tokenizer, 16, out=open(os.devnull, "w"))
+
+    primed = Session(model)
+    primed.feed(tokenizer.prefix(system))
+    primed.save(tmp_path / "session")
+    resumed = Session.load(model, tmp_path / "session")
+    assert conversation[: len(resumed.tokens)] == resumed.tokens
+    resumed.feed(conversation[len(resumed.tokens) :])
+    assert reply(resumed, tokenizer, 16, out=open(os.devnull, "w")) == want

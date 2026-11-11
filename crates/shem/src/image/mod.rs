@@ -419,6 +419,14 @@ impl Store {
             std::fs::create_dir_all(&cache)?;
             let staging = tempfile::tempdir_in(&cache)?;
             image.unpack_rootfs(staging.path())?;
+            // A model's primed session, where `shem save` puts it for Docker too
+            if let (Some(_), Some(files)) = (&image.config.model, image.state_files()?) {
+                let dir = staging.path().join(model::SESSION_DIR);
+                std::fs::create_dir_all(&dir)?;
+                for (name, data) in files {
+                    std::fs::write(dir.join(name), data)?;
+                }
+            }
             std::fs::rename(staging.keep(), &dir)?;
         }
         Ok(dir)

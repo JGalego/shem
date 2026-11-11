@@ -95,6 +95,30 @@ pub fn layer_groups(root: &Path) -> anyhow::Result<Vec<Vec<PathBuf>>> {
     Ok(groups)
 }
 
+/// Where a model image's primed session lives, relative to the root, once
+/// `shem run` or `docker load` has unpacked its state layer.
+pub const SESSION_DIR: &str = ".shem";
+
+/// Prime a session of the model at `root` with the driver's options in
+/// `entrypoint`, and save it in `out`: what `WARM --until=prompt` freezes.
+pub fn warm(entrypoint: &[String], root: &Path, out: &Path) -> anyhow::Result<()> {
+    let (driver, options) = entrypoint.split_first().context("no entrypoint")?;
+    if driver != "shem:generate" {
+        bail!("WARM --until=prompt needs the shem:generate driver, not {driver}");
+    }
+    let status = python("shem_neural.model.generate")
+        .args(options)
+        .arg("--warm")
+        .arg(out)
+        .arg(root.join(MODEL_DIR))
+        .status()
+        .context("running the model, which needs uv")?;
+    if !status.success() {
+        bail!("priming the session failed ({status})");
+    }
+    Ok(())
+}
+
 /// Whether `entrypoint` names a driver rather than a guest program.
 pub fn is_driver(entrypoint: &[String]) -> bool {
     entrypoint
@@ -110,11 +134,12 @@ pub fn run_driver(entrypoint: &[String], args: &[String], root: &Path) -> anyhow
         "shem:generate" => python("shem_neural.model.generate"),
         other => bail!("unknown driver {other}: shem has shem:generate"),
     };
-    command
-        .args(options)
-        .arg(root.join(MODEL_DIR))
-        .arg("--")
-        .args(args);
+    command.args(options);
+    let session = root.join(SESSION_DIR);
+    if session.join("session.json").is_file() {
+        command.arg("--session").arg(session);
+    }
+    command.arg(root.join(MODEL_DIR)).arg("--").args(args);
     let status = command
         .status()
         .context("running the model, which needs uv")?;

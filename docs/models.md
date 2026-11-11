@@ -28,6 +28,23 @@ ENTRYPOINT and CMD keep their Docker meanings: the entrypoint is what runs, and 
 
 A `shem:` entrypoint names a driver, which the host runs, like a shell builtin; the prefix keeps it from ever being mistaken for a file in the image. `shem:generate` options: `--max-tokens N` (default 256) and `--system TEXT`. Decoding is greedy, so a prompt always gets the same reply.
 
+## Sessions as layers
+
+`WARM --until=prompt` primes a session at build time and freezes it into the image ([`examples/golem`](../examples/golem/Shemfile)):
+
+```dockerfile
+FROM hf.co/Qwen/Qwen3.5-0.8B
+ENTRYPOINT ["shem:generate", "--system", "You are Shem, a golem made of clay and brought to life by a word."]
+CMD ["Who are you?"]
+WARM --until=prompt
+```
+
+The builder runs the model over the conversation up to where the user's prompt goes, here the system prompt, and saves every block's state in the image's state layer: the attention layers' key and value caches, and the Gated DeltaNet layers' convolution inputs and memory matrices. `shem run` continues that session, so the system prompt is never read again, and the reply is exactly what an unprimed session would give; a test checks this for both models.
+
+What the state costs depends on the blocks. After the same 27-token prompt, Qwen3-0.6B's attention caches take 6 MB and grow with every token, while Qwen3.5-0.8B's state takes 20 MB, almost all of it Gated DeltaNet memories, and stays that size however long the session runs. A long document read at build time is where the fixed size pays off.
+
+The session is saved as `session.safetensors`, every block's state by block number and name, and `session.json`, the tokens it has read. `shem run` unpacks them into `/.shem`, which is also where `shem save` puts them for `docker load`.
+
 ## The model as files
 
 The importer (`shem_neural.model.importers`) writes the model into `/model`:
@@ -63,7 +80,6 @@ Qwen3.5's vision encoder and multi-token prediction layer are left out. [`tests/
 
 ## Next
 
-- **Sessions as layers.** `WARM` for model images: run a prompt at build time and freeze the blocks' state (the Gated DeltaNet memories and the attention caches) into a state layer, so `shem run` continues the session.
 - **Compiled layers.** Exact circuits, such as the RV32IM CPU of the [neural vCPU](neural.md), as block types spliced into a model, and tool calls that run programs on them.
 - **`docker run`.** The containerd shim running `shem:` drivers, so Docker runs model images too.
 - **Speed.** The model server holding loaded models and batching sessions, on GPUs.

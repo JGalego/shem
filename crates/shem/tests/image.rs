@@ -383,6 +383,14 @@ WARM --until=syscall:read --max-steps=1000
             max_steps: Some(1000)
         }
     );
+    let warm = shemfile::parse("FROM hf.co/Qwen/Qwen3-0.6B\nWARM --until=prompt\n").unwrap();
+    assert_eq!(
+        warm[0].instructions[0],
+        Instruction::Warm {
+            until: Until::Prompt,
+            max_steps: None
+        }
+    );
     for bad in [
         "COPY a\n",
         "WARM\n",
