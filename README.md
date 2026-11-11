@@ -250,9 +250,75 @@ docs/
   shemfile.md      the Shemfile and the image format
 ```
 
-## Built with
+## Development
 
-[🦀 Rust](https://www.rust-lang.org) · [🐍 Python](https://www.python.org) · [🔥 PyTorch](https://pytorch.org) · [⚡ uv](https://docs.astral.sh/uv/) · [🐳 Docker](https://www.docker.com) · [📦 containerd](https://containerd.io) · [🦎 Zig](https://ziglang.org)
+### Stack
+
+- [🦀 Rust](https://www.rust-lang.org) for the host: the reference vCPU, the Linux system calls, images, VM mode, the CLI and the containerd shim ([`crates/`](crates/)).
+- [🐍 Python](https://www.python.org) and [🔥 PyTorch](https://pytorch.org) for the neural vCPU: the weight compiler, the network and its server ([`neural/`](neural/)).
+- [⚡ uv](https://docs.astral.sh/uv/) for the Python environment and the GPU jobs.
+- [🐳 Docker](https://www.docker.com) for the guest toolchain image and the ordinary stages of a Shemfile ([`toolchain/`](toolchain/)).
+- [🦎 Zig](https://ziglang.org) to compile guest programs for RV32 against musl.
+- [📦 containerd](https://containerd.io) to run shem containers under Docker and containerd.
+
+### Set up
+
+Install the git hooks with [pre-commit](https://pre-commit.com). They format and lint on every commit and run the tests before every push.
+
+```sh
+pre-commit install --hook-type pre-commit --hook-type pre-push
+```
+
+### Check your changes
+
+Format the Rust code.
+
+```sh
+cargo fmt --all
+```
+
+Lint it.
+
+```sh
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Run the Rust tests.
+
+```sh
+cargo test --workspace
+```
+
+Run the neural vCPU's tests.
+
+```sh
+uv run --project neural pytest neural/tests
+```
+
+The slower suites are ignored tests that need inputs built first: guest programs, BusyBox, the riscv-tests, a Linux kernel, a neural vCPU server, a registry or containerd. CI builds the inputs and runs every suite on each push, and [`.github/workflows/ci.yml`](.github/workflows/ci.yml) shows how. Run one locally with `cargo test --release --test <suite> -- --ignored` once its inputs exist.
+
+### Extend shem
+
+| To add | Change | Test in |
+|---|---|---|
+| A system call | Its number in [`linux/abi.rs`](crates/shem/src/linux/abi.rs), its dispatch in `Linux::handle` in [`linux/mod.rs`](crates/shem/src/linux/mod.rs), and its implementation on `Process` | [`tests/linux.rs`](crates/shem/tests/linux.rs) |
+| A Shemfile instruction | The parser in [`image/shemfile.rs`](crates/shem/src/image/shemfile.rs) and the builder in [`image/build.rs`](crates/shem/src/image/build.rs), then [`docs/shemfile.md`](docs/shemfile.md) | [`tests/image.rs`](crates/shem/tests/image.rs) |
+| A device in VM mode | `device_read` and `device_write` in [`vm.rs`](crates/shem/src/vm.rs), and its node in the device tree | [`tests/vm.rs`](crates/shem/tests/vm.rs) |
+| An instruction | The reference vCPU in [`reference.rs`](crates/shem/src/reference.rs), the ISA table in [`isa.py`](neural/src/shem_neural/isa.py), and the network in [`cpu.py`](neural/src/shem_neural/cpu.py) | [`tests/reference.rs`](crates/shem/tests/reference.rs), [`neural/tests`](neural/tests/) and [`tests/neural.rs`](crates/shem/tests/neural.rs) |
+| A vCPU | The `Vcpu` trait in [`vcpu.rs`](crates/shem/src/vcpu.rs), with snapshots in the canonical format | The differential tests in [`tests/neural.rs`](crates/shem/tests/neural.rs) show how |
+
+[docs/architecture.md](docs/architecture.md) explains the design, and its [roadmap](docs/architecture.md#roadmap) lists what is next.
+
+### Ground rules
+
+- **The reference vCPU defines correct.** The neural vCPU must match it instruction for instruction, and the dense network and the fused executor must match each other. Tests check both.
+- **Runs are deterministic.** Time comes from the virtual clock and randomness from the seeded PRNG. Nothing the guest sees may depend on the host, such as real time, inode numbers or directory order.
+- **Docs have no hard wraps.** Each paragraph or list item is one line.
+- **Commit messages are one line**, in the form `<type>: <message>`, with a type such as `feat`, `fix`, `docs`, `test`, `ci`, `perf` or `refactor`.
+
+### Contribute
+
+Fork the repository, make your change on a branch with its tests and docs, and open a pull request once CI is green. For a change to the design, open an issue first. Contributions are under the [MIT license](LICENSE).
 
 ## License
 
