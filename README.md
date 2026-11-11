@@ -7,6 +7,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Status](https://img.shields.io/badge/status-experimental-orange)](docs/architecture.md#roadmap)
 
+Built with [🦀 Rust](https://www.rust-lang.org) · [🐍 Python](https://www.python.org) · [🔥 PyTorch](https://pytorch.org) · [⚡ uv](https://docs.astral.sh/uv/) · [🐳 Docker](https://www.docker.com) · [📦 containerd](https://containerd.io) · [🦎 Zig](https://ziglang.org)
+
 shem treats the host as a hypervisor and a model as the machine. The model supplies a CPU, compiled into its weights, and RAM, which is its recurrent state, as in [Qwenputer](https://divagr.com/blog/qwenputer). The host supplies everything else: system calls, devices, scheduling and storage. Images are built from a [Shemfile](docs/shemfile.md) as OCI images, like Docker images, and can carry a running guest, frozen at build time.
 
 The name comes from the golem legend: a clay figure comes to life when a *shem*, a slip of paper with words on it, is placed in its mouth. Here the weights are the clay and the program is the shem.
@@ -15,18 +17,18 @@ The name comes from the golem legend: a clay figure comes to life when a *shem*,
 
 Early, but every part of the design exists, from the reference vCPU to a model running guests.
 
-- **Containers** (`shem run`). The host is the guest's kernel: static RV32 Linux programs run with files from a host directory as their root, processes (`fork`, `execve`, `wait`, pipes, signal handlers), a virtual clock, and atomics emulated so the vCPU stays RV32IM. C programs linked against musl and a static BusyBox run, `sh` pipelines and job control included, and so do `ps`, `df` and `free`, on a `/proc` the host makes up. `--trace` prints each system call.
+- **Containers** (`shem run`). The host is the guest's kernel: static RV32 Linux programs run with files from a host directory as their root, processes (`fork`, `execve`, `wait`, pipes, signal handlers), a virtual clock, and atomics emulated so the vCPU stays RV32IM. C programs linked against musl and a static [🧰 BusyBox](https://busybox.net) run, `sh` pipelines and job control included, and so do `ps`, `df` and `free`, on a `/proc` the host makes up. `--trace` prints each system call.
 - **Images** (`shem build`). A [Shemfile](docs/shemfile.md) becomes a reproducible OCI image. `WARM` freezes a running guest into the image at build time, so `shem run` resumes it where the build left off. `shem push` and `shem pull` move images through OCI registries.
-- **VM mode** (`shem boot`). The host is the machine around a guest kernel, emulating the privileged architecture, a timer, a UART and a syscon: a no-MMU Linux 6.8 boots to a shell in two seconds. A VM image can ship Linux already booted, so `shem run` starts at its prompt, on either vCPU ([docs/vm.md](docs/vm.md)).
-- **Docker and containerd**. `docker run --runtime io.containerd.shem.v1` and `ctr run` run RV32 programs from ordinary OCI images, built with `docker build --platform linux/riscv32`, on shem ([docs/containerd.md](docs/containerd.md)).
-- **The neural vCPU**. An RV32IM CPU compiled into network weights, one instruction per forward pass, with memory in delta-rule state. It matches the reference vCPU exactly on the official riscv-tests, random programs and a Linux kernel running a shell command, resumes snapshots the reference took, batches every running guest into one forward pass, and shares memory pages between them. On GPUs it is bit-exact against the CPU and runs up to 7.4 million instructions per second across 32,768 guests on an A100 ([docs/neural.md](docs/neural.md)).
-- **The reference vCPU**. An RV32IM interpreter that defines correct behaviour for the neural one, passes the official riscv-tests, and runs about 175 million instructions per second.
+- **VM mode** (`shem boot`). The host is the machine around a guest kernel, emulating the privileged architecture, a timer, a UART and a syscon: a no-MMU [🐧 Linux](https://kernel.org) 6.8 boots to a shell in two seconds. A VM image can ship Linux already booted, so `shem run` starts at its prompt, on either vCPU ([docs/vm.md](docs/vm.md)).
+- **[🐳 Docker](https://www.docker.com) and [📦 containerd](https://containerd.io)**. `docker run --runtime io.containerd.shem.v1` and `ctr run` run RV32 programs from ordinary OCI images, built with `docker build --platform linux/riscv32`, on shem ([docs/containerd.md](docs/containerd.md)).
+- **The neural vCPU**. An RV32IM CPU compiled into network weights and run with [🔥 PyTorch](https://pytorch.org), one instruction per forward pass, with memory in delta-rule state. It matches the reference vCPU exactly on the official riscv-tests, random programs and a Linux kernel running a shell command, resumes snapshots the reference took, batches every running guest into one forward pass, and shares memory pages between them. On GPUs it is bit-exact against the CPU and runs up to 7.4 million instructions per second across 32,768 guests on an A100, measured with [🤗 Hugging Face Jobs](https://huggingface.co/docs/huggingface_hub/guides/jobs) ([docs/neural.md](docs/neural.md)).
+- **The reference vCPU**. An RV32IM interpreter in [🦀 Rust](https://www.rust-lang.org) that defines correct behaviour for the neural one, passes the official riscv-tests, and runs about 175 million instructions per second.
 
 See the [roadmap](docs/architecture.md#roadmap) for what is next.
 
 ## Getting started
 
-You need Rust 1.88 or later and Docker. The neural vCPU also needs [uv](https://docs.astral.sh/uv/). Pushing images needs [ORAS](https://oras.land). Guest programs are static RV32 Linux executables built with Zig against musl in a [toolchain image](toolchain/).
+You need [🦀 Rust](https://www.rust-lang.org) 1.88 or later and [🐳 Docker](https://www.docker.com). The neural vCPU also needs [⚡ uv](https://docs.astral.sh/uv/). Pushing images needs [🗄️ ORAS](https://oras.land). Guest programs are static RV32 Linux executables built with [🦎 Zig](https://ziglang.org) against musl in a [toolchain image](toolchain/).
 
 Build shem and put it on your `PATH`.
 
