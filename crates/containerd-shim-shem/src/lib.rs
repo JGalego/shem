@@ -10,3 +10,4 @@ pub mod bundle;
 pub mod holder;
 #[cfg(target_os = "linux")]
 pub mod service;
+pub mod session;

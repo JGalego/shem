@@ -53,6 +53,13 @@ pub struct Bundle {
     pub root: PathBuf,
     pub memory: u32,
     pub vcpu: VcpuKind,
+    /// The container's ID: the bundle directory's name, as containerd makes it.
+    pub id: String,
+    /// Whether the process has a terminal (`docker run -t`).
+    pub terminal: bool,
+    /// Whether this is a Kubernetes pod's sandbox, which only holds the pod's
+    /// namespaces: its pause program is not a guest.
+    pub sandbox: bool,
 }
 
 impl Bundle {
@@ -94,6 +101,10 @@ impl Bundle {
             root: dir.join(root),
             memory,
             vcpu,
+            id: (dir.file_name())
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+            terminal: process["terminal"].as_bool().unwrap_or(false),
+            sandbox: annotations["io.kubernetes.cri.container-type"] == "sandbox",
         })
     }
 }
@@ -120,8 +131,17 @@ fn warm_state(root: &Path) -> anyhow::Result<Option<Frozen>> {
 /// it at the next slice boundary, with the status a shell reports for that
 /// signal.
 pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8> {
+    if bundle.sandbox {
+        // A pod's sandbox: the holder keeps its namespaces, and it waits to be stopped
+        loop {
+            match kill.load(Ordering::SeqCst) {
+                0 => std::thread::sleep(std::time::Duration::from_millis(100)),
+                signal => return Ok(128u32.saturating_add(signal) as u8),
+            }
+        }
+    }
     if bundle.args[0].starts_with("shem:") {
-        return run_driver(bundle, stdio);
+        return crate::session::run(bundle, stdio, kill);
     }
     match &bundle.vcpu {
         VcpuKind::Reference => run_on(bundle, stdio, kill, SLICE, |mem| {
@@ -137,60 +157,6 @@ pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8
         }),
     }
 }
-
-/// Run a driver command, such as a model image's `shem:generate`, on the
-/// model server, with the container's arguments as its command line. When
-/// they hold no prompt, stdin is the prompt.
-fn run_driver(bundle: &Bundle, mut stdio: Stdio) -> anyhow::Result<u8> {
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
-
-    if bundle.args[0] != "shem:generate" {
-        bail!("unknown driver {}: shem has shem:generate", bundle.args[0]);
-    }
-    let socket = match &bundle.vcpu {
-        VcpuKind::Neural(socket) => socket.clone(),
-        VcpuKind::Reference => PathBuf::from(DEFAULT_NEURAL_SOCKET),
-    };
-    let mut stdin = String::new();
-    stdio.stdin.read_to_string(&mut stdin)?;
-    let session = bundle.root.join(WARM_DIR);
-    let mut request = serde_json::json!({
-        "model": bundle.root.join("model"),
-        "argv": &bundle.args[1..],
-        "stdin": stdin,
-    });
-    if session.join("session.json").is_file() {
-        request["session"] = session.display().to_string().into();
-    }
-    let mut stream = UnixStream::connect(&socket)
-        .with_context(|| format!("connecting to the model server at {}", socket.display()))?;
-    let payload = [&[GENERATE][..], &serde_json::to_vec(&request)?].concat();
-    stream.write_all(&[&(payload.len() as u32).to_le_bytes()[..], &payload].concat())?;
-    loop {
-        let mut header = [0u8; 4];
-        stream.read_exact(&mut header)?;
-        let mut frame = vec![0u8; u32::from_le_bytes(header) as usize];
-        stream.read_exact(&mut frame)?;
-        match frame.split_first() {
-            Some((&CHUNK, text)) => {
-                stdio.stdout.write_all(text)?;
-                stdio.stdout.flush()?;
-            }
-            Some((&OK, _)) => return Ok(0),
-            Some((_, message)) => {
-                writeln!(stdio.stderr, "shem: {}", String::from_utf8_lossy(message))?;
-                return Ok(1);
-            }
-            None => bail!("the model server sent an empty frame"),
-        }
-    }
-}
-
-/// The model server's protocol: the `GENERATE` op, and its result statuses.
-const GENERATE: u8 = 14;
-const OK: u8 = 0;
-const CHUNK: u8 = 3;
 
 fn run_on<V: Vcpu + Clone>(
     bundle: &Bundle,
