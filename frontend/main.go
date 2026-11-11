@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -67,22 +68,22 @@ func build(ctx context.Context, c client.Client) (*client.Result, error) {
 		}
 	}
 	inputs := map[string]*pb.Definition{}
-	files := map[string][]string{}
+	imported := map[string]Imported{}
 	imports, err := Imports(src)
 	if err != nil {
 		return nil, err
 	}
 	for _, imp := range imports {
-		def, list, err := importModel(ctx, c, imp, neuralImage, buildPlatform)
+		def, model, err := importModel(ctx, c, imp, neuralImage, buildPlatform)
 		if err != nil {
 			return nil, fmt.Errorf("importing %s: %w", imp.Repo, err)
 		}
-		files[imp.Name] = list
+		imported[imp.Name] = model
 		inputs[imp.Name] = def
 		forward["context:"+imp.Name] = "input:" + imp.Name
 	}
 
-	dockerfile, err := Transpile(src, files, neuralImage)
+	dockerfile, err := Transpile(src, imported, neuralImage)
 	if err != nil {
 		return nil, err
 	}
@@ -125,10 +126,11 @@ func readShemfile(ctx context.Context, c client.Client, filename string) ([]byte
 }
 
 // importModel runs the importer for `imp` in the shem-neural image, on the
-// build platform, and returns its result and the files it wrote, relative to
-// the model's directory. A Hugging Face token, for gated models, comes from
+// build platform, and returns its result, the files it wrote (relative to the
+// model's directory) and the licence the model card declares. A Hugging Face token, for gated models, comes from
 // the build's secret HF_TOKEN, and downloads are cached between builds.
-func importModel(ctx context.Context, c client.Client, imp Import, neuralImage string, platform ocispecs.Platform) (*pb.Definition, []string, error) {
+func importModel(ctx context.Context, c client.Client, imp Import, neuralImage string, platform ocispecs.Platform) (*pb.Definition, Imported, error) {
+	var model Imported
 	args := []string{"shem-neural-import", imp.Repo, importDir}
 	if imp.Revision != "" {
 		args = append(args, "--revision", imp.Revision)
@@ -142,27 +144,39 @@ func importModel(ctx context.Context, c client.Client, imp Import, neuralImage s
 	).Root()
 	def, err := state.Marshal(ctx, llb.Platform(platform))
 	if err != nil {
-		return nil, nil, err
+		return nil, model, err
 	}
 	res, err := c.Solve(ctx, client.SolveRequest{Definition: def.ToPB(), Evaluate: true})
 	if err != nil {
-		return nil, nil, err
+		return nil, model, err
 	}
 	ref, err := res.SingleRef()
 	if err != nil {
-		return nil, nil, err
+		return nil, model, err
 	}
-	var files []string
 	for _, dir := range []string{"", "blocks"} {
 		entries, err := ref.ReadDir(ctx, client.ReadDirRequest{Path: path.Join(importDir, dir)})
 		if err != nil {
-			return nil, nil, err
+			return nil, model, err
 		}
 		for _, entry := range entries {
 			if !entry.IsDir() {
-				files = append(files, strings.TrimPrefix(path.Join(dir, entry.GetPath()), "/"))
+				model.Files = append(model.Files, strings.TrimPrefix(path.Join(dir, entry.GetPath()), "/"))
 			}
 		}
 	}
-	return def.ToPB(), files, nil
+	manifest, err := ref.ReadFile(ctx, client.ReadRequest{Filename: path.Join(importDir, "shem.json")})
+	if err != nil {
+		return nil, model, err
+	}
+	var parsed struct {
+		Source struct {
+			SPDX string `json:"spdx"`
+		} `json:"source"`
+	}
+	if err := json.Unmarshal(manifest, &parsed); err != nil {
+		return nil, model, fmt.Errorf("the model's manifest: %w", err)
+	}
+	model.License = parsed.Source.SPDX
+	return def.ToPB(), model, nil
 }

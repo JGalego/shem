@@ -197,7 +197,15 @@ The slower suites are ignored tests that need inputs built first: guest programs
 
 A release publishes the `shem` and `containerd-shim-shem` crates on crates.io, the `shem-neural` package on PyPI, binaries for Linux (x86_64 and arm64) and macOS (arm64) with build provenance on the GitHub release, the guest toolchain and `shem-neural` runtime images on GHCR with SBOMs and provenance, every example as a shem image on GHCR (`ghcr.io/jgalego/shem/qwen3`, `…/golem`, `…/linux` and so on), and the compiled CPU's weights with a model card on the Hugging Face Hub ([jgalego/shem-rv32im](https://huggingface.co/jgalego/shem-rv32im)), with release notes from the commit messages ([`release.yml`](.github/workflows/release.yml)). CI packages everything on every push, so a release does not fail on packaging.
 
-Set the same version in [`Cargo.toml`](Cargo.toml) and [`neural/pyproject.toml`](neural/pyproject.toml), and commit it.
+Set the same version in [`Cargo.toml`](Cargo.toml) and [`neural/pyproject.toml`](neural/pyproject.toml).
+
+Update the changelog from the commit messages.
+
+```sh
+git cliff --tag v0.2.0 -o CHANGELOG.md
+```
+
+Commit the release.
 
 ```sh
 git commit -am "chore: release 0.2.0"

@@ -7,9 +7,9 @@ import (
 
 const neural = "shem-neural:test"
 
-func transpile(t *testing.T, src string, files map[string][]string) string {
+func transpile(t *testing.T, src string, imported map[string]Imported) string {
 	t.Helper()
-	out, err := Transpile([]byte(src), files, neural)
+	out, err := Transpile([]byte(src), imported, neural)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,11 +47,11 @@ func TestModelsBecomeOneLayerPerBlock(t *testing.T) {
 	if len(imports) != 1 || imports[0] != (Import{"shem-import-0", "Qwen/Qwen3-0.6B", "main"}) {
 		t.Fatalf("imports %+v", imports)
 	}
-	files := map[string][]string{"shem-import-0": {
+	imported := map[string]Imported{"shem-import-0": {Files: []string{
 		"shem.json", "tokenizer.json", "embed.safetensors", "head.safetensors",
 		"blocks/000-attention.safetensors", "blocks/001-mlp.safetensors",
-	}}
-	out := transpile(t, src, files)
+	}, License: "Apache-2.0"}}
+	out := transpile(t, src, imported)
 	for _, line := range []string{
 		"FROM scratch AS qwen",
 		"COPY --link --from=shem-import-0 /out/model/shem.json /out/model/tokenizer.json /model/",
@@ -59,6 +59,8 @@ func TestModelsBecomeOneLayerPerBlock(t *testing.T) {
 		"COPY --link --from=shem-import-0 /out/model/blocks/001-mlp.safetensors /model/blocks/",
 		"COPY --link --from=shem-import-0 /out/model/embed.safetensors /model/",
 		`LABEL dev.shem.machine="rv32im" dev.shem.model="/model"`,
+		`LABEL org.opencontainers.image.source="https://huggingface.co/Qwen/Qwen3-0.6B"`,
+		`LABEL org.opencontainers.image.licenses="Apache-2.0"`,
 		`ENTRYPOINT ["shem:generate"]`,
 		`CMD ["hi"]`,
 	} {
@@ -76,7 +78,7 @@ func TestManyBlocksShareLayers(t *testing.T) {
 	for i := range 300 {
 		files = append(files, "blocks/"+strings.Repeat("0", 3-len(itoa(i)))+itoa(i)+"-mlp.safetensors")
 	}
-	out := transpile(t, "FROM hf.co/big/model\n", map[string][]string{"shem-import-0": files})
+	out := transpile(t, "FROM hf.co/big/model\n", map[string]Imported{"shem-import-0": {Files: files}})
 	if n := strings.Count(out, "COPY"); n > maxModelLayers {
 		t.Errorf("%d layers, more than %d", n, maxModelLayers)
 	}
@@ -95,7 +97,7 @@ ENTRYPOINT ["shem:generate", "--system", "You are a golem."]
 WARM --until=prompt
 CMD ["Who are you?"]
 `
-	out := transpile(t, src, map[string][]string{"shem-import-0": {"shem.json"}})
+	out := transpile(t, src, map[string]Imported{"shem-import-0": {Files: []string{"shem.json"}}})
 	for _, line := range []string{
 		"FROM scratch AS shem-0-before-warm-0",
 		"FROM --platform=$BUILDPLATFORM shem-neural:test AS shem-0-warm-0",
@@ -126,7 +128,7 @@ func TestShemStagesRefuseWhatTheyCannotDo(t *testing.T) {
 		"FROM alpine AS build\nWARM --until=prompt\nFROM scratch\n",
 		"ARG ONLY=1\n",
 	} {
-		if _, err := Transpile([]byte(src), map[string][]string{}, neural); err == nil {
+		if _, err := Transpile([]byte(src), map[string]Imported{}, neural); err == nil {
 			t.Errorf("want an error for\n%s", src)
 		}
 	}

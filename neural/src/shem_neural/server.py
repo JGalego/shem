@@ -307,6 +307,8 @@ def make_server(socket_path: Path, dense: bool = False) -> tuple[socketserver.Ba
     socket_path.unlink(missing_ok=True)
     server = socketserver.ThreadingUnixStreamServer(str(socket_path), Handler)
     server.daemon_threads = True
+    # Only this user, and root (as the containerd shim runs), may connect
+    os.chmod(socket_path, 0o600)
     return server, registry
 
 

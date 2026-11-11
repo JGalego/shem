@@ -123,6 +123,7 @@ impl Builder<'_> {
                     revision.as_deref(),
                     &self.root.join(model::MODEL_DIR),
                 )?;
+                self.image.config.labels.extend(model::labels(&self.root)?);
                 for group in model::layer_groups(&self.root)? {
                     self.add_layer(&group, &[])?;
                 }

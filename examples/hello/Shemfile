@@ -7,5 +7,6 @@ RUN rv32-cc -O2 -o hello hello.c
 
 FROM scratch
 COPY --from=build /src/hello /bin/hello
+LABEL org.opencontainers.image.licenses="MIT"
 ENTRYPOINT ["/bin/hello"]
 CMD ["from", "a", "shem", "image"]

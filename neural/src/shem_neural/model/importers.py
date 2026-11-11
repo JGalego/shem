@@ -22,7 +22,9 @@ from safetensors.torch import save_file
 
 from .manifest import BlockSpec, Manifest
 
-PATTERNS = ["*.json", "*.safetensors", "*.jinja"]
+PATTERNS = ["*.json", "*.safetensors", "*.jinja", "LICENSE*", "NOTICE*", "README.md"]
+# Hugging Face licence tags as SPDX identifiers, for the image's licence label
+SPDX = {"apache-2.0": "Apache-2.0", "mit": "MIT", "bsd-3-clause": "BSD-3-Clause", "cc-by-4.0": "CC-BY-4.0"}
 
 
 class Checkpoint:
@@ -159,6 +161,26 @@ def eos_tokens(checkpoint: Checkpoint, cfg: dict) -> list[int]:
     return sorted(set(ids))
 
 
+def model_license(directory: Path) -> dict:
+    """The licence a checkpoint's model card declares in its front matter: the
+    Hugging Face tag, its SPDX identifier where there is one, and its link."""
+    card = directory / "README.md"
+    if not card.exists():
+        return {}
+    text = card.read_text(errors="replace")
+    if not text.startswith("---"):
+        return {}
+    front = text.split("---", 2)[1]
+    fields = dict(line.split(":", 1) for line in front.splitlines() if ":" in line and not line.startswith(" "))
+    tag = fields.get("license", "").strip()
+    if not tag:
+        return {}
+    found = {"license": tag, "spdx": SPDX.get(tag, f"LicenseRef-{tag}")}
+    if fields.get("license_link"):
+        found["license_link"] = fields["license_link"].strip()
+    return found
+
+
 def import_model(repo: str, out: Path, revision: str | None = None) -> Manifest:
     """Download `repo` from Hugging Face and write it to `out` as a shem model."""
     directory = Path(snapshot_download(repo, revision=revision, allow_patterns=PATTERNS))
@@ -171,6 +193,9 @@ def import_model(repo: str, out: Path, revision: str | None = None) -> Manifest:
     embed, head, cfg = IMPORTERS[architecture](writer)
 
     shutil.copy(directory / "tokenizer.json", out / "tokenizer.json")
+    # The weights' licence and notices travel with them
+    for notice in sorted(directory.glob("LICENSE*")) + sorted(directory.glob("NOTICE*")):
+        shutil.copy(notice, out / notice.name)
     template = directory / "chat_template.jinja"
     if template.exists():
         shutil.copy(template, out / "chat_template.jinja")
@@ -187,7 +212,7 @@ def import_model(repo: str, out: Path, revision: str | None = None) -> Manifest:
         embed=embed,
         blocks=writer.blocks,
         head=head,
-        source={"repo": repo, "revision": directory.name, "architecture": architecture},
+        source={"repo": repo, "revision": directory.name, "architecture": architecture} | model_license(directory),
     )
     manifest.save(out)
     return manifest
