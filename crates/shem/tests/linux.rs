@@ -35,6 +35,7 @@ const KILL: u32 = 129;
 const RT_SIGACTION: u32 = 134;
 const UNAME: u32 = 160;
 const CLONE: u32 = 220;
+const MMAP: u32 = 222;
 const EXECVE: u32 = 221;
 const WAIT4: u32 = 260;
 const RENAMEAT2: u32 = 276;
@@ -64,6 +65,10 @@ const SIGPIPE: u32 = 13;
 const CLONE_VM: u32 = 0x100;
 const CLONE_THREAD: u32 = 0x10000;
 const WNOHANG: u32 = 1;
+const PROT_READ: u32 = 1;
+const PROT_WRITE: u32 = 2;
+const MAP_SHARED: u32 = 1;
+const MAP_PRIVATE: u32 = 2;
 
 const ENOENT: i32 = -2;
 const EBADF: i32 = -9;
@@ -76,6 +81,7 @@ const ENOEXEC: i32 = -8;
 const EAGAIN: i32 = -11;
 const EPIPE: i32 = -32;
 const EBUSY: i32 = -16;
+const ENODEV: i32 = -19;
 
 const MEM: u32 = 1 << 20;
 
@@ -293,6 +299,37 @@ fn statx_reports_files_links_and_stdio() {
 }
 
 #[test]
+fn file_metadata_follows_the_virtual_clock_not_the_host() {
+    const EPOCH_S: u64 = 1_767_225_600; // 2026-01-01, the virtual clock's start
+    let mut g = Guest::new();
+    g.retired = 1_000;
+    let fd = g.open("/new", O_WRONLY | O_CREAT);
+    g.retired = 5_000;
+    assert_eq!(g.write(fd, b"hello"), 5);
+
+    let (_, st) = g.statx(AT_FDCWD, "/new", 0);
+    let time = |st: &[u8], at: usize| (dword(st, at), word(st, at + 8));
+    assert_eq!(time(&st, 64), (EPOCH_S, 1_000), "accessed: when created");
+    assert_eq!(time(&st, 112), (EPOCH_S, 5_000), "modified: when written");
+    assert_eq!(time(&st, 96), (EPOCH_S, 5_000), "changed: as modified");
+    let (_, root) = g.statx(AT_FDCWD, "/", 0);
+    assert_eq!(time(&root, 112), (EPOCH_S, 1_000), "the directory, when the file appeared");
+
+    // Inode numbers count up as files are first seen; the device and the
+    // block count are fixed or computed
+    assert_eq!((dword(&st, 32), dword(&root, 32)), (1, 2));
+    assert_eq!(g.statx(AT_FDCWD, "/new", 0).1, st);
+    assert_eq!((word(&st, 136), word(&st, 140)), (8, 1), "device 8:1");
+    assert_eq!((word(&st, 4), dword(&st, 48)), (4096, 8), "one 4 KiB block");
+
+    g.retired = 9_000;
+    let path = g.cstr("/new");
+    assert_eq!(g.call(UNLINKAT, &[AT_FDCWD, path, 0]), 0);
+    let (_, root) = g.statx(AT_FDCWD, "/", 0);
+    assert_eq!(time(&root, 112), (EPOCH_S, 9_000), "the directory, when the file went");
+}
+
+#[test]
 fn working_directory_and_relative_paths() {
     let mut g = Guest::new();
     let buf = g.buf(64);
@@ -360,6 +397,31 @@ fn guest_paths_never_reach_host_files_outside_the_root() {
     assert_eq!(g.write(fd, b"guest data"), 10);
     assert_eq!(fs::read(&inside).unwrap(), b"guest data");
     assert_eq!(fs::read(outside).unwrap(), b"");
+}
+
+#[test]
+fn files_map_as_private_copies() {
+    let mut g = Guest::new();
+    let data: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+    fs::write(g.host("data"), &data).unwrap();
+    let fd = g.open("/data", O_RDONLY) as u32;
+
+    // From the second page: the rest of the file, then zeros
+    let private = PROT_READ | PROT_WRITE;
+    let at = g.call(MMAP, &[0, 8192, private, MAP_PRIVATE, fd, 1]) as u32;
+    assert_eq!(g.get(at, 6000 - 4096), &data[4096..]);
+    assert_eq!(g.get(at + 6000 - 4096, 16), [0; 16]);
+    g.vcpu.write_mem(at, b"changed").unwrap();
+    assert_eq!(fs::read(g.host("data")).unwrap(), data, "writes stay private");
+
+    let shared = g.call(MMAP, &[0, 4096, PROT_READ, MAP_SHARED, fd, 0]) as u32;
+    assert_eq!(g.get(shared, 4096), &data[..4096]);
+    let writable = [0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0];
+    assert_eq!(g.call(MMAP, &writable), ENODEV);
+
+    let write_only = g.open("/data", O_WRONLY) as u32;
+    assert_eq!(g.call(MMAP, &[0, 4096, PROT_READ, MAP_PRIVATE, write_only, 0]), EACCES);
+    assert_eq!(g.call(MMAP, &[0, 4096, PROT_READ, MAP_PRIVATE, 0, 0]), ENODEV, "stdin");
 }
 
 #[test]

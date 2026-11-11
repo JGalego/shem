@@ -199,8 +199,12 @@ pub const CLOCK_REALTIME: u32 = 0;
 pub const CLOCK_REALTIME_COARSE: u32 = 5;
 pub const CLOCK_TAI: u32 = 11;
 
+pub const MAP_SHARED: u32 = 0x01;
 pub const MAP_FIXED: u32 = 0x10;
 pub const MAP_ANONYMOUS: u32 = 0x20;
+pub const PROT_WRITE: u32 = 0x2;
+/// `mmap2` takes its file offset in units of this many bytes.
+pub const MMAP_UNIT: u64 = 4096;
 
 pub const WNOHANG: u32 = 1;
 pub const WEXITED: u32 = 4;
@@ -255,21 +259,30 @@ pub struct Stat {
 }
 
 const STATX_BASIC_STATS: u32 = 0x7ff;
+/// The device every file in the root filesystem is on: 8:1, the first SCSI
+/// disk's first partition.
+pub const GUEST_DEV: u64 = 0x801;
 pub const STATX_SIZE: usize = 256;
 
 impl Stat {
-    pub fn from_metadata(meta: &Metadata) -> Self {
+    /// A host file's status as the guest sees it, with the guest inode number
+    /// `ino`. Only what the guest controls comes from the host: the type,
+    /// permissions, links, size, and the access and modification times, which
+    /// the host keeps on the virtual clock. The device and block counts are
+    /// fixed or computed, and the change time is the modification time, since
+    /// the host cannot set it, so stat results do not depend on the host.
+    pub fn from_metadata(meta: &Metadata, ino: u64) -> Self {
         Self {
             mode: meta.mode(),
             nlink: meta.nlink() as u32,
-            ino: meta.ino(),
+            ino,
             size: meta.size(),
-            blocks: meta.blocks(),
-            blksize: meta.blksize() as u32,
+            blocks: meta.size().div_ceil(4096) * 8,
+            blksize: 4096,
             atime: (meta.atime(), meta.atime_nsec() as u32),
             mtime: (meta.mtime(), meta.mtime_nsec() as u32),
-            ctime: (meta.ctime(), meta.ctime_nsec() as u32),
-            dev: meta.dev(),
+            ctime: (meta.mtime(), meta.mtime_nsec() as u32),
+            dev: GUEST_DEV,
             rdev: meta.rdev(),
         }
     }

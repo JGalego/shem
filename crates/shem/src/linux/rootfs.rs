@@ -14,11 +14,12 @@
 //! its system calls one at a time. On Linux, `openat2` with `RESOLVE_IN_ROOT`
 //! would close the gap.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use super::abi::Errno;
 
@@ -29,6 +30,9 @@ const NAME_MAX: usize = 255;
 
 pub struct RootFs {
     root: PathBuf,
+    /// Guest inode numbers by host device and inode, handed out in the order
+    /// files are first seen, so they do not depend on the host filesystem.
+    inodes: Mutex<HashMap<(u64, u64), u64>>,
 }
 
 /// A resolved path: where it lives on the host, and its canonical guest path.
@@ -45,7 +49,17 @@ impl RootFs {
         if !root.is_dir() {
             return Err(ErrorKind::NotADirectory.into());
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            inodes: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The guest inode number of the host file `ino` on the host device `dev`.
+    pub fn inode(&self, dev: u64, ino: u64) -> u64 {
+        let mut inodes = self.inodes.lock().unwrap();
+        let next = inodes.len() as u64 + 1;
+        *inodes.entry((dev, ino)).or_insert(next)
     }
 
     /// Resolve `path` against `base`, an absolute guest directory. The last

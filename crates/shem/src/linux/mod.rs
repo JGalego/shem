@@ -180,6 +180,9 @@ pub struct Process {
     umask: u32,
     pub signals: Signals,
     pub mm: AddressSpace,
+    /// The virtual time of the system call being serviced, in nanoseconds
+    /// since the epoch, for the timestamps of files the call changes.
+    now: u64,
 }
 
 impl Default for Linux {
@@ -218,6 +221,7 @@ impl Linux {
         let nr = vcpu.reg(A7);
         let a: [u32; 6] = std::array::from_fn(|i| vcpu.reg(A0 + i));
         let p = process;
+        p.now = EPOCH_NS + retired + self.slept_ns;
         let result = match nr {
             nr::EXIT | nr::EXIT_GROUP => return Action::Exit(Termination::Exited(a[0] as u8)),
             nr::CLONE => match clone(a[0]) {
@@ -278,10 +282,7 @@ impl Linux {
             nr::READLINKAT => p.readlinkat(vcpu, a[0], a[1], a[2], a[3]),
             nr::RENAMEAT2 => p.renameat2(vcpu, (a[0], a[1]), (a[2], a[3]), a[4]),
             nr::SENDFILE64 => p.sendfile(vcpu, a[0], a[1], a[2], a[3]),
-            nr::UTIMENSAT_TIME64 => {
-                let now = EPOCH_NS + retired + self.slept_ns;
-                p.utimensat(vcpu, a[0], a[1], a[2], a[3], now)
-            }
+            nr::UTIMENSAT_TIME64 => p.utimensat(vcpu, a[0], a[1], a[2], a[3]),
             nr::DUP => p.dup(a[0], 0, false),
             nr::DUP3 => p.dup3(a[0], a[1], a[2]),
             nr::FCNTL64 => p.fcntl(a[0], a[1], a[2]),
@@ -289,7 +290,7 @@ impl Linux {
             nr::IOCTL => Err(Errno::ENOTTY), // no terminals
             nr::UMASK => Ok(std::mem::replace(&mut p.umask, a[0] & 0o777)),
             nr::BRK => Ok(p.mm.set_brk(vcpu, a[0])),
-            nr::MMAP => p.mmap(vcpu, a[0], a[1], a[3]),
+            nr::MMAP => p.mmap(vcpu, a[0], a[1], a[2], a[3], (a[4], a[5])),
             nr::MUNMAP => p.mm.unmap(a[0], a[1]).map(|()| 0).map_err(Errno::from),
             nr::MREMAP => Err(Errno::ENOMEM), // callers fall back to map, copy, unmap
             nr::MPROTECT | nr::MADVISE => Ok(0), // guest memory has no protection bits
@@ -438,6 +439,7 @@ impl Process {
             umask: 0o022,
             signals: Signals::default(),
             mm: AddressSpace::new(brk, top),
+            now: 0,
         }
     }
 
@@ -500,6 +502,7 @@ impl Process {
             umask: self.umask,
             signals: self.signals.fork(),
             mm: self.mm.clone(),
+            now: self.now,
         }
     }
 
@@ -569,13 +572,31 @@ impl Process {
         Ok(0)
     }
 
-    /// Anonymous mappings only. The offset argument is ignored, which is correct
-    /// for anonymous memory.
-    fn mmap(&mut self, vcpu: &mut dyn Vcpu, addr: u32, len: u32, flags: u32) -> Result<u32, Errno> {
-        if flags & MAP_ANONYMOUS == 0 {
+    /// Anonymous mappings, and copies of files: a file mapping holds the file's
+    /// bytes from `pgoff` units in, as a private mapping does until the file
+    /// changes. That is also right for a shared mapping that is only read; one
+    /// that can be written would have to write back to the file, which the host
+    /// does not do, so it fails.
+    fn mmap(
+        &mut self,
+        vcpu: &mut dyn Vcpu,
+        addr: u32,
+        len: u32,
+        prot: u32,
+        flags: u32,
+        (fd, pgoff): (u32, u32),
+    ) -> Result<u32, Errno> {
+        let fixed = flags & MAP_FIXED != 0;
+        if flags & MAP_ANONYMOUS != 0 {
+            return Ok(self.mm.map(vcpu, addr, len, fixed)?);
+        }
+        if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 {
             return Err(Errno::ENODEV);
         }
-        Ok(self.mm.map(vcpu, addr, len, flags & MAP_FIXED != 0)?)
+        let data = self.mapped_bytes(fd, pgoff as u64 * MMAP_UNIT, len)?;
+        let at = self.mm.map(vcpu, addr, len, fixed)?;
+        vcpu.write_mem(at, &data)?;
+        Ok(at)
     }
 }
 

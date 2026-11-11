@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use super::abi::*;
-use super::rootfs::{PATH_MAX, Resolved};
+use super::rootfs::{PATH_MAX, Resolved, RootFs};
 use super::{Exec, IOV_MAX, MAX_IO, NS_PER_SEC, Process, Stdio};
 use crate::elf;
 use crate::vcpu::Vcpu;
@@ -213,6 +213,13 @@ impl FdTable {
 }
 
 impl Description {
+    /// Stamp a file just written with the virtual time `now`.
+    fn modified(&self, now: u64) {
+        if let Kind::File(file) = &self.kind {
+            let _ = file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_nanos(now));
+        }
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Errno> {
         if self.flags & O_ACCMODE == O_WRONLY {
             return Err(Errno::EBADF);
@@ -288,10 +295,10 @@ impl Description {
         Ok(data.len())
     }
 
-    fn stat(&self) -> Result<Stat, Errno> {
+    fn stat(&self, root: Option<&RootFs>) -> Result<Stat, Errno> {
         match &self.kind {
-            Kind::File(file) => Ok(Stat::from_metadata(&file.metadata()?)),
-            Kind::Dir(dir) => Ok(Stat::from_metadata(&std::fs::metadata(&dir.host)?)),
+            Kind::File(file) => Ok(guest_stat(root, &file.metadata()?)),
+            Kind::Dir(dir) => Ok(guest_stat(root, &std::fs::metadata(&dir.host)?)),
             Kind::Input(_) | Kind::Output(_) => Ok(Stat::char_device()),
             Kind::Pipe(_) => Ok(Stat::fifo()),
             Kind::Device(device) => Ok(device.stat()),
@@ -364,6 +371,7 @@ impl Process {
         let resolved = self.resolve_at(vcpu, dirfd, path, flags & O_NOFOLLOW == 0)?;
         let access = flags & O_ACCMODE;
         let creating = flags & O_CREAT != 0;
+        let existed = std::fs::symlink_metadata(&resolved.host).is_ok();
         let kind = match std::fs::symlink_metadata(&resolved.host) {
             Ok(meta) if meta.is_symlink() => return Err(Errno::ELOOP),
             Ok(_) if creating && flags & O_EXCL != 0 => return Err(Errno::EEXIST),
@@ -371,7 +379,7 @@ impl Process {
                 if access != O_RDONLY || creating {
                     return Err(Errno::EISDIR);
                 }
-                Kind::Dir(list_dir(resolved)?)
+                Kind::Dir(list_dir(self.root.as_deref(), resolved.clone())?)
             }
             Ok(_) if flags & O_DIRECTORY != 0 => return Err(Errno::ENOTDIR),
             Err(err) if !creating || err.kind() != std::io::ErrorKind::NotFound => {
@@ -392,6 +400,11 @@ impl Process {
                     options.create(true).write(true);
                 }
                 let file = options.open(&resolved.host)?;
+                if !existed {
+                    self.created(&resolved);
+                } else if flags & O_TRUNC != 0 && access != O_RDONLY {
+                    stamp(&resolved.host, None, Some(self.now));
+                }
                 Kind::File(file)
             }
         };
@@ -400,6 +413,33 @@ impl Process {
             flags: flags & (O_ACCMODE | O_APPEND),
         };
         self.files.install(description, 0, flags & O_CLOEXEC != 0)
+    }
+
+    /// The bytes a mapping of `len` bytes of the file open on `fd`, from
+    /// `offset`, starts with: the file's, as far as it goes. The rest of the
+    /// mapping is zeros.
+    pub(super) fn mapped_bytes(&self, fd: u32, offset: u64, len: u32) -> Result<Vec<u8>, Errno> {
+        let description = self.files.get(fd)?;
+        let description = description.lock().unwrap();
+        if description.flags & O_ACCMODE == O_WRONLY {
+            return Err(Errno::EACCES);
+        }
+        match &description.kind {
+            Kind::File(file) => {
+                let mut data = vec![0; len as usize];
+                let mut filled = 0;
+                while filled < data.len() {
+                    match file.read_at(&mut data[filled..], offset + filled as u64)? {
+                        0 => break,
+                        n => filled += n,
+                    }
+                }
+                data.truncate(filled);
+                Ok(data)
+            }
+            Kind::Device(Device::Zero) => Ok(Vec::new()), // the same as anonymous memory
+            _ => Err(Errno::ENODEV),
+        }
     }
 
     pub(super) fn close(&mut self, fd: u32) -> Result<u32, Errno> {
@@ -428,8 +468,28 @@ impl Process {
     ) -> Result<u32, Errno> {
         let mut data = vec![0; count.min(MAX_IO) as usize];
         vcpu.read_mem(buf, &mut data)?;
-        let n = self.files.get(fd)?.lock().unwrap().write(&data)?;
+        let description = self.files.get(fd)?;
+        let mut description = description.lock().unwrap();
+        let n = description.write(&data)?;
+        description.modified(self.now);
         Ok(n as u32)
+    }
+
+    /// Stamp a file the guest just created, and the directory it is in, with
+    /// the virtual time.
+    fn created(&self, resolved: &Resolved) {
+        stamp(&resolved.host, Some(self.now), Some(self.now));
+        self.changed_dir(resolved);
+    }
+
+    /// Stamp the directory holding `resolved` as modified now, since an entry
+    /// in it was added, removed or renamed.
+    fn changed_dir(&self, resolved: &Resolved) {
+        if resolved.guest != b"/"
+            && let Some(parent) = resolved.host.parent()
+        {
+            stamp(parent, None, Some(self.now));
+        }
     }
 
     pub(super) fn readv(
@@ -545,15 +605,16 @@ impl Process {
             if dirfd == AT_FDCWD {
                 self.stat_path(&self.cwd.clone(), true)?
             } else {
-                self.files.get(dirfd)?.lock().unwrap().stat()?
+                self.files.get(dirfd)?.lock().unwrap().stat(self.root())?
             }
         } else {
             match self.device_at(vcpu, dirfd, path)? {
                 Some(Ok(device)) => device.stat(),
-                Some(Err(stream)) => self.files.get(stream)?.lock().unwrap().stat()?,
+                Some(Err(stream)) => self.files.get(stream)?.lock().unwrap().stat(self.root())?,
                 None => {
                     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-                    stat_host(&self.resolve_at(vcpu, dirfd, path, follow)?, follow)?
+                    let resolved = self.resolve_at(vcpu, dirfd, path, follow)?;
+                    stat_host(self.root(), &resolved, follow)?
                 }
             }
         };
@@ -563,7 +624,7 @@ impl Process {
 
     fn stat_path(&self, guest: &[u8], follow: bool) -> Result<Stat, Errno> {
         let root = self.root.as_ref().ok_or(Errno::ENOENT)?;
-        stat_host(&root.resolve(b"/", guest, follow)?, follow)
+        stat_host(Some(root), &root.resolve(b"/", guest, follow)?, follow)
     }
 
     pub(super) fn faccessat(
@@ -576,7 +637,7 @@ impl Process {
         if self.device_at(vcpu, dirfd, path)?.is_some() {
             return Ok(0);
         }
-        let stat = stat_host(&self.resolve_at(vcpu, dirfd, path, true)?, true)?;
+        let stat = stat_host(self.root(), &self.resolve_at(vcpu, dirfd, path, true)?, true)?;
         // The guest is root, so only execute permission can be missing.
         let is_dir = stat.mode & 0o170000 == 0o040000;
         if mode & X_OK != 0 && !is_dir && stat.mode & 0o111 == 0 {
@@ -614,6 +675,7 @@ impl Process {
         std::fs::DirBuilder::new()
             .mode((mode & !self.umask) & 0o7777)
             .create(&resolved.host)?;
+        self.created(&resolved);
         Ok(0)
     }
 
@@ -640,6 +702,7 @@ impl Process {
             }
             std::fs::remove_file(&resolved.host)?;
         }
+        self.changed_dir(&resolved);
         Ok(0)
     }
 
@@ -657,6 +720,7 @@ impl Process {
         let resolved = self.resolve_at(vcpu, dirfd, path, false)?;
         // The target is stored verbatim; the resolver interprets it inside the root.
         std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &resolved.host)?;
+        self.created(&resolved);
         Ok(0)
     }
 
@@ -695,6 +759,8 @@ impl Process {
             return Err(Errno::EEXIST);
         }
         std::fs::rename(&from.host, &to.host)?;
+        self.changed_dir(&from);
+        self.changed_dir(&to);
         Ok(0)
     }
 
@@ -727,7 +793,10 @@ impl Process {
             vcpu.write_mem(offset, &(position + n as u64).to_le_bytes())?;
             n
         };
-        let n = self.files.get(out_fd)?.lock().unwrap().write(&data[..n])?;
+        let output = self.files.get(out_fd)?;
+        let mut output = output.lock().unwrap();
+        let n = output.write(&data[..n])?;
+        output.modified(self.now);
         Ok(n as u32)
     }
 
@@ -740,8 +809,8 @@ impl Process {
         path: u32,
         times: u32,
         flags: u32,
-        now: u64,
     ) -> Result<u32, Errno> {
+        let now = self.now;
         let mut stamps = [Some(now); 2];
         if times != 0 {
             let mut raw = [0u8; 32];
@@ -938,13 +1007,14 @@ fn normalize(base: &[u8], path: &[u8]) -> Vec<u8> {
     out
 }
 
-fn list_dir(resolved: Resolved) -> Result<Dir, Errno> {
-    let ino = |path: &std::path::Path| std::fs::metadata(path).map(|meta| meta.ino());
-    let own = ino(&resolved.host)?;
+fn list_dir(root: Option<&RootFs>, resolved: Resolved) -> Result<Dir, Errno> {
+    let meta = std::fs::metadata(&resolved.host)?;
+    let ino = |meta: &std::fs::Metadata| guest_ino(root, meta.dev(), meta.ino());
+    let own = ino(&meta);
     let parent = if resolved.guest == b"/" {
         own
     } else {
-        ino(resolved.host.parent().unwrap())?
+        ino(&std::fs::metadata(resolved.host.parent().unwrap())?)
     };
     let mut entries = vec![
         Dirent {
@@ -962,7 +1032,7 @@ fn list_dir(resolved: Resolved) -> Result<Dir, Errno> {
     for entry in std::fs::read_dir(&resolved.host)? {
         let entry = entry?;
         listed.push(Dirent {
-            ino: entry.ino(),
+            ino: guest_ino(root, meta.dev(), entry.ino()),
             kind: dirent_type(entry.file_type()?),
             name: entry.file_name().as_bytes().to_vec(),
         });
@@ -998,13 +1068,48 @@ fn dirent_type(kind: std::fs::FileType) -> u8 {
     }
 }
 
-fn stat_host(resolved: &Resolved, follow: bool) -> Result<Stat, Errno> {
+fn stat_host(root: Option<&RootFs>, resolved: &Resolved, follow: bool) -> Result<Stat, Errno> {
     let meta = if follow {
         std::fs::metadata(&resolved.host)?
     } else {
         std::fs::symlink_metadata(&resolved.host)?
     };
-    Ok(Stat::from_metadata(&meta))
+    Ok(guest_stat(root, &meta))
+}
+
+fn guest_stat(root: Option<&RootFs>, meta: &std::fs::Metadata) -> Stat {
+    Stat::from_metadata(meta, guest_ino(root, meta.dev(), meta.ino()))
+}
+
+/// The guest's inode number for a host file: the root filesystem's, which
+/// does not depend on the host. Without a root there are no host files.
+fn guest_ino(root: Option<&RootFs>, dev: u64, ino: u64) -> u64 {
+    root.map_or(ino, |root| root.inode(dev, ino))
+}
+
+/// Set a host file's access and modification times, in virtual nanoseconds
+/// since the epoch, leaving out those that are `None`. A symlink's own times
+/// are set, not its target's. Failing to set them is not the guest's problem,
+/// so errors are ignored.
+fn stamp(path: &std::path::Path, access: Option<u64>, modify: Option<u64>) {
+    let timespec = |ns: Option<u64>| match ns {
+        Some(ns) => libc::timespec {
+            tv_sec: (ns / NS_PER_SEC) as libc::time_t,
+            tv_nsec: (ns % NS_PER_SEC) as libc::c_long,
+        },
+        None => libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+    };
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    let times = [timespec(access), timespec(modify)];
+    // SAFETY: a NUL-terminated path and two timespecs, as utimensat expects.
+    unsafe {
+        libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW);
+    }
 }
 
 fn iovecs(vcpu: &dyn Vcpu, iov: u32, count: u32) -> Result<Vec<(u32, u32)>, Errno> {
