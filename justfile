@@ -118,17 +118,20 @@ docker-test: toolchain
     just cc -O2 -o target/oci-hello/hello guests/hello.c
     printf 'FROM scratch\nCOPY hello /hello\nENTRYPOINT ["/hello"]\n' | docker build -q --platform linux/riscv32 -t shem-hello:riscv32 -f - target/oci-hello
     docker info --format 'Docker {{{{.ServerVersion}}, storage {{{{.Driver}} {{{{json .DriverStatus}}'
+    # The shim traces every request here, so a hang shows where it is
+    sudo mkdir -p /run/shem
     status=0
-    timeout -k 5 60 docker run --name shem-docker-test --runtime io.containerd.shem.v1 --platform linux/riscv32 shem-hello:riscv32 one two > target/oci-hello/docker.txt 2>&1 || status=$?
+    timeout -k 5 30 docker run --name shem-docker-test --runtime io.containerd.shem.v1 --platform linux/riscv32 shem-hello:riscv32 one two > target/oci-hello/docker.txt 2>&1 || status=$?
     cat target/oci-hello/docker.txt
     echo "docker run exited with status $status (the program exits with its argument count, 3)"
     if ! grep -q "sum of squares below 100000" target/oci-hello/docker.txt || [ "$status" != 3 ]; then
-        docker ps -a --no-trunc --filter name=shem-docker-test || true
-        docker inspect --format '{{{{json .State}}' shem-docker-test || true
-        sudo journalctl -u containerd -u docker --since "-3min" --no-pager | tail -60 || true
+        # Each with a timeout: a stuck container also blocks Docker's commands about it
+        echo "--- the shim's trace"; sudo cat /run/shem/shim.log || true
+        echo "--- containers"; timeout 10 docker ps -a --no-trunc || true
+        echo "--- containerd and Docker"; sudo timeout 20 journalctl -u containerd -u docker --since "-2min" --no-pager | tail -80 || true
         exit 1
     fi
-    docker rm shem-docker-test >/dev/null
+    timeout 10 docker rm shem-docker-test >/dev/null
 
 # Push and pull an image through a local registry; needs Docker and oras
 registry-test:

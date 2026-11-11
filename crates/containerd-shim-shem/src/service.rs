@@ -48,6 +48,25 @@ struct Task {
     kill: Arc<AtomicU32>,
 }
 
+/// Append a line to `/run/shem/shim.log` if that directory exists: an opt-in
+/// trace of every request, for when containerd's own logs are out of reach.
+fn trace(message: impl std::fmt::Display) {
+    let dir = std::path::Path::new("/run/shem");
+    if !dir.is_dir() {
+        return;
+    }
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("shim.log"))
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        let _ = writeln!(log, "{now:.3} [{}] {message}", std::process::id());
+    }
+}
+
 fn error(message: impl std::fmt::Display) -> ttrpc::Error {
     ttrpc::Error::Others(message.to_string())
 }
@@ -69,8 +88,10 @@ impl shim::Shim for Service {
     }
 
     fn start_shim(&mut self, opts: StartOpts) -> Result<String, shim::Error> {
+        trace("start_shim");
         let grouping = opts.id.clone();
         let (_pid, address) = shim::spawn(opts, &grouping, Vec::new())?;
+        trace(format!("start_shim: serving at {address}"));
         Ok(address)
     }
 
@@ -154,6 +175,7 @@ impl shim::Task for Service {
         _ctx: &TtrpcContext,
         req: api::CreateTaskRequest,
     ) -> TtrpcResult<api::CreateTaskResponse> {
+        trace("create");
         info!("create {} in {}", req.id, req.bundle);
         let bundle = PathBuf::from(&req.bundle);
         let rootfs = bundle.join("rootfs");
@@ -167,12 +189,14 @@ impl shim::Task for Service {
             )
             .map_err(error)?;
         }
+        trace(format!("create: mounted {} layers", req.rootfs.len()));
         self.publish(TaskCreate {
             container_id: req.id.clone(),
             bundle: req.bundle.clone(),
             pid: pid(),
             ..Default::default()
         });
+        trace("create: published TaskCreate");
         *self.task.0.lock().unwrap() = Some(Task {
             id: req.id,
             bundle,
@@ -194,6 +218,7 @@ impl shim::Task for Service {
         _ctx: &TtrpcContext,
         _req: api::StartRequest,
     ) -> TtrpcResult<api::StartResponse> {
+        trace("start");
         let (id, bundle_dir, streams, kill) = self.with_task(|task| {
             task.status = api::Status::RUNNING;
             let streams = (task.stdin.clone(), task.stdout.clone(), task.stderr.clone());
@@ -211,6 +236,7 @@ impl shim::Task for Service {
             ..Default::default()
         });
         let service = self.clone();
+        trace("start: published TaskStart, running the container");
         std::thread::spawn(move || {
             let status = match stdio(&streams.0, &streams.1, &streams.2) {
                 Ok(stdio) => bundle::run(&bundle, stdio, &kill).unwrap_or_else(|err| {
@@ -234,6 +260,7 @@ impl shim::Task for Service {
                 task.exited = Some((status as u32, at.clone()));
             }
             exited.notify_all();
+            trace(format!("exited with {status}"));
             service.publish(TaskExit {
                 container_id: id.clone(),
                 id,
@@ -250,6 +277,7 @@ impl shim::Task for Service {
     }
 
     fn wait(&self, _ctx: &TtrpcContext, _req: api::WaitRequest) -> TtrpcResult<api::WaitResponse> {
+        trace("wait");
         let (lock, exited) = &*self.task;
         let mut task = lock.lock().unwrap();
         loop {
@@ -275,6 +303,7 @@ impl shim::Task for Service {
         _ctx: &TtrpcContext,
         _req: api::StateRequest,
     ) -> TtrpcResult<api::StateResponse> {
+        trace("state");
         self.with_task(|task| api::StateResponse {
             id: task.id.clone(),
             bundle: task.bundle.display().to_string(),
@@ -290,6 +319,7 @@ impl shim::Task for Service {
     }
 
     fn kill(&self, _ctx: &TtrpcContext, req: api::KillRequest) -> TtrpcResult<api::Empty> {
+        trace("kill");
         let signal = if req.signal == 0 { SIGKILL } else { req.signal };
         self.with_task(|task| task.kill.store(signal, Ordering::SeqCst))?;
         Ok(api::Empty::default())
@@ -300,6 +330,7 @@ impl shim::Task for Service {
         _ctx: &TtrpcContext,
         _req: api::DeleteRequest,
     ) -> TtrpcResult<api::DeleteResponse> {
+        trace("delete");
         let (id, bundle, exited) =
             self.with_task(|task| (task.id.clone(), task.bundle.clone(), task.exited.clone()))?;
         let rootfs = bundle.join("rootfs");
@@ -323,6 +354,7 @@ impl shim::Task for Service {
     }
 
     fn pids(&self, _ctx: &TtrpcContext, _req: api::PidsRequest) -> TtrpcResult<api::PidsResponse> {
+        trace("pids");
         Ok(api::PidsResponse {
             processes: vec![containerd_shim::protos::types::task::ProcessInfo {
                 pid: pid(),
@@ -337,6 +369,7 @@ impl shim::Task for Service {
         _ctx: &TtrpcContext,
         _req: api::ConnectRequest,
     ) -> TtrpcResult<api::ConnectResponse> {
+        trace("connect");
         Ok(api::ConnectResponse {
             shim_pid: pid(),
             task_pid: pid(),
@@ -346,6 +379,7 @@ impl shim::Task for Service {
     }
 
     fn shutdown(&self, _ctx: &TtrpcContext, _req: api::ShutdownRequest) -> TtrpcResult<api::Empty> {
+        trace("shutdown");
         self.exit.signal();
         Ok(api::Empty::default())
     }
