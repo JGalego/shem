@@ -10,6 +10,11 @@
 //! on a neural vCPU server (`python -m shem_neural.server`) at the socket that
 //! `dev.shem.neural-socket` names, by default `/tmp/shem-neural.sock`.
 //!
+//! A model image's command starts with a driver, `shem:generate`, rather
+//! than a program. The shim hands it to the same server, which loads the
+//! model from the container's root filesystem, keeps it for the next
+//! container, and streams the reply to the container's stdout.
+//!
 //! [runtime spec]: https://github.com/opencontainers/runtime-spec/blob/main/config.md
 
 use std::path::{Path, PathBuf};
@@ -115,6 +120,9 @@ fn warm_state(root: &Path) -> anyhow::Result<Option<Frozen>> {
 /// it at the next slice boundary, with the status a shell reports for that
 /// signal.
 pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8> {
+    if bundle.args[0].starts_with("shem:") {
+        return run_driver(bundle, stdio);
+    }
     match &bundle.vcpu {
         VcpuKind::Reference => run_on(bundle, stdio, kill, SLICE, |mem| {
             Ok(ReferenceVcpu::new(mem))
@@ -129,6 +137,60 @@ pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8
         }),
     }
 }
+
+/// Run a driver command, such as a model image's `shem:generate`, on the
+/// model server, with the container's arguments as its command line. When
+/// they hold no prompt, stdin is the prompt.
+fn run_driver(bundle: &Bundle, mut stdio: Stdio) -> anyhow::Result<u8> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    if bundle.args[0] != "shem:generate" {
+        bail!("unknown driver {}: shem has shem:generate", bundle.args[0]);
+    }
+    let socket = match &bundle.vcpu {
+        VcpuKind::Neural(socket) => socket.clone(),
+        VcpuKind::Reference => PathBuf::from(DEFAULT_NEURAL_SOCKET),
+    };
+    let mut stdin = String::new();
+    stdio.stdin.read_to_string(&mut stdin)?;
+    let session = bundle.root.join(WARM_DIR);
+    let mut request = serde_json::json!({
+        "model": bundle.root.join("model"),
+        "argv": &bundle.args[1..],
+        "stdin": stdin,
+    });
+    if session.join("session.json").is_file() {
+        request["session"] = session.display().to_string().into();
+    }
+    let mut stream = UnixStream::connect(&socket)
+        .with_context(|| format!("connecting to the model server at {}", socket.display()))?;
+    let payload = [&[GENERATE][..], &serde_json::to_vec(&request)?].concat();
+    stream.write_all(&[&(payload.len() as u32).to_le_bytes()[..], &payload].concat())?;
+    loop {
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header)?;
+        let mut frame = vec![0u8; u32::from_le_bytes(header) as usize];
+        stream.read_exact(&mut frame)?;
+        match frame.split_first() {
+            Some((&CHUNK, text)) => {
+                stdio.stdout.write_all(text)?;
+                stdio.stdout.flush()?;
+            }
+            Some((&OK, _)) => return Ok(0),
+            Some((_, message)) => {
+                writeln!(stdio.stderr, "shem: {}", String::from_utf8_lossy(message))?;
+                return Ok(1);
+            }
+            None => bail!("the model server sent an empty frame"),
+        }
+    }
+}
+
+/// The model server's protocol: the `GENERATE` op, and its result statuses.
+const GENERATE: u8 = 14;
+const OK: u8 = 0;
+const CHUNK: u8 = 3;
 
 fn run_on<V: Vcpu + Clone>(
     bundle: &Bundle,

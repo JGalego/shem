@@ -225,3 +225,27 @@ fn annotated_bundles_run_inside_the_model() {
     assert_eq!(bundle::run(&bundle, stdio, &AtomicU32::new(0)).unwrap(), 3);
     assert_eq!(out.0.lock().unwrap().as_slice(), msg);
 }
+
+#[test]
+#[ignore = "needs a model server and an unpacked model image: set SHEM_NEURAL_SOCKET and SHEM_MODEL_ROOT"]
+fn model_images_run_on_the_model_server() {
+    let socket = std::env::var("SHEM_NEURAL_SOCKET").expect("SHEM_NEURAL_SOCKET");
+    let root = std::env::var("SHEM_MODEL_ROOT").expect("SHEM_MODEL_ROOT, the root of an unpacked model image");
+    let dir = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({
+        "process": {"args": ["shem:generate", "--max-tokens", "12", "Say hi in Portuguese."]},
+        "root": {"path": root},
+        "annotations": {"dev.shem.vcpu": "neural", "dev.shem.neural-socket": socket},
+    });
+    std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+    let bundle = Bundle::load(dir.path()).unwrap();
+    let out = Captured::default();
+    let stdio = Stdio {
+        stdin: Box::new(std::io::empty()),
+        stdout: Box::new(out.clone()),
+        stderr: Box::new(std::io::sink()),
+    };
+    assert_eq!(bundle::run(&bundle, stdio, &AtomicU32::new(0)).unwrap(), 0);
+    let reply = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+    assert!(reply.contains("Ol"), "{reply}");
+}

@@ -86,40 +86,58 @@ def reply(session: Session, tokenizer: Tokenizer, max_tokens: int, out=sys.stdou
     return tokens
 
 
-def main() -> None:
+def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
+    """The driver's arguments: its options, the model, and the prompt. With
+    `model`, `argv` holds only options and the prompt, in any order, as a
+    container's command line does."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--system", help="a system prompt")
     parser.add_argument("--warm", type=Path, help="prime a session with the system prompt and save it here")
     parser.add_argument("--session", type=Path, help="continue the session saved here")
     parser.add_argument("--stats", action="store_true", help="print the token rate to stderr")
+    if model is not None:
+        parser.add_argument("prompt", nargs="*")
+        args = parser.parse_intermixed_args(argv)
+        args.model = model
+        return args
     parser.add_argument("model", help="the model's directory, holding shem.json")
     parser.add_argument("prompt", nargs="*")
-    args = parser.parse_args()
+    return parser.parse_args(argv)
 
-    model = Model(args.model)
-    tokenizer = Tokenizer(args.model, model.manifest.tokenizer)
+
+def run(model: Model, tokenizer: Tokenizer, args: argparse.Namespace, prompt: str, out=sys.stdout, err=sys.stderr):
+    """One run of the driver: prime and save a session with `--warm`, or
+    reply to `prompt`, continuing the `--session` if there is one."""
     system = [{"role": "system", "content": args.system}] if args.system else []
     if args.warm:
         if not system:
-            raise SystemExit("priming a session needs a system prompt: give --system")
+            raise ValueError("priming a session needs a system prompt: give --system")
         session = Session(model)
         session.feed(tokenizer.prefix(system))
         session.save(args.warm)
-        print(f"shem: primed a session with {len(session.tokens)} tokens", file=sys.stderr)
+        print(f"shem: primed a session with {len(session.tokens)} tokens", file=err)
         return
-
     session = Session.load(model, args.session) if args.session else Session(model)
-    prompt = " ".join(args.prompt) or sys.stdin.read()
     tokens = tokenizer.chat(system + [{"role": "user", "content": prompt}])
     if tokens[: len(session.tokens)] != session.tokens:
-        raise SystemExit("the saved session is not the start of this conversation: was it saved with another --system?")
+        raise ValueError("the saved session is not the start of this conversation: was it saved with another --system?")
     started = time.perf_counter()
     session.feed(tokens[len(session.tokens) :])
-    replied = reply(session, tokenizer, args.max_tokens)
+    replied = reply(session, tokenizer, args.max_tokens, out)
     if args.stats:
-        elapsed = time.perf_counter() - started
-        print(f"shem: {len(replied)} tokens in {elapsed:.1f} s", file=sys.stderr)
+        print(f"shem: {len(replied)} tokens in {time.perf_counter() - started:.1f} s", file=err)
+
+
+def main() -> None:
+    args = options(sys.argv[1:])
+    model = Model(args.model)
+    tokenizer = Tokenizer(args.model, model.manifest.tokenizer)
+    prompt = " ".join(args.prompt) or ("" if args.warm else sys.stdin.read())
+    try:
+        run(model, tokenizer, args, prompt)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
 
 
 if __name__ == "__main__":

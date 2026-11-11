@@ -217,7 +217,10 @@ pub fn strip(layer: &[u8], dir: &str) -> anyhow::Result<Option<Vec<u8>>> {
     if flat.is_empty() {
         return Ok(None);
     }
-    let files: Vec<(&str, &[u8])> = flat.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    let files: Vec<(&str, &[u8])> = flat
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
     Ok(Some(from_files(&files)?))
 }
 

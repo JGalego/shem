@@ -2,7 +2,8 @@
 
 The protocol is the `Vcpu` interface as requests, KVM-style: create a vCPU, run
 it until it exits, read and write its registers and memory, and fork it by
-cloning.
+cloning. `GENERATE` runs a session of a model image's model, streaming the
+reply back, and keeps loaded models for the next session.
 
 vCPUs share memory pages, by memory size, so forks and guests resumed from the
 same snapshot share what they have not written. Runs from different clients
@@ -17,7 +18,10 @@ status byte (see `Status`) and the result. `docs/neural.md` lists the ops.
 """
 
 import argparse
+import hashlib
 import itertools
+import json
+import os
 import socketserver
 import struct
 import sys
@@ -47,12 +51,64 @@ class Op(IntEnum):
     RESET = 11
     SNAPSHOT = 12
     RESTORE = 13
+    GENERATE = 14
 
 
 class Status(IntEnum):
     OK = 0
     ERROR = 1
     MEMORY_FAULT = 2
+    #: Part of a streamed result: more frames follow, then one with OK.
+    CHUNK = 3
+
+
+class Models:
+    """Loaded models, by their manifest's contents, so sessions of the same
+    model share its weights, however many containers unpack it."""
+
+    def __init__(self):
+        self.loaded: dict[str, tuple] = {}
+        self.lock = threading.Lock()
+
+    def get(self, directory: Path):
+        from .model.blocks import Model
+        from .model.tokenizer import Tokenizer
+
+        key = hashlib.sha256((directory / "shem.json").read_bytes()).hexdigest()
+        with self.lock:
+            if key not in self.loaded:
+                model = Model(directory)
+                self.loaded[key] = (model, Tokenizer(directory, model.manifest.tokenizer))
+            return self.loaded[key]
+
+    def generate(self, request: dict, write) -> None:
+        """Run the driver for `request`, writing the reply with `write` as it
+        comes. The request has the model's directory, the driver's command
+        line (its options and the prompt, as a container's arguments), and
+        optionally a saved session to continue and stdin, the prompt when the
+        command line has none."""
+        from .model import generate
+
+        args = generate.options(request.get("argv", []), model=request["model"])
+        if request.get("session"):
+            args.session = Path(request["session"])
+        model, tokenizer = self.get(Path(request["model"]))
+        prompt = " ".join(args.prompt) or request.get("stdin", "")
+
+        class Stream:
+            def write(self, text: str) -> None:
+                if text:
+                    write(text.encode())
+
+            def flush(self) -> None:
+                pass
+
+        threads = torch.get_num_threads()
+        torch.set_num_threads(os.cpu_count() or 1)  # a model's matrices are big: use every core
+        try:
+            generate.run(model, tokenizer, args, prompt, out=Stream(), err=Stream())
+        finally:
+            torch.set_num_threads(threads)
 
 
 class Job:
@@ -230,12 +286,18 @@ def make_server(socket_path: Path, dense: bool = False) -> tuple[socketserver.Ba
     """A server on `socket_path`, not yet serving, and its registry of vCPUs."""
     torch.set_num_threads(1)  # tiny tensors: threads only add overhead
     registry = Registry(dense)
+    models = Models()
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
             while (payload := read_frame(self.rfile)) is not None:
                 try:
-                    response = bytes([Status.OK]) + registry.handle(payload)
+                    if payload[0] == Op.GENERATE:
+                        chunk = lambda data: write_frame(self.wfile, bytes([Status.CHUNK]) + data)  # noqa: E731
+                        models.generate(json.loads(payload[1:]), chunk)
+                        response = bytes([Status.OK])
+                    else:
+                        response = bytes([Status.OK]) + registry.handle(payload)
                 except MemoryFault as fault:
                     response = bytes([Status.MEMORY_FAULT]) + str(fault).encode()
                 except Exception as error:  # report anything else to the host

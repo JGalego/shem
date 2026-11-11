@@ -102,7 +102,12 @@ impl Config {
         let strings = |value: &serde_json::Value| -> Vec<String> {
             value
                 .as_array()
-                .map(|items| items.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         let mut labels: BTreeMap<String, String> =
@@ -277,7 +282,10 @@ impl Image {
             diff_ids.push(digest(&tar));
             layers.push(put(LAYER_TYPE, &zstd::encode_all(&tar[..], ZSTD_LEVEL)?)?);
         }
-        let config = put(OCI_CONFIG_TYPE, &serde_json::to_vec(&self.config.to_oci(diff_ids))?)?;
+        let config = put(
+            OCI_CONFIG_TYPE,
+            &serde_json::to_vec(&self.config.to_oci(diff_ids))?,
+        )?;
         let manifest = Manifest {
             schema_version: 2,
             media_type: MANIFEST_TYPE.into(),
@@ -331,7 +339,10 @@ impl Image {
                 let compressed = d.media_type.ends_with(COMPRESSED) || gzip;
                 let data = if gzip {
                     let mut out = Vec::new();
-                    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&data[..]), &mut out)?;
+                    std::io::Read::read_to_end(
+                        &mut flate2::read::GzDecoder::new(&data[..]),
+                        &mut out,
+                    )?;
                     out
                 } else if compressed {
                     zstd::decode_all(&data[..])?
