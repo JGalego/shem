@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Run containers and VMs inside a model's weights"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow = "1"

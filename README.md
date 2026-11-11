@@ -4,6 +4,7 @@
 
 [![CI](https://github.com/JGalego/shem/actions/workflows/ci.yml/badge.svg)](https://github.com/JGalego/shem/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Status](https://img.shields.io/badge/status-experimental-orange)](docs/architecture.md#roadmap)
 
 shem treats the host as a hypervisor and a model as the machine. The model supplies a CPU, compiled into its weights, and RAM, which is its recurrent state, as in [Qwenputer](https://divagr.com/blog/qwenputer). The host supplies everything else: system calls, devices, scheduling and storage. Images are built from a [Shemfile](docs/shemfile.md) and stored in OCI registries, like Docker images.
@@ -64,3 +65,7 @@ docs/
   architecture.md  design, tech stack and roadmap
   shemfile.md      the Shemfile and image format (draft)
 ```
+
+## License
+
+[MIT](LICENSE)
