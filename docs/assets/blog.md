@@ -52,7 +52,7 @@ The base sets the entrypoint to shem's text-generation driver, the way `FROM pyt
 
 Under the hood, every transformer block gets its own weights file, and every weights file becomes its own image layer. Qwen3-0.6B comes out as 59 layers and 892 MB. Registries deduplicate layers, so images built on the same model share their weights, and pushing a new system prompt doesn't push a gigabyte again. Larger models group neighbouring blocks into a layer to stay under the roughly 128-layer limit of overlay filesystems. Even containers have limits.
 
-Shipping models in container-shaped boxes isn't new: Ollama's Modelfile, Docker Model Runner and KitOps all do a version of it.
+Shipping models in container-shaped boxes isn't new. There's even a CNCF standard for it, [ModelPack](https://github.com/modelpack/model-spec), which tools like [KitOps](https://kitops.org) and [llmman](https://github.com/llmmanorg/llmman) implement, and Ollama's Modelfile and Docker Model Runner do their own versions. Those carry the weights as data for an inference server to load.
 
 ## Stage 2: A conversation is just a layer
 
