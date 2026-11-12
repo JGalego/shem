@@ -7,13 +7,10 @@
 //! image as it was before `WARM`, byte for byte, so a registry lists the
 //! sessions of a model among its referrers. The artifact's config says what
 //! a runtime needs to decide whether it can load the session: its format,
-//! the tokens it has read, its precision, the version of each type of block
-//! that wrote it, and the model's fingerprint, the digest of its blocks and
-//! their weights however its files are laid out. `load` checks the format
-//! and the fingerprint, and unpacks the session for the driver to continue,
-//! which changes nothing but speed, on any image of the same model. The
-//! driver checks the precision and the versions, and where its own differ,
-//! reads the session's tokens again rather than trust its state.
+//! the tokens it has read, its precision, and the model's fingerprint, the
+//! digest of its blocks and their weights however its files are laid out.
+//! `load` checks that, and unpacks the session for the driver to continue,
+//! which changes nothing but speed, on any image of the same model.
 //!
 //! The media types are shem's own, while #239's are placeholders.
 
@@ -87,16 +84,12 @@ pub fn publish(image: &Image, root: &Path, out: &Path, tag: &str) -> anyhow::Res
     // The same blob as the image's own state layer
     let tar = layer::under(&state.data, STATE_DIR)?;
     let (layer_digest, layer_size) = put(&zstd::encode_all(&tar[..], ZSTD_LEVEL)?)?;
-    let mut config = serde_json::json!({
+    let config = serde_json::json!({
         "format": FORMAT,
         "tokens": meta["tokens"].as_array().map_or(0, Vec::len),
-        // Sessions saved before they recorded their precision were all float32
-        "precision": meta.get("precision").cloned().unwrap_or_else(|| "float32".into()),
+        "precision": "float32",
         "model": model_digest(root, image)?,
     });
-    if let Some(blocks) = meta.get("blocks") {
-        config["blocks"] = blocks.clone();
-    }
     let (config_digest, config_size) = put(&serde_json::to_vec(&config)?)?;
     let manifest = serde_json::json!({
         "schemaVersion": 2,
