@@ -270,6 +270,12 @@ fn twins_share_the_artifacts_tar_layers_and_run_its_checkpoint() {
         artifact.as_str()
     );
     assert_eq!(reply, reference(&["--max-tokens", "8"]));
+
+    // An artifact's layout runs as is, as its twin, with the driver's defaults
+    let layout = context.path().join("artifact");
+    let mut args = vec!["run", layout.to_str().unwrap()];
+    args.extend(PROMPT);
+    assert_eq!(ok(shem(home.path(), &args)), reference(&[]));
 }
 
 #[test]
@@ -480,15 +486,25 @@ fn images_publish_as_artifacts_whose_layers_are_their_own() {
             .iter()
             .all(|l| l["mediaType"].as_str().unwrap().ends_with(".v1.tar"))
     );
+    let plain_files = plain_manifest["layers"].as_array().unwrap();
+    assert!(
+        plain_files
+            .iter()
+            .all(|l| !l["annotations"]["org.cncf.model.filepath"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("model/")),
+        "files at the root, as modctl packs them"
+    );
     assert_eq!(
-        plain_config["modelfs"], config["modelfs"],
-        "the same tars, uncompressed"
+        plain_config["modelfs"]["diffIds"].as_array().unwrap().len(),
+        config["modelfs"]["diffIds"].as_array().unwrap().len()
     );
 
-    for artifact in [&shared, &plain] {
+    for (artifact, model) in [(&shared, "model"), (&plain, "")] {
         let files = tempfile::tempdir().unwrap();
         extract(artifact, files.path());
-        assert!(loads_as_the_checkpoint(&files.path().join("model")));
+        assert!(loads_as_the_checkpoint(&files.path().join(model)));
     }
 
     // And back: the artifact is a base like any other, whose twin replies as the image does

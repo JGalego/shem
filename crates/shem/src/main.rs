@@ -372,16 +372,13 @@ impl Drop for Terminal {
     }
 }
 
-/// An image from an OCI layout directory, or from the store by reference.
+/// An image from an OCI layout directory, or from the store by reference,
+/// pulled from its registry the first time. A ModelPack artifact, in a
+/// layout or a registry, is its image twin.
 fn load_image(target: &str) -> anyhow::Result<Image> {
     let dir = Path::new(target);
     if dir.join("oci-layout").is_file() {
-        if image::modelpack::is_artifact(dir) {
-            bail!(
-                "{target} is a ModelPack artifact: build an image on it with FROM {target}, or pull it from a registry"
-            );
-        }
-        return Image::read_layout(dir);
+        return Image::read_layout(&image_dir(target)?);
     }
     Image::read_layout(&Store::open()?.fetch(target)?)
 }
@@ -529,6 +526,9 @@ fn finish_vm<V: Vcpu>(
 fn image_dir(target: &str) -> anyhow::Result<PathBuf> {
     let dir = Path::new(target);
     if dir.join("oci-layout").is_file() {
+        if image::modelpack::is_artifact(dir) {
+            return Store::open()?.twin(dir);
+        }
         return Ok(dir.to_path_buf());
     }
     let path = Store::open()?.path(target)?;

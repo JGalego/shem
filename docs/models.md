@@ -114,7 +114,7 @@ ENTRYPOINT ["shem:generate", "--system", "You are a golem."]
 WARM --until=prompt
 ```
 
-`FROM` also takes an artifact's OCI layout directory, such as the one `oras cp --to-oci-layout` writes.
+`FROM`, `shem run` and `shem push` also take an artifact's OCI layout directory, such as the one `oras cp --to-oci-layout` writes; shem keeps its twin in the store, by the artifact's digest.
 
 - **Tar layers stay shared.** A tar layer goes into the twin as the very same blob, so a registry keeps the weights once for the artifact and its twin, and pushing the twin beside the artifact uploads only shem's layer. modctl writes tar layers with `modctl build --raw=false`.
 - **Raw layers are copied.** A raw layer, modctl's default, is a file with no tar around it, which no image can use as a layer, so the twin wraps each one in a tar of its own.
@@ -133,8 +133,8 @@ shem push --modelpack --uncompressed qwen3 registry.example.com/team/qwen3:model
 
 `--modelpack` publishes a model image's model as a ModelPack artifact: the image's layers that hold the model's files, and a model config filled in from `shem.json` (name, family, vendor, revision, licences, source, parameter count and precision). The image is the artifact's `subject` and is pushed with it, so a registry lists the artifact among the image's referrers (`oras discover`).
 
-- **The layers are the image's own blobs**, so the artifact takes no room of its own in a registry. They're compressed with zstd, which ModelPack allows but modctl 0.2 can't extract, and the spec recommends uncompressed weights for runtimes that mount them. `--uncompressed` writes plain tars instead, as new blobs, which modctl pulls and extracts.
-- **The files keep their paths in the image**, under `model/` for an imported model. Those files are a Hugging Face checkpoint sharded by block, so transformers loads `model/` from an extracted artifact. A twin's files are at the root.
+- **The layers are the image's own blobs**, so the artifact takes no room of its own in a registry. Their files keep their paths in the image, under `model/` for an imported model. They're compressed with zstd, which ModelPack allows but modctl 0.2 can't extract, and the spec recommends uncompressed weights for runtimes that mount them.
+- **`--uncompressed` writes plain tars instead**, as new blobs, with the files at the root, as modctl packs them. modctl pulls and extracts them into a Hugging Face checkpoint sharded by block, which transformers and vLLM load.
 - **Only the model goes in.** A layer goes into the artifact if it holds nothing but the model's files: the image's tools, compiled layers and session state stay out.
 
 [`tests/modelpack.rs`](../crates/shem/tests/modelpack.rs) packs a tiny checkpoint as modctl does, in tar and raw layers. It checks that the twin keeps the artifact's blobs, replies as the checkpoint does, primes a session with `WARM`, and round-trips through a registry. The other way, it checks that an image publishes as an artifact over its own blobs, that the artifact's files load in transformers with the checkpoint's logits, and that the artifact runs again as a twin. Artifacts that modctl 0.2.2 builds, in both formats, run the same way. modctl 0.2.2 also pulls and extracts an `--uncompressed` artifact that shem publishes, and transformers loads what it extracts with the checkpoint's logits.

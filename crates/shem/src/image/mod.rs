@@ -677,6 +677,28 @@ impl Store {
         })
     }
 
+    /// The layout of the image twin of the ModelPack artifact in the layout
+    /// `dir`, made once and kept, by the artifact's digest.
+    pub fn twin(&self, dir: &Path) -> anyhow::Result<PathBuf> {
+        let artifact = modelpack::Artifact::read(dir)?.context("not a ModelPack artifact")?;
+        let hex = artifact
+            .descriptor
+            .digest
+            .trim_start_matches("sha256:")
+            .to_string();
+        let twins = self.root.with_file_name("twins");
+        let path = twins.join(hex);
+        if !path.join("oci-layout").is_file() {
+            std::fs::create_dir_all(&twins)?;
+            let staging = tempfile::tempdir_in(&twins)?;
+            let root = tempfile::tempdir()?;
+            let twin = artifact.twin(&dir.display().to_string(), root.path())?;
+            twin.write_layout(&staging.path().join("layout"), "latest")?;
+            std::fs::rename(staging.path().join("layout"), &path)?;
+        }
+        Ok(path)
+    }
+
     /// A directory holding the filesystem of the image whose manifest digest
     /// is `digest`, unpacked once and kept: images are immutable, and a model
     /// is too big to unpack for every run.

@@ -13,10 +13,10 @@
 //! The other way, `export` publishes a model image as an artifact: the
 //! image's layers that hold the model's files, as they are, with a model
 //! config filled in from `shem.json`, and the image as the artifact's
-//! `subject`. Its files are where they are in the image, under `model/` for
-//! an imported model, and its layers are the image's blobs: compressed with
-//! zstd, which the spec allows and modctl 0.2 can't extract, unless written
-//! uncompressed, as new blobs.
+//! `subject`. Its layers are the image's blobs, its files where the image
+//! has them, under `model/` for an imported model: compressed with zstd,
+//! which the spec allows and modctl 0.2 can't extract. Written uncompressed,
+//! they are new blobs, so their files go at the root, as modctl packs them.
 //!
 //! The spec names its media types and annotations `cncf`; modctl and older
 //! artifacts name them `cnai`. shem reads both, and writes the spec's.
@@ -335,6 +335,13 @@ pub fn export(
         } else {
             "weight.config"
         };
+        // Uncompressed, the layer is a new blob anyway, so its files go at the
+        // root, as modctl packs them; shared, they stay where the image has them
+        let tar = if uncompressed {
+            rebase(&layer.data, model)?
+        } else {
+            layer.data.clone()
+        };
         let (format, digest, size) = match &layer.stored {
             Some(stored) if !uncompressed => {
                 let target = blobs.join(&stored.digest["sha256:".len()..]);
@@ -348,13 +355,17 @@ pub fn export(
                 (format, stored.digest.clone(), stored.size)
             }
             _ => {
-                let (digest, size) = put(&layer.data)?;
+                let (digest, size) = put(&tar)?;
                 ("tar".into(), digest, size)
             }
         };
         let mut annotations = BTreeMap::new();
         if let [file] = files.as_slice() {
-            let path = Path::new(model).join(file);
+            let path = if uncompressed {
+                Path::new(file).to_path_buf()
+            } else {
+                Path::new(model).join(file)
+            };
             annotations.insert(FILEPATH.into(), path.to_string_lossy().into_owned());
         }
         layers.push(Descriptor {
@@ -364,7 +375,7 @@ pub fn export(
             annotations,
             platform: None,
         });
-        diff_ids.push(super::digest(&layer.data));
+        diff_ids.push(super::digest(&tar));
         covered.extend(files);
     }
     if let Some(missing) = needed.iter().find(|f| !covered.contains(f)) {
@@ -432,6 +443,35 @@ fn model_files(layer: &[u8], model: &str) -> anyhow::Result<Option<Vec<String>>>
         }
     }
     Ok((!files.is_empty()).then_some(files))
+}
+
+/// The layer `tar` with its entries moved from the model's directory
+/// `model` to the root, and the entry for the directory itself dropped.
+fn rebase(tar: &[u8], model: &str) -> anyhow::Result<Vec<u8>> {
+    if model.is_empty() {
+        return Ok(tar.to_vec());
+    }
+    let mut builder = tar::Builder::new(Vec::new());
+    for entry in tar::Archive::new(tar).entries()? {
+        let mut entry = entry?;
+        let path = entry
+            .path()?
+            .to_string_lossy()
+            .trim_start_matches("./")
+            .to_string();
+        let path = path.trim_end_matches('/');
+        let Some(inside) = path
+            .strip_prefix(model)
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
+            continue;
+        };
+        let mut header = entry.header().clone();
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data)?;
+        builder.append_data(&mut header, inside, &data[..])?;
+    }
+    Ok(builder.into_inner()?)
 }
 
 fn is_doc(file: &str) -> bool {
