@@ -1,0 +1,184 @@
+{
+ "format": "shem.model/v2",
+ "source": {
+  "architecture": "tiny random Qwen3.5, Qwen3-MoE and Mamba blocks, for test_sessions"
+ },
+ "hidden_size": 32,
+ "tokenizer": {
+  "file": "tokenizer.json",
+  "chat_template": "chat_template.jinja",
+  "eos": [],
+  "special": {
+   "bos_token": "t3",
+   "eos_token": "t1"
+  }
+ },
+ "weights": "model.safetensors.index.json",
+ "parameters": 40048,
+ "precision": [
+  "float32"
+ ],
+ "embed": {
+  "type": "embedding",
+  "params": {},
+  "tensors": {
+   "weight": "embed.weight"
+  }
+ },
+ "blocks": [
+  {
+   "type": "gated_deltanet",
+   "params": {
+    "k_heads": 2,
+    "v_heads": 4,
+    "k_dim": 8,
+    "v_dim": 8,
+    "conv_kernel": 4,
+    "eps": 1e-06,
+    "norm_offset": 1.0
+   },
+   "tensors": {
+    "norm": "blocks.0.norm",
+    "in_qkv": "blocks.0.in_qkv",
+    "in_z": "blocks.0.in_z",
+    "in_b": "blocks.0.in_b",
+    "in_a": "blocks.0.in_a",
+    "conv": "blocks.0.conv",
+    "dt_bias": "blocks.0.dt_bias",
+    "A_log": "blocks.0.A_log",
+    "out_norm": "blocks.0.out_norm",
+    "out": "blocks.0.out"
+   }
+  },
+  {
+   "type": "mlp",
+   "params": {
+    "eps": 1e-06,
+    "norm_offset": 1.0
+   },
+   "tensors": {
+    "gate": "blocks.1.gate",
+    "up": "blocks.1.up",
+    "down": "blocks.1.down",
+    "norm": "blocks.1.norm"
+   }
+  },
+  {
+   "type": "attention",
+   "params": {
+    "heads": 4,
+    "kv_heads": 2,
+    "head_dim": 8,
+    "rope_theta": 10000.0,
+    "rotary_dim": 2,
+    "output_gate": true,
+    "eps": 1e-06,
+    "norm_offset": 1.0
+   },
+   "tensors": {
+    "q": "blocks.2.q",
+    "k": "blocks.2.k",
+    "v": "blocks.2.v",
+    "o": "blocks.2.o",
+    "norm": "blocks.2.norm",
+    "q_norm": "blocks.2.q_norm",
+    "k_norm": "blocks.2.k_norm"
+   }
+  },
+  {
+   "type": "mlp",
+   "params": {
+    "eps": 1e-06,
+    "norm_offset": 1.0
+   },
+   "tensors": {
+    "gate": "blocks.3.gate",
+    "up": "blocks.3.up",
+    "down": "blocks.3.down",
+    "norm": "blocks.3.norm"
+   }
+  },
+  {
+   "type": "attention",
+   "params": {
+    "heads": 4,
+    "kv_heads": 2,
+    "head_dim": 8,
+    "rope_theta": 10000.0,
+    "rotary_dim": 8,
+    "output_gate": false,
+    "eps": 1e-06,
+    "norm_offset": 0.0
+   },
+   "tensors": {
+    "q": "blocks.4.q",
+    "k": "blocks.4.k",
+    "v": "blocks.4.v",
+    "o": "blocks.4.o",
+    "norm": "blocks.4.norm",
+    "q_norm": "blocks.4.q_norm",
+    "k_norm": "blocks.4.k_norm"
+   }
+  },
+  {
+   "type": "moe",
+   "params": {
+    "experts": 4,
+    "top_k": 2,
+    "normalize": false,
+    "eps": 1e-06,
+    "norm_offset": 0.0
+   },
+   "tensors": {
+    "router": "blocks.5.router",
+    "gate.0": "blocks.5.gate.0",
+    "up.0": "blocks.5.up.0",
+    "down.0": "blocks.5.down.0",
+    "gate.1": "blocks.5.gate.1",
+    "up.1": "blocks.5.up.1",
+    "down.1": "blocks.5.down.1",
+    "gate.2": "blocks.5.gate.2",
+    "up.2": "blocks.5.up.2",
+    "down.2": "blocks.5.down.2",
+    "gate.3": "blocks.5.gate.3",
+    "up.3": "blocks.5.up.3",
+    "down.3": "blocks.5.down.3",
+    "norm": "blocks.5.norm"
+   }
+  },
+  {
+   "type": "mamba",
+   "params": {
+    "inner": 64,
+    "state_size": 8,
+    "conv_kernel": 4,
+    "time_step_rank": 2,
+    "eps": 1e-05
+   },
+   "tensors": {
+    "norm": "blocks.6.norm",
+    "in": "blocks.6.in",
+    "x": "blocks.6.x",
+    "out": "blocks.6.out",
+    "conv": "blocks.6.conv",
+    "dt": "blocks.6.dt",
+    "dt_bias": "blocks.6.dt_bias",
+    "A_log": "blocks.6.A_log",
+    "D": "blocks.6.D",
+    "conv_bias": "blocks.6.conv_bias"
+   }
+  }
+ ],
+ "head": {
+  "type": "head",
+  "params": {
+   "eps": 1e-06,
+   "norm_offset": 1.0,
+   "tied": false
+  },
+  "tensors": {
+   "norm": "head.norm",
+   "weight": "head.weight"
+  }
+ }
+}

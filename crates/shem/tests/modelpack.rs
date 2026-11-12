@@ -635,6 +635,8 @@ fn sessions_publish_beside_their_models_and_resume_on_them() {
     );
     assert_eq!(config["format"], "shem.session/v1");
     assert!(config["tokens"].as_u64().unwrap() > 0);
+    assert_eq!(config["precision"], "float32");
+    assert_eq!(config["blocks"]["attention"], 1, "{config}");
 
     let reply = ok(run_with_state(home.path(), &cold, state.to_str().unwrap()));
     assert_eq!(

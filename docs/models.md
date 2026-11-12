@@ -54,7 +54,9 @@ WARM --until=prompt
 
 Attention caches grow with the token count. Gated DeltaNet's convolution state and memory matrices are fixed-size. Qwen3.5 combines both block types, so its total session state still grows with its attention caches.
 
-The session is saved as `session.safetensors`, every block's state by block number and name, and `session.json`, the tokens it has read. `shem run` unpacks them into `/.shem`, which is also where `shem save` puts them for `docker load`.
+The session is saved as `session.safetensors`, every block's state by block number and name, and `session.json`, the tokens it has read, the precision it ran in and the version of each type of block that wrote it. `shem run` unpacks them into `/.shem`, which is also where `shem save` puts them for `docker load`.
+
+The weights and the tokens don't say how a runtime reads the state: a later shem whose attention cached its keys otherwise would continue an old session wrong. So a block type's version changes whenever a session saved before would resume otherwise than a cold start, and a runtime whose versions or precision differ from the session's reads its tokens again rather than trust its state, which costs the time `WARM` saved and nothing else. `neural/tests/test_sessions.py` resumes a session saved by an earlier shem, on a tiny model with every type of block, to catch a change that needed a new version.
 
 ### Sessions as artifacts
 
@@ -67,7 +69,7 @@ shem run --state registry.example.com/team/golem:session qwen3.5 "Who are you?"
 
 `--state` publishes a model image's session as an artifact of its own. The session is the image's state layer, the same blob. Its `subject` is the model image without that layer: the image as it was before `WARM`, byte for byte, which is pushed with it. A registry then lists a model's sessions among its referrers (`oras discover`), so one model can carry many primed system prompts and saved conversations.
 
-The artifact's config says what a runtime needs to decide whether it can load the session: its format (`shem.session/v1`), the tokens it has read, its precision, and the model's fingerprint. `shem.json` records that fingerprint at import: a digest of the blocks and their tensors' contents, which is the same however the files are laid out. `shem run --state` takes a registry reference or a layout directory, checks the fingerprint, and continues the session on any image of the same model, such as the model's ModelPack twin. A model of the same shape with other weights refuses the session rather than running it wrong. The media types are shem's own (`application/vnd.shem.session.v1+json`) while #239's are placeholders.
+The artifact's config says what a runtime needs to decide whether it can load the session: its format (`shem.session/v1`), the tokens it has read, its precision, the versions of its blocks, and the model's fingerprint. `shem.json` records that fingerprint at import: a digest of the blocks and their tensors' contents, which is the same however the files are laid out. `shem run --state` takes a registry reference or a layout directory, checks the fingerprint, and continues the session on any image of the same model, such as the model's ModelPack twin. A model of the same shape with other weights refuses the session rather than running it wrong. The media types are shem's own (`application/vnd.shem.session.v1+json`) while #239's are placeholders.
 
 ## The model as files
 

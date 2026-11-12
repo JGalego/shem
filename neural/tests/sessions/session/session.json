@@ -1,0 +1,1 @@
+{"format": "shem.session/v1", "precision": "float32", "blocks": {"gated_deltanet": 1, "mlp": 1, "attention": 1, "moe": 1, "mamba": 1}, "tokens": [3, 17, 42, 8, 25, 61, 9, 33, 50, 12, 4, 27], "messages": [], "tools": []}

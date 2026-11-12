@@ -117,6 +117,14 @@ ACTIVATIONS = {
 class Block:
     """A block's weights and parameters. Subclasses implement `forward`."""
 
+    #: The version of what the block computes and keeps as state. A saved
+    #: session records it for each type of block, and a runtime whose blocks
+    #: have another reads the session's tokens again rather than trust its
+    #: state. Bump it when a session saved before a change would resume
+    #: otherwise than a cold start, as `test_sessions` checks: even a
+    #: stateless block changes what the blocks after it keep.
+    VERSION = 1
+
     def __init__(self, params: dict, tensors: dict[str, torch.Tensor]):
         self.p = params
         self.t = tensors
@@ -423,6 +431,16 @@ class Model:
 
     def init_state(self, batch: int = 1) -> list:
         return [block.init_state(batch) for block in self.blocks]
+
+    @property
+    def versions(self) -> dict[str, int]:
+        """The `VERSION` of each type of block the model has."""
+        return {spec.type: BLOCKS[spec.type].VERSION for spec in self.manifest.blocks}
+
+    @property
+    def precision(self) -> str:
+        """The type the model computes in, as ModelPack names it, such as `float32`."""
+        return str(self.dtype).removeprefix("torch.")
 
     @torch.no_grad()
     def forward(self, tokens: torch.Tensor, state: list, start: int) -> torch.Tensor:

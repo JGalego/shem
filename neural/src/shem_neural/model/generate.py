@@ -67,7 +67,14 @@ class Session:
         }
 
     def meta(self) -> dict:
-        return {"format": SESSION_FORMAT, "tokens": self.tokens, "messages": self.messages, "tools": self.tools}
+        return {
+            "format": SESSION_FORMAT,
+            "precision": self.model.precision,
+            "blocks": self.model.versions,
+            "tokens": self.tokens,
+            "messages": self.messages,
+            "tools": self.tools,
+        }
 
     def save(self, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
@@ -82,26 +89,50 @@ class Session:
         }
 
     @classmethod
-    def load(cls, model: Model, directory: Path) -> "Session":
+    def load(cls, model: Model, directory: Path, err=sys.stderr) -> "Session":
         meta = json.loads((directory / "session.json").read_text())
-        return cls._from(model, meta, load_file(str(directory / "session.safetensors")))
+        return cls._from(model, meta, lambda: load_file(str(directory / "session.safetensors")), err)
 
     @classmethod
-    def from_files(cls, model: Model, files: dict[str, bytes]) -> "Session":
-        return cls._from(model, json.loads(files["session.json"]), load(files["session.safetensors"]))
+    def from_files(cls, model: Model, files: dict[str, bytes], err=sys.stderr) -> "Session":
+        return cls._from(model, json.loads(files["session.json"]), lambda: load(files["session.safetensors"]), err)
 
     @classmethod
-    def _from(cls, model: Model, meta: dict, tensors: dict[str, torch.Tensor]) -> "Session":
+    def _from(cls, model: Model, meta: dict, tensors, err) -> "Session":
+        """The session `meta` describes, with its blocks' state from
+        `tensors()`, or, if this runtime would read that state otherwise than
+        the one that saved it, from its tokens read again."""
         if meta.get("format") != SESSION_FORMAT:
             raise ValueError(f"not a {SESSION_FORMAT} session")
         session = cls(model)
-        session.tokens = meta["tokens"]
         session.messages = meta.get("messages", [])
         session.tools = meta.get("tools", [])
-        for key, tensor in tensors.items():
+        if stale := staleness(model, meta):
+            print(f"shem: the session was saved {stale}: reading its {len(meta['tokens'])} tokens again", file=err)
+            session.feed(meta["tokens"])
+            return session
+        session.tokens = meta["tokens"]
+        for key, tensor in tensors().items():
             block, name = key.split(".", 1)
-            session.state[int(block)][name] = tensor.to(device=model.device, dtype=model.dtype)
+            # In the types it was saved in, which are this model's, as its precision is
+            session.state[int(block)][name] = tensor.to(device=model.device)
         return session
+
+
+def staleness(model: Model, meta: dict) -> str | None:
+    """How the runtime that saved the session `meta` describes differs from
+    the one that runs `model`, if its state would mean something else here:
+    another precision, or another version of a type of block. Sessions saved
+    before they recorded these were saved in float32 by each block's first
+    version."""
+    precision = meta.get("precision", "float32")
+    if precision != model.precision:
+        return f"in {precision}, and this model runs in {model.precision}"
+    saved, here = meta.get("blocks", dict.fromkeys(model.versions, 1)), model.versions
+    changed = sorted(kind for kind in saved.keys() | here.keys() if saved.get(kind) != here.get(kind))
+    if changed:
+        return f"by another version of shem's {', '.join(changed)} blocks"
+    return None
 
 
 def next_turn(session: Session, tokenizer: Tokenizer, new: list[dict]) -> list[int]:
@@ -323,7 +354,7 @@ def start(
         session.save(args.warm)
         print(f"shem: primed a session with {len(session.tokens)} tokens", file=err)
         return None
-    session = Session.load(model, args.session) if args.session else Session(model)
+    session = Session.load(model, args.session, err) if args.session else Session(model)
     if not session.messages:
         session.messages, session.tools = system, tools
     session.runner = runner
