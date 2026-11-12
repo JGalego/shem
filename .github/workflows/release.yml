@@ -292,4 +292,5 @@ jobs:
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "feat: shem $VERSION" && git push
+          git add Formula/shem.rb
+          git diff --cached --quiet || { git commit -m "feat: shem $VERSION" && git push; }

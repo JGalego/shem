@@ -258,7 +258,7 @@ Before the first release, set up publishing once:
 - **GitHub Pages**: in the repository's settings, set Pages to deploy from GitHub Actions, and set the repository variable `DOCS_SITE` to `true`, for the docs site.
 - **GHCR**: after the first release, make the new packages public (each package's settings, then "Change visibility"): `shem-toolchain`, `shem-neural`, the BuildKit frontend `shem/dockerfile` and the example images under `shem/`.
 
-Install a release's binaries without compiling, with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) (`cargo binstall shem`) or Homebrew (`brew install jgalego/shem/shem`, once the tap exists).
+Install a release's binaries without compiling, with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) (`cargo binstall shem`) or Homebrew (`brew install jgalego/shem/shem`) on Apple Silicon Macs and on Linux.
 
 ### Contribute
 
