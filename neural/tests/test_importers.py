@@ -259,6 +259,14 @@ def imported(request, tmp_path_factory):
     return request.param, reference, out, checkpoint
 
 
+def same(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether the same weights gave these logits: equal up to the order of
+    floating-point sums, which math libraries may change with how tensors sit
+    in memory, as they do for a mixture of experts' many small products. A
+    weight read wrong is orders of magnitude further off."""
+    return torch.allclose(a, b, atol=1e-6, rtol=1e-6)
+
+
 def logits(reference, tokens: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
         return reference(input_ids=tokens).logits
@@ -305,7 +313,7 @@ def test_imported_directories_are_checkpoints(imported):
         pytest.skip("the import leaves out the vision encoder, so it is a text model's checkpoint")
     loaded = transformers.AutoModelForCausalLM.from_pretrained(out).eval()
     tokens = torch.arange(10)[None, :] % SMALL["vocab_size"]
-    assert torch.equal(logits(loaded, tokens), logits(reference, tokens))
+    assert same(logits(loaded, tokens), logits(reference, tokens))
 
 
 def test_manifests_count_the_models_parameters(imported):
@@ -373,7 +381,7 @@ def test_in_place_imports_run_the_checkpoint_as_it_is(imported, tmp_path):
     assert locate(twin) == (twin, twin)
     tokens = torch.arange(9)[None, :] % SMALL["vocab_size"]
     in_place, full = Model(twin), Model(out)
-    assert torch.equal(in_place.forward(tokens, in_place.init_state(), 0), full.forward(tokens, full.init_state(), 0))
+    assert same(in_place.forward(tokens, in_place.init_state(), 0), full.forward(tokens, full.init_state(), 0))
 
 
 def test_models_are_found_in_images_and_alone(tmp_path):
@@ -418,7 +426,7 @@ def test_v1_manifests_still_load(imported, tmp_path):
 
     tokens = torch.arange(9)[None, :] % SMALL["vocab_size"]
     v1, v2 = Model(tmp_path), Model(out)
-    assert torch.equal(v1.forward(tokens, v1.init_state(), 0), v2.forward(tokens, v2.init_state(), 0))
+    assert same(v1.forward(tokens, v1.init_state(), 0), v2.forward(tokens, v2.init_state(), 0))
 
 
 def test_unsupported_rotary_scaling_is_refused(tmp_path):
