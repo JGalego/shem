@@ -1,0 +1,44 @@
+# A model image mounted as an image volume and run by transformers, without
+# shem: the image's /model is a Hugging Face checkpoint. Build the image and
+# push it listed for the node's platform too, which image volumes are pulled
+# for, then run the Pod:
+#
+#   shem build -t smollm2 examples/smollm2
+#   shem push --platform linux/amd64 smollm2 ghcr.io/your-user/smollm2:shem
+#   kubectl apply -f examples/kubernetes/model-volume.yaml
+#   kubectl logs -f smollm2-transformers
+#
+# Image volumes need the ImageVolume feature gate, where it is still off.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smollm2-transformers
+spec:
+  restartPolicy: Never
+  containers:
+    - name: transformers
+      image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+      command:
+        - uv
+        - run
+        - --no-project
+        - --with=transformers
+        - --with=torch
+        - --index=https://download.pytorch.org/whl/cpu
+        - --index-strategy=unsafe-best-match
+        - python
+        - -c
+        - |
+          from transformers import pipeline
+          chat = pipeline("text-generation", "/models/smollm2/model")
+          messages = [{"role": "user", "content": "What is a golem? Answer in one sentence."}]
+          print(chat(messages, max_new_tokens=48, do_sample=False)[0]["generated_text"][-1]["content"])
+      volumeMounts:
+        - name: smollm2
+          mountPath: /models/smollm2
+          readOnly: true
+  volumes:
+    - name: smollm2
+      image:
+        reference: ghcr.io/your-user/smollm2:shem
+        pullPolicy: IfNotPresent

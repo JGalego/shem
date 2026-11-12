@@ -1,0 +1,5 @@
+# SmolLM2-360M-Instruct, a model of Llama's layout small enough to reply at
+# several words a second on any CPU.
+FROM hf.co/HuggingFaceTB/SmolLM2-360M-Instruct
+ENTRYPOINT ["shem:generate", "--max-tokens", "96"]
+CMD ["What is a golem? Answer in one sentence."]

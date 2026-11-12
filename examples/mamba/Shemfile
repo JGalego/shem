@@ -1,0 +1,9 @@
+# Mamba-130M, a state space model: no attention, so no cache that grows with
+# the text: its session is 2.8 MB after ten tokens or ten thousand.
+# It is a base model, which continues text rather than following
+# instructions: WARM reads a few examples of a pattern at build time, a run
+# continues the pattern, and --stop ends the reply at the end of its line.
+FROM hf.co/state-spaces/mamba-130m-hf
+ENTRYPOINT ["shem:generate", "--max-tokens", "16", "--stop", "\n", "--system", "France: Paris\nJapan: Tokyo\nItaly: Rome\nKenya: Nairobi\nCanada: Ottawa\n"]
+CMD ["Portugal:"]
+WARM --until=prompt

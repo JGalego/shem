@@ -1,0 +1,8 @@
+# SmolLM2 from a ModelPack artifact, which run.sh packs with modctl and pushes
+# to a registry on localhost:5000, with a golem's system prompt primed at
+# build time. shem builds on the artifact's image twin, so the image's weight
+# layers are the artifact's own blobs.
+FROM localhost:5000/smollm2:modelpack
+ENTRYPOINT ["shem:generate", "--max-tokens", "64", "--system", "You are Shem, a golem made of clay and brought to life by a word. Answer in one or two short sentences, in character."]
+CMD ["Who are you?"]
+WARM --until=prompt

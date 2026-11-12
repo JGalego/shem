@@ -246,8 +246,9 @@ frontend-models-test registry="localhost:5000":
     layout() { docker save "$1" -o $dir/$1.tar && mkdir -p $dir/$1 && tar -xf $dir/$1.tar -C $dir/$1; }
     same() { [ "$1" = "$2" ] || { echo "expected the same reply:"; echo "$1"; echo "$2"; exit 1; }; }
 
-    echo "--- WARM through docker build, as shem build primes it"
-    shemfile="FROM $model\nENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"8\", \"--system\", \"You are a golem.\"]\nWARM --until=prompt\n"
+    echo "--- WARM through docker build, as shem build primes it, from a file of the image too"
+    echo "You are a golem." > $dir/warm/golem.txt
+    shemfile="FROM $model\nCOPY golem.txt /etc/golem.txt\nENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"8\", \"--system\", \"Stay in character.\", \"--system-file\", \"/etc/golem.txt\"]\nWARM --until=prompt\n"
     printf "# syntax=$reg/shem-dockerfile:ci\n$shemfile" > $dir/warm/Dockerfile
     printf "$shemfile" > $dir/warm/Shemfile
     build shem-warm $dir/warm
@@ -270,6 +271,40 @@ frontend-models-test registry="localhost:5000":
     layout shem-gguf
     $shem run $dir/shem-gguf 'Say hi.' | tee $dir/gguf.out
     test -s $dir/gguf.out
+
+# Build and run the model examples, each in a store of its own, then the
+# ModelPack round trip through a registry on localhost:5000; needs uv, modctl,
+# oras and the hf CLI
+examples-test:
+    #!/bin/sh
+    set -e
+    cargo build --release -p shem
+    export PATH="$PWD/target/release:$PATH"
+    check() { echo "$2"; echo "$2" | grep -qi "$1" || { echo "--- expected $1"; exit 1; }; }
+    run() {
+        echo "--- $1"
+        export SHEM_HOME=$PWD/target/examples/$1
+        rm -rf $SHEM_HOME
+        shem build -t $1 examples/$1
+        check "$2" "$(timeout 900 shem run $1)"
+        rm -rf $SHEM_HOME
+    }
+    run smollm2 golem
+    run granite-moe expert
+    run mamba lisbon
+    run llama-gguf golem
+    run handbook "shem push"
+    echo "--- modelpack"
+    export SHEM_HOME=$PWD/target/examples/modelpack
+    rm -rf $SHEM_HOME
+    examples/modelpack/run.sh
+    rm -rf $SHEM_HOME
+
+# Run examples-test on Hugging Face Jobs, at the pushed HEAD, with the gated Gemma example and the image volume Pod's command too; needs `hf auth login`
+examples-job flavor="cpu-upgrade":
+    uvx --from huggingface_hub hf jobs run --flavor {{ flavor }} --timeout 2h --secrets HF_TOKEN -e HF_XET_HIGH_PERFORMANCE=1 \
+        ghcr.io/astral-sh/uv:python3.12-bookworm bash -c \
+        "curl -fsSL https://github.com/JGalego/shem/archive/$(git rev-parse HEAD).tar.gz | tar xz && sh shem-*/neural/jobs/examples.sh"
 
 # Mount a model image as a Kubernetes image volume, as a model server would
 # read it: its /model is a Hugging Face checkpoint; needs Docker, kind and

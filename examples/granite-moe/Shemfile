@@ -1,0 +1,7 @@
+# Granite 3.1 1B-A400M, a mixture of experts: each of its 24 MLP blocks holds
+# 32 experts and sends every token to 8 of them, so 400M of its 1.3B
+# parameters work on each token. Each block is a layer of its own, experts
+# and router together.
+FROM hf.co/ibm-granite/granite-3.1-1b-a400m-instruct
+ENTRYPOINT ["shem:generate", "--max-tokens", "96"]
+CMD ["In machine learning, what is a mixture of experts? Answer in one sentence."]

@@ -1,0 +1,10 @@
+# An assistant that answers from a document, read once at build time.
+# --system-file adds the handbook to the system prompt, and WARM runs the
+# model over it and freezes every block's state after it into the image. A
+# run starts from that state, so a question costs only its own tokens, not
+# the 658 of the system prompt and handbook.
+FROM hf.co/allenai/OLMo-2-0425-1B-Instruct
+COPY handbook.md /etc/handbook.md
+ENTRYPOINT ["shem:generate", "--max-tokens", "128", "--system", "Answer questions about shem from its handbook, below, in one or two sentences.", "--system-file", "/etc/handbook.md"]
+CMD ["How do I share a model image?"]
+WARM --until=prompt

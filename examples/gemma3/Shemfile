@@ -1,0 +1,6 @@
+# Gemma 3 1B, a gated model: accept its licence on its Hugging Face page and
+# log in with `hf auth login` before building. Five of every six attention
+# layers look back over a sliding window of 512 tokens.
+FROM hf.co/google/gemma-3-1b-it
+ENTRYPOINT ["shem:generate", "--max-tokens", "96"]
+CMD ["What is a golem? Answer in one sentence."]

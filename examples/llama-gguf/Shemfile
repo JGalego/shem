@@ -1,0 +1,7 @@
+# Llama 3.2 1B Instruct from a GGUF repo, which holds the model in many
+# quantizations: :Q4_K_M picks the 4-bit one, 808 MB to download. The
+# importer dequantizes it as transformers does, into float32, so models that
+# are published only as GGUF files run too.
+FROM hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M
+ENTRYPOINT ["shem:generate", "--max-tokens", "96"]
+CMD ["What is a golem? Answer in one sentence."]
