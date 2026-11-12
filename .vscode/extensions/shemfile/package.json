@@ -1,0 +1,33 @@
+{
+  "name": "shemfile",
+  "displayName": "Shemfile",
+  "description": "Dockerfile highlighting and a file icon for Shemfiles, with WARM and KERNEL",
+  "publisher": "shem",
+  "version": "0.0.1",
+  "license": "MIT",
+  "repository": "https://github.com/JGalego/shem",
+  "engines": { "vscode": "^1.88.0" },
+  "extensionKind": ["workspace"],
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "shemfile",
+        "aliases": ["Shemfile"],
+        "filenames": ["Shemfile"],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/shemfile-light.svg",
+          "dark": "./icons/shemfile-dark.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "shemfile",
+        "scopeName": "source.shemfile",
+        "path": "./shemfile.tmLanguage.json"
+      }
+    ]
+  }
+}

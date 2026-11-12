@@ -1,0 +1,16 @@
+{
+  "scopeName": "source.shemfile",
+  "patterns": [
+    {
+      "match": "^\\s*(?i:(WARM|KERNEL))(?=\\s|$)",
+      "captures": {
+        "1": {
+          "name": "keyword.other.special-method.dockerfile"
+        }
+      }
+    },
+    {
+      "include": "source.dockerfile"
+    }
+  ]
+}
