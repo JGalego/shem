@@ -51,21 +51,27 @@ The session is saved as `session.safetensors`, every block's state by block numb
 
 The importer (`shem_neural.model.importers`) writes the model into `/model`:
 
-- `shem.json`, the manifest: the embedding, the blocks in order, and the head, each with its type, its weights file and its parameters, plus the tokenizer;
-- `blocks/NNN-TYPE.safetensors`: one weights file per block, in the checkpoint's own type;
-- `embed.safetensors`, `head.safetensors`, `tokenizer.json` and `chat_template.jinja`.
+- `shem.json`, the manifest: the embedding, the blocks in order, and the head, each with its type, its parameters and its tensors, plus the tokenizer;
+- `blocks/NNN-TYPE.safetensors`: one weights file per block, holding that block's tensors with the checkpoint's own names and types;
+- `embed.safetensors` and `head.safetensors`;
+- `model.safetensors.index.json`, the index that says which file holds each tensor;
+- the checkpoint's `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json` and `chat_template.jinja`, and its licence and notices.
 
 Each weights file is its own image layer, so images built on the same model share those blobs in stores and registries. A model with more than 95 weights files shares layers between neighbouring blocks, since overlay filesystems stack about 128 layers at most.
 
-The format knows nothing about Qwen. A model is a residual stream: an embedding, then blocks that each read the stream and add to it, then a head. A Qwen layer is two blocks, a token mixer and an MLP.
+The directory is also a Hugging Face checkpoint, sharded by block: the index and the tensor names are the ones transformers expects, so `AutoModelForCausalLM.from_pretrained("/model")` loads it and gives the original's logits, which a test checks. A block in `shem.json` names its tensors as the checkpoint does, and the index finds their files, so whether the files follow the blocks or the checkpoint's own shards is a choice of layout rather than of format. That manifest format is `shem.model/v2`; `shem.model/v1` models, whose blocks each name one file holding their tensors under the block type's names, still run.
+
+The format knows nothing about any one family. A model is a residual stream: an embedding, then blocks that each read the stream and add to it, then a head. A decoder layer is two blocks, a token mixer and an MLP.
 
 | Block type | What it does | Its state in a session |
 |---|---|---|
-| `attention` | Grouped-query attention, with rotary positions on all or part of each head, optional RMSNorm on queries and keys, and an optional output gate | The key and value cache, which grows with the session |
+| `attention` | Grouped-query attention, with rotary positions on all or part of each head (scaled linearly or as Llama 3 does), optional biases, RMSNorm on queries and keys, a sliding window and an output gate | The key and value cache, which grows with the session |
 | `gated_deltanet` | Gated DeltaNet: a causal depthwise convolution, then a matrix memory per head, written with the gated delta rule | The convolution's last inputs and the memory matrices, a fixed size however long the session |
-| `mlp` | A SwiGLU feed-forward block | None |
+| `mlp` | A SwiGLU feed-forward block, with optional biases | None |
 
-Supporting a new model family means writing an importer that maps its tensors onto these types. A new kind of layer, such as Mamba or a mixture of experts, is a new block type in [`blocks.py`](../neural/src/shem_neural/model/blocks.py), registered by name. Neither changes the image format.
+Llama, Mistral, Qwen2, Qwen3 and Qwen3.5 share Llama's layout, so one importer reads them all. It turns on what each checkpoint's config and tensors call for: projection biases, norms on queries and keys, sliding windows, rotary scaling and output gates. It refuses what the blocks can't run yet, such as YaRN scaling or an activation other than SiLU, rather than run it wrong. A family with another layout needs an importer of its own that maps its tensors onto these types. A new kind of layer, such as Mamba or a mixture of experts, is a new block type in [`blocks.py`](../neural/src/shem_neural/model/blocks.py), registered by name. Neither changes the image format.
+
+[`tests/test_importers.py`](../neural/tests/test_importers.py) builds a tiny random checkpoint of each family with transformers, imports it, and compares logits, in one pass and token by token, with no downloads.
 
 ## Imported models
 
@@ -73,8 +79,10 @@ Supporting a new model family means writing an importer that maps its tensors on
 |---|---|---|---|
 | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | 28 attention, 28 MLP | 59 layers, 892 MB | Logits within 1e-3 of transformers, and the same 24 greedy tokens |
 | [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) | 18 Gated DeltaNet, 6 attention with output gates and partial rotary positions, 24 MLP | 51 layers | The same, against transformers' Qwen3.5 |
+| [HuggingFaceTB/SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | 32 attention, 32 MLP | 67 layers | The same, against transformers' Llama |
+| [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | 24 attention with query, key and value biases, 24 MLP | 51 layers | The same, against transformers' Qwen2 |
 
-Qwen3.5's vision encoder and multi-token prediction layer are left out. [`tests/test_model.py`](../neural/tests/test_model.py) does the comparison; it downloads the checkpoints, so it runs with `SHEM_MODEL_TESTS=1`.
+Qwen3.5's vision encoder and multi-token prediction layer are left out, so its import is a text model. The others' imports load in transformers with the original's logits, exactly. [`tests/test_model.py`](../neural/tests/test_model.py) does these comparisons; it downloads the checkpoints, so it runs with `SHEM_MODEL_TESTS=1`. Mistral, Llama 3's rotary scaling and every family's other options are checked on tiny random checkpoints instead.
 
 ## Sessions under Docker
 

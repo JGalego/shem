@@ -8,13 +8,17 @@ caller-owned, one entry per block per session:
 - `mlp`: stateless SwiGLU.
 
 RMSNorm's weight offset is 0 for ordinary weights and 1 for zero-centred
-weights. Computation defaults to float32; CUDA execution disables TF32.
+weights. A projection `x` adds its bias `x_bias` when the block has one.
+Computation defaults to float32; CUDA execution disables TF32.
 """
 
+import math
+from collections import defaultdict
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 from .manifest import BlockSpec, Manifest
@@ -31,6 +35,39 @@ def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def rope_frequencies(p: dict, device: torch.device) -> torch.Tensor:
+    """The rotary frequencies of an attention block: one per pair of its
+    first `rotary_dim` dimensions, stretched as its `rope_scaling` says.
+    `linear` divides them all by the factor; `llama3` divides only the slow
+    ones, those whose wavelength is longer than the context the model was
+    trained on, and blends between the two around it."""
+    rotary = p.get("rotary_dim", p["head_dim"])
+    inv_freq = 1.0 / (p["rope_theta"] ** (torch.arange(0, rotary, 2, device=device).float() / rotary))
+    scaling = p.get("rope_scaling")
+    if scaling is None:
+        return inv_freq
+    factor = scaling["factor"]
+    if scaling["type"] == "linear":
+        return inv_freq / factor
+    if scaling["type"] == "llama3":
+        context = scaling["original_max_position_embeddings"]
+        low, high = scaling["low_freq_factor"], scaling["high_freq_factor"]
+        wavelength = 2 * math.pi / inv_freq
+        scaled = torch.where(wavelength > context / low, inv_freq / factor, inv_freq)
+        smooth = (context / wavelength - low) / (high - low)
+        blended = (1 - smooth) * scaled / factor + smooth * scaled
+        between = (wavelength >= context / high) & (wavelength <= context / low)
+        return torch.where(between, blended, scaled)
+    raise ValueError(f"unknown RoPE scaling {scaling['type']!r}")
+
+
+def project(h: torch.Tensor, t: dict, name: str) -> torch.Tensor:
+    """`h` through the projection `name`, and its bias if it has one."""
+    out = h @ t[name].T
+    bias = t.get(f"{name}_bias")
+    return out if bias is None else out + bias
 
 
 class Block:
@@ -60,14 +97,14 @@ class Attention(Block):
         offset, eps = p.get("norm_offset", 0.0), p["eps"]
         h = rmsnorm(x, t["norm"], eps, offset)
 
-        q = h @ t["q"].T
+        q = project(h, t, "q")
         gate = None
         if p.get("output_gate"):
             q, gate = q.view(batch, length, heads, 2 * head_dim).chunk(2, dim=-1)
             gate = gate.reshape(batch, length, heads * head_dim)
         q = q.reshape(batch, length, heads, head_dim)
-        k = (h @ t["k"].T).view(batch, length, kv_heads, head_dim)
-        v = (h @ t["v"].T).view(batch, length, kv_heads, head_dim)
+        k = project(h, t, "k").view(batch, length, kv_heads, head_dim)
+        v = project(h, t, "v").view(batch, length, kv_heads, head_dim)
         if "q_norm" in t:
             q = rmsnorm(q, t["q_norm"], eps, offset)
             k = rmsnorm(k, t["k_norm"], eps, offset)
@@ -75,8 +112,7 @@ class Attention(Block):
         # Rotary positions on the first `rotary_dim` dimensions of each head
         rotary = p.get("rotary_dim", head_dim)
         positions = torch.arange(start, start + length, dtype=torch.float32, device=x.device)
-        inv_freq = 1.0 / (p["rope_theta"] ** (torch.arange(0, rotary, 2, device=x.device).float() / rotary))
-        freqs = positions[:, None] * inv_freq
+        freqs = positions[:, None] * rope_frequencies(p, x.device)
         angles = torch.cat((freqs, freqs), dim=-1)
         cos, sin = angles.cos().to(x.dtype)[:, None, :], angles.sin().to(x.dtype)[:, None, :]
 
@@ -96,15 +132,18 @@ class Attention(Block):
         v = v.repeat_interleave(group, dim=1)
         scores = (q @ k.transpose(2, 3)) * head_dim**-0.5
         total = k.shape[2]
-        future = (
-            torch.arange(total, device=x.device)[None, :]
-            > torch.arange(total - length, total, device=x.device)[:, None]
-        )
-        scores = scores.masked_fill(future, float("-inf"))
+        # Each query sees the keys up to its own, or with a sliding window,
+        # only the last `sliding_window` of them
+        keys = torch.arange(total, device=x.device)[None, :]
+        queries = torch.arange(total - length, total, device=x.device)[:, None]
+        hidden = keys > queries
+        if p.get("sliding_window"):
+            hidden |= keys <= queries - p["sliding_window"]
+        scores = scores.masked_fill(hidden, float("-inf"))
         out = (scores.softmax(-1) @ v).transpose(1, 2).reshape(batch, length, heads * head_dim)
         if gate is not None:
             out = out * torch.sigmoid(gate)
-        return x + out @ t["o"].T
+        return x + project(out, t, "o")
 
 
 class GatedDeltaNet(Block):
@@ -163,7 +202,7 @@ class MLP(Block):
     def forward(self, x, state, start):
         t = self.t
         h = rmsnorm(x, t["norm"], self.p["eps"], self.p.get("norm_offset", 0.0))
-        return x + (F.silu(h @ t["gate"].T) * (h @ t["up"].T)) @ t["down"].T
+        return x + project(F.silu(project(h, t, "gate")) * project(h, t, "up"), t, "down")
 
 
 BLOCKS: dict[str, type[Block]] = {
@@ -193,18 +232,32 @@ class Model:
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
 
+        m = self.manifest
+        weight_map = m.weight_map(self.directory)
+
         def tensors(spec: BlockSpec) -> dict[str, torch.Tensor]:
-            loaded = load_file(str(self.directory / spec.file), device=device)
+            if spec.file is not None:
+                # A v1 manifest: the block's file, under its type's names
+                loaded = load_file(str(self.directory / spec.file), device=device)
+            else:
+                # The block's tensors from whichever files hold them
+                by_file = defaultdict(list)
+                for local, name in spec.tensors.items():
+                    by_file[weight_map[name]].append((local, name))
+                loaded = {}
+                for file, names in by_file.items():
+                    with safe_open(str(self.directory / file), "pt", device=device) as handle:
+                        for local, name in names:
+                            loaded[local] = handle.get_tensor(name)
             return {name: tensor.to(dtype) for name, tensor in loaded.items()}
 
-        m = self.manifest
         self.embed = tensors(m.embed)["weight"]
         self.blocks: list[Block] = []
         for spec in m.blocks:
             if spec.type not in BLOCKS:
                 raise ValueError(f"unknown block type {spec.type!r}: this runtime has {sorted(BLOCKS)}")
             self.blocks.append(BLOCKS[spec.type](spec.params, tensors(spec)))
-        head = tensors(m.head) if m.head.file else {}
+        head = tensors(m.head)
         self.head_norm = head["norm"]
         self.head_weight = self.embed if m.head.params.get("tied") else head["weight"]
         self.head_params = m.head.params

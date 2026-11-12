@@ -15,7 +15,9 @@ from shem_neural.model.tokenizer import Tokenizer
 
 pytestmark = pytest.mark.skipif(not os.environ.get("SHEM_MODEL_TESTS"), reason="set SHEM_MODEL_TESTS=1")
 
-REPOS = ["Qwen/Qwen3-0.6B", "Qwen/Qwen3.5-0.8B"]
+REPOS = ["Qwen/Qwen3-0.6B", "Qwen/Qwen3.5-0.8B", "HuggingFaceTB/SmolLM2-360M-Instruct", "Qwen/Qwen2.5-0.5B-Instruct"]
+#: The imports that are a text model's whole checkpoint: Qwen3.5's leaves out its vision encoder
+TEXT_REPOS = [repo for repo in REPOS if "3.5" not in repo]
 _IMPORTED: dict = {}
 
 
@@ -57,8 +59,14 @@ def test_imported_models_match_transformers(repo, imports):
     got = model.forward(tokens, model.init_state(), 0)
     assert torch.allclose(got, expected, atol=1e-3, rtol=1e-3), (got - expected).abs().max()
 
-    # Greedy decoding, one token at a time from the session's state
-    want = ref.generate(input_ids=tokens, max_new_tokens=24, do_sample=False)[0, len(prompt) :].tolist()
+    # Greedy decoding, one token at a time from the session's state. The
+    # checkpoint's generation defaults are replaced, not overridden, since
+    # generate merges them into a config it is given: Qwen2.5's repetition
+    # penalty would apply even without sampling
+    import transformers
+
+    ref.generation_config = transformers.GenerationConfig()
+    want = ref.generate(input_ids=tokens, do_sample=False, max_new_tokens=24)[0, len(prompt) :].tolist()
     state = model.init_state()
     logits = model.forward(tokens, state, 0)
     reply = []
@@ -67,6 +75,18 @@ def test_imported_models_match_transformers(repo, imports):
         reply.append(token)
         logits = model.forward(torch.tensor([[token]]), state, position)
     assert reply == want, (tokenizer.decode(reply), tokenizer.decode(want))
+
+
+@pytest.mark.parametrize("repo", TEXT_REPOS)
+def test_imported_directories_load_in_transformers(repo, imports):
+    """An import is the checkpoint sharded by block, with its own tensor
+    names: transformers loads it and gives the original's logits."""
+    import transformers
+
+    loaded = transformers.AutoModelForCausalLM.from_pretrained(imports(repo), dtype=torch.float32).eval()
+    tokens = torch.arange(100, 140)[None, :]
+    with torch.no_grad():
+        assert torch.equal(loaded(input_ids=tokens).logits, reference(repo)(input_ids=tokens).logits)
 
 
 @pytest.mark.parametrize("repo", REPOS)
