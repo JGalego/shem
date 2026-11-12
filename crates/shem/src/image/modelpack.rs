@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use super::{
     Config, Descriptor, Image, Layer, MANIFEST_TYPE, ROOTFS_TYPE, Stored, digest, layer,
-    layer_type, model,
+    layer_type, model, put_blob,
 };
 
 /// The namespaces of ModelPack's media types: the spec's, and modctl's.
@@ -318,7 +318,7 @@ pub fn export(
     }
     let put = |data: &[u8]| -> anyhow::Result<(String, u64)> {
         let digest = digest(data);
-        std::fs::write(blobs.join(&digest["sha256:".len()..]), data)?;
+        put_blob(&blobs, &digest, data)?;
         Ok((digest, data.len() as u64))
     };
     let mut layers = Vec::new();

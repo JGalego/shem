@@ -273,6 +273,18 @@ pub fn digest(data: &[u8]) -> String {
     format!("sha256:{hex}")
 }
 
+/// Write `data`, whose digest is `digest`, into a layout's `blobs` directory.
+/// A blob is named by its content, so one already there holds these very
+/// bytes, and may be a read-only link to a stored blob, as oras leaves them:
+/// it stays.
+fn put_blob(blobs: &Path, digest: &str, data: &[u8]) -> anyhow::Result<()> {
+    let target = blobs.join(&digest["sha256:".len()..]);
+    if !target.exists() {
+        std::fs::write(target, data)?;
+    }
+    Ok(())
+}
+
 impl Image {
     /// The files of the state layer, if this is a warm image.
     fn state_files(&self) -> anyhow::Result<Option<BTreeMap<String, Vec<u8>>>> {
@@ -349,7 +361,7 @@ impl Image {
         std::fs::create_dir_all(&blobs)?;
         let put = |media_type: &str, data: &[u8]| -> anyhow::Result<Descriptor> {
             let digest = digest(data);
-            std::fs::write(blobs.join(&digest["sha256:".len()..]), data)?;
+            put_blob(&blobs, &digest, data)?;
             Ok(Descriptor {
                 media_type: media_type.into(),
                 digest,

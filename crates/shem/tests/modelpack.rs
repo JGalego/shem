@@ -313,6 +313,37 @@ fn twins_warm_as_imported_models_do() {
 }
 
 #[test]
+#[ignore = "needs uv and the neural package's dev dependencies"]
+fn images_built_on_twins_publish_as_uncompressed_artifacts() {
+    // A twin's files are at the root already, so the layers an uncompressed
+    // export writes are its tars as they were: blobs the export has linked
+    // already, read-only, as oras leaves them
+    let context = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (_, blobs) = pack(&context.path().join("artifact"), "cncf", false);
+    for entry in std::fs::read_dir(context.path().join("artifact/blobs/sha256")).unwrap() {
+        let path = entry.unwrap().path();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+    }
+    let shemfile = "FROM artifact\nENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"8\"]\n";
+    let (out, _, _) = build_and_run(context.path(), shemfile, home.path());
+    let image = shem::image::Image::read_layout(&out).unwrap();
+    let artifact = home.path().join("exported");
+    export(&out, &image, &artifact, true);
+
+    let layers = layer_digests(&read_image(&artifact).0);
+    assert!(
+        blobs.iter().all(|blob| layers.contains(blob)),
+        "the twin's tars"
+    );
+    let dest = tempfile::tempdir().unwrap();
+    extract(&artifact, dest.path());
+    assert!(loads_as_the_checkpoint(dest.path()));
+}
+
+#[test]
 #[ignore = "needs uv, oras and a registry: set SHEM_TEST_REGISTRY"]
 fn artifacts_pull_as_twins_that_push_beside_them() {
     let registry = std::env::var("SHEM_TEST_REGISTRY").unwrap_or_else(|_| "localhost:5000".into());
@@ -604,6 +635,8 @@ fn sessions_publish_beside_their_models_and_resume_on_them() {
     );
     assert_eq!(config["format"], "shem.session/v1");
     assert!(config["tokens"].as_u64().unwrap() > 0);
+    assert_eq!(config["precision"], "float32");
+    assert_eq!(config["blocks"]["attention"], 1, "{config}");
 
     let reply = ok(run_with_state(home.path(), &cold, state.to_str().unwrap()));
     assert_eq!(
