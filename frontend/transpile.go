@@ -16,9 +16,12 @@ import (
 // Ordinary Docker stages run on the build platform.
 
 const (
-	hfPrefix       = "hf.co/"
-	modelDir       = "/model"
-	importDir      = "/out/model"
+	hfPrefix  = "hf.co/"
+	modelDir  = "/model"
+	importDir = "/out/model"
+	// imageDir is where WARM sees the image's filesystem: the driver finds
+	// the model in it, at /model or, in a ModelPack artifact's twin, at /
+	imageDir       = "/image"
 	maxModelLayers = 96
 )
 
@@ -221,9 +224,9 @@ func Transpile(src []byte, imported map[string]Imported, neuralImage string) (st
 				}
 				warmName := fmt.Sprintf("shem-%d-warm-%d", i, warm)
 				command := append([]string{"shem-neural-generate"}, entrypoint[1:]...)
-				command = append(command, "--warm", "/out/.shem", modelDir)
+				command = append(command, "--warm", "/out/.shem", imageDir)
 				write("FROM --platform=$BUILDPLATFORM %s AS %s", neuralImage, warmName)
-				write("COPY --from=%s %s %s", part(warm), modelDir, modelDir)
+				write("COPY --from=%s / %s", part(warm), imageDir)
 				write("RUN %s", jsonArray(command))
 				warm++
 				write("FROM %s%s", part(warm-1), as(part(warm)))

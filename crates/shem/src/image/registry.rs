@@ -11,6 +11,7 @@ use std::process::Command;
 use anyhow::{Context, bail};
 
 use super::Image;
+use super::modelpack::Artifact;
 
 fn oras() -> Command {
     Command::new(std::env::var_os("SHEM_ORAS").unwrap_or_else(|| "oras".into()))
@@ -46,8 +47,21 @@ pub fn push(dir: &Path, remote: &str, plain_http: bool) -> anyhow::Result<String
     Ok(digest)
 }
 
-/// Pull `remote` into the layout directory `dir`, replacing what is there, and
-/// check that it is a shem image. Returns its manifest digest.
+/// The registry a reference names, such as ghcr.io in ghcr.io/me/app:1.0.
+pub fn registry_host(reference: &str) -> Option<&str> {
+    let (first, _) = reference.split_once('/')?;
+    (first.contains('.') || first.contains(':') || first == "localhost").then_some(first)
+}
+
+/// Whether a registry is local, which speaks plain HTTP.
+pub fn is_local(host: &str) -> bool {
+    host.starts_with("localhost") || host.starts_with("127.0.0.1")
+}
+
+/// Pull `remote` into the layout directory `dir`, replacing what is there.
+/// A ModelPack artifact becomes its image twin, whose layers are the
+/// artifact's own blobs; anything else must be a shem image. Returns the
+/// image's manifest digest.
 pub fn pull(remote: &str, dir: &Path, plain_http: bool) -> anyhow::Result<String> {
     let parent = dir.parent().context("no directory to pull into")?;
     std::fs::create_dir_all(parent)?;
@@ -63,7 +77,20 @@ pub fn pull(remote: &str, dir: &Path, plain_http: bool) -> anyhow::Result<String
         .arg("--to-oci-layout")
         .arg(format!("{}:latest", layout.display()));
     run(command)?;
-    Image::read_layout(&layout).with_context(|| format!("{remote} is not a shem image"))?;
+    let layout = match Artifact::read(&layout)? {
+        Some(artifact) => {
+            let root = tempfile::tempdir()?;
+            let twin = staging.path().join("twin");
+            artifact
+                .twin(remote, root.path())?
+                .write_layout(&twin, "latest")?;
+            twin
+        }
+        None => {
+            Image::read_layout(&layout).with_context(|| format!("{remote} is not a shem image"))?;
+            layout
+        }
+    };
     if dir.exists() {
         std::fs::remove_dir_all(dir)?;
     }

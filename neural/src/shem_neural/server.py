@@ -91,10 +91,10 @@ class Models:
         under which the session stays open for more turns."""
         from .model import generate
 
-        args = generate.options(request.get("argv", []), model=request["model"])
+        args = generate.resolve(generate.options(request.get("argv", []), model=request["model"]))
         if request.get("session"):
             args.session = Path(request["session"])
-        model, tokenizer = self.get(Path(request["model"]))
+        model, tokenizer = self.get(args.model)
         session = generate.start(model, tokenizer, args, err=_Stream(write), vcpu_socket=self.socket)
         prompt = " ".join(args.prompt) or request.get("stdin", "")
         with _all_cores():

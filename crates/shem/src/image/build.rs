@@ -14,8 +14,11 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
+use super::modelpack::{self, Artifact};
 use super::shemfile::{self, Instruction, Stage, Until};
-use super::{Config, Image, Layer, ROOTFS_TYPE, STATE_TYPE, find_program, layer, model};
+use super::{
+    Config, Image, Layer, ROOTFS_TYPE, STATE_TYPE, Store, find_program, layer, model, registry_host,
+};
 use crate::container::{Container, Frozen, Pause, Stop};
 use crate::linux::{RootFs, Stdio};
 use crate::reference::ReferenceVcpu;
@@ -43,9 +46,18 @@ pub fn build(options: &BuildOptions) -> anyhow::Result<Image> {
         .with_context(|| format!("reading {}", options.shemfile.display()))?;
     let stages = shemfile::parse(&text)?;
     let last = stages.last().context("the Shemfile has no FROM")?;
-    let base = shem_base(last, &options.context).context(
-        "the last stage must be a shem stage: FROM scratch, or FROM a shem image's directory",
-    )?;
+    let base = match shem_base(last, &options.context) {
+        Some(base) => base,
+        // A shem image or a ModelPack artifact in a registry, pulled into the
+        // store the first time; an artifact is kept as its image twin
+        None if registry_host(&last.from).is_some() => {
+            Base::Image(Store::open()?.fetch(&last.from)?)
+        }
+        None => bail!(
+            "the last stage must be a shem stage: FROM scratch, a Hugging Face model, \
+             or a shem image or ModelPack artifact, in a registry or a layout directory"
+        ),
+    };
 
     let root = tempfile::tempdir()?;
     let mut builder = Builder {
@@ -66,13 +78,17 @@ pub fn build(options: &BuildOptions) -> anyhow::Result<Image> {
 }
 
 /// The base a shem stage starts from: nothing, an image's layout directory,
-/// or a Hugging Face model.
+/// a Hugging Face model, or a ModelPack artifact's layout directory.
 enum Base {
     Scratch,
     Image(PathBuf),
     Model {
         repo: String,
         revision: Option<String>,
+    },
+    ModelPack {
+        dir: PathBuf,
+        name: String,
     },
 }
 
@@ -87,7 +103,17 @@ fn shem_base(stage: &Stage, context: &Path) -> Option<Base> {
         });
     }
     let dir = context.join(&stage.from);
-    dir.join("oci-layout").is_file().then_some(Base::Image(dir))
+    if !dir.join("oci-layout").is_file() {
+        return None;
+    }
+    Some(if modelpack::is_artifact(&dir) {
+        Base::ModelPack {
+            dir,
+            name: stage.from.clone(),
+        }
+    } else {
+        Base::Image(dir)
+    })
 }
 
 struct Builder<'a> {
@@ -128,8 +154,14 @@ impl Builder<'_> {
                     self.add_layer(&group, &[])?;
                 }
             }
+            Base::ModelPack { dir, name } => {
+                let artifact = Artifact::read(&dir)?.context("not a ModelPack artifact")?;
+                self.image = artifact.twin(&name, &self.root)?;
+            }
             Base::Image(dir) => {
                 self.image = Image::read_layout(&dir)?;
+                // An image built on another is not the other's twin
+                self.image.subject = None;
                 self.image.unpack_rootfs(&self.root)?;
                 if self.image.config.model.is_some() {
                     // A model's session is rebuilt by its own WARM, if any
@@ -395,13 +427,7 @@ impl Builder<'_> {
             .iter()
             .position(|l| l.media_type == STATE_TYPE)
             .unwrap_or(self.image.layers.len());
-        self.image.layers.insert(
-            at,
-            Layer {
-                media_type: ROOTFS_TYPE.into(),
-                data,
-            },
-        );
+        self.image.layers.insert(at, Layer::new(ROOTFS_TYPE, data));
         Ok(())
     }
 
@@ -463,10 +489,7 @@ impl Builder<'_> {
         let machine = frozen.machine.encode();
         let state = layer::from_files(&[("container.json", &host), ("machine.state", &machine)])?;
         self.image.layers.retain(|l| l.media_type != STATE_TYPE);
-        self.image.layers.push(Layer {
-            media_type: STATE_TYPE.into(),
-            data: state,
-        });
+        self.image.layers.push(Layer::new(STATE_TYPE, state));
         self.image.config.memory = Some(frozen.machine.mem.len() as u32);
         self.frozen = Some(frozen);
         Ok(())
@@ -514,10 +537,7 @@ impl Builder<'_> {
         let state = frozen.machine.encode();
         let state = layer::from_files(&[("machine.state", &state), ("vm.json", &host)])?;
         self.image.layers.retain(|l| l.media_type != STATE_TYPE);
-        self.image.layers.push(Layer {
-            media_type: STATE_TYPE.into(),
-            data: state,
-        });
+        self.image.layers.push(Layer::new(STATE_TYPE, state));
         self.image.config.memory = Some(frozen.machine.mem.len() as u32);
         self.frozen_vm = Some(frozen);
         Ok(())
@@ -549,10 +569,7 @@ impl Builder<'_> {
         let files: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (*n, d.as_slice())).collect();
         let state = layer::from_files(&files)?;
         self.image.layers.retain(|l| l.media_type != STATE_TYPE);
-        self.image.layers.push(Layer {
-            media_type: STATE_TYPE.into(),
-            data: state,
-        });
+        self.image.layers.push(Layer::new(STATE_TYPE, state));
         Ok(())
     }
 
@@ -565,8 +582,9 @@ impl Builder<'_> {
             return Ok(dir.path().to_path_buf());
         }
         let context = &self.options.context;
-        let docker_stages: Vec<&Stage> = self
-            .stages
+        // The last stage is the shem stage being built, whatever its base
+        let earlier = &self.stages[..self.stages.len() - 1];
+        let docker_stages: Vec<&Stage> = earlier
             .iter()
             .filter(|stage| shem_base(stage, context).is_none())
             .collect();

@@ -33,7 +33,7 @@ docker build --platform linux/riscv32 -t golem .
 
 BuildKit pulls and runs the frontend, which turns the Shemfile into a Dockerfile and has BuildKit's own Dockerfile frontend build it:
 
-- `FROM hf.co/ORG/NAME[:REVISION]` runs the importer in the `shem-neural` image, then copies each weights file into a layer of its own, as `shem build` does. A gated model's token comes from the build's secret `HF_TOKEN` (`docker build --secret id=HF_TOKEN,env=HF_TOKEN`), and downloads are cached between builds.
+- `FROM hf.co/ORG/NAME[:REVISION]` runs the importer in the `shem-neural` image, then copies each weights file into a layer of its own, as `shem build` does. `FROM` a ModelPack artifact's [image twin](models.md#modelpack-artifacts) works as for any image, but not `FROM` the artifact itself. A gated model's token comes from the build's secret `HF_TOKEN` (`docker build --secret id=HF_TOKEN,env=HF_TOKEN`), and downloads are cached between builds.
 - `WARM --until=prompt` runs the model's driver over the prompt in the `shem-neural` image and copies the primed session into `/.shem`.
 - `KERNEL` becomes the image's `dev.shem.kernel` and `dev.shem.bootargs` labels.
 - Other stages are Docker stages, built on the build platform, and `RUN` is refused in shem stages, as with `shem build`.
@@ -78,13 +78,13 @@ riscv32
 
 ## Stages
 
-The last stage is the image. With `shem build`, it must start from `scratch`, a Hugging Face model (`hf.co/ORG/NAME[:REVISION]`), or a shem image's OCI layout directory relative to the build context. Other stages supply files through `COPY --from`; ordinary Docker stages are built only when their files are needed.
+The last stage is the image. With `shem build`, it must start from `scratch`, a Hugging Face model (`hf.co/ORG/NAME[:REVISION]`), or a shem image or a [ModelPack artifact](models.md#modelpack-artifacts), either in a registry (pulled into the store the first time) or as an OCI layout directory relative to the build context. Other stages supply files through `COPY --from`; ordinary Docker stages are built only when their files are needed.
 
 ## Instructions
 
 | Instruction | In a shem stage |
 |---|---|
-| `FROM` | `scratch`, a Hugging Face model ([models.md](models.md)), or a shem image's layout directory |
+| `FROM` | `scratch`, a Hugging Face model ([models.md](models.md)), or a shem image or a ModelPack artifact ([models.md](models.md#modelpack-artifacts)), in a registry or a layout directory |
 | `COPY --from=shem:rv32im src dest` | Copies a compiled layer, which shem compiles at build time: the RV32IM CPU, for a model's tools ([models.md](models.md#compiled-layers-and-tools)) |
 | `COPY [--from=stage] src... dest` | As in Docker: a directory's contents are copied into `dest`; a file goes to `dest`, or into it when `dest` ends in `/` or there are several sources. Each `COPY` is one layer. Sources must stay inside the context. |
 | `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`, `ARG`, `LABEL` | As in Docker, including shell and exec forms, and `$NAME` and `${NAME}` substitution from `ARG` and `ENV` |
@@ -150,7 +150,7 @@ Layouts in shem's earlier format, with these media types, can still be read:
 | `application/vnd.oci.image.layer.v1.tar+zstd` | Guest filesystem layers, in the standard format |
 | `application/vnd.shem.state.v1.tar+zstd` | A `WARM` snapshot, always the last layer: a container's (`machine.state`, `container.json`) or a VM's (`machine.state`, `vm.json`) |
 
-Layers are tars compressed with zstd, which matters most for state layers: they hold all of a guest's memory, mostly zeros. The booted Linux image is 2 MB, where its RAM alone is 64 MiB. Uncompressed layers, which earlier versions wrote, are still read.
+Layers are tars compressed with zstd, which matters most for state layers: they hold all of a guest's memory, mostly zeros. The booted Linux image is 2 MB, where its RAM alone is 64 MiB. Uncompressed layers, which earlier versions wrote, are still read. A layer an image gets from elsewhere, such as its base, a Docker build or a ModelPack artifact, keeps its blob as it was, compressed or not, so an image built on another shares its base's blobs. An image may name the manifest it belongs to as its `subject`, as a ModelPack artifact's twin does.
 
 Images in the local store live under `$SHEM_HOME/images/<name>/<tag>`, by default `~/.local/share/shem/images`. Program and VM runs unpack a fresh filesystem and remove it afterwards. Model images [cache their unpacked filesystem](models.md#running).
 

@@ -12,6 +12,7 @@ mod build;
 mod docker;
 mod layer;
 pub mod model;
+pub mod modelpack;
 mod registry;
 pub mod shemfile;
 
@@ -25,7 +26,7 @@ use sha2::{Digest, Sha256};
 pub use build::{BuildOptions, CONTAINER_MEM, VM_MEM, build};
 pub use docker::WARM_DIR;
 pub use layer::unpack;
-pub use registry::{pull, push};
+pub use registry::{is_local, pull, push, registry_host};
 
 use crate::container::{Container, Frozen, FrozenHost};
 use crate::linux::{RootFs, Stdio};
@@ -38,6 +39,9 @@ pub const OCI_CONFIG_TYPE: &str = "application/vnd.oci.image.config.v1+json";
 /// The config media type of shem's earlier image format, still read.
 pub const CONFIG_TYPE: &str = "application/vnd.shem.config.v1+json";
 const LAYER_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+/// The media types of OCI image layers: a tar, and a tar compressed with gzip
+const TAR_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
+const GZIP_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 /// The config media type of images Docker builds without the OCI exporter.
 const DOCKER_CONFIG_TYPE: &str = "application/vnd.docker.container.image.v1+json";
 /// The prefix of the labels that hold shem's own settings.
@@ -149,28 +153,68 @@ pub struct Config {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A layer: its kind (a filesystem layer or shem's state) and its tar.
+#[derive(Debug, Clone)]
 pub struct Layer {
     pub media_type: String,
     pub data: Vec<u8>,
+    /// The blob the layer was read from, which writing the image copies
+    /// rather than compressing the tar again: a layer an image shares with
+    /// a ModelPack artifact, or with an image Docker built, stays one blob
+    /// in stores and registries.
+    pub stored: Option<Stored>,
+}
+
+impl Layer {
+    pub fn new(media_type: &str, data: Vec<u8>) -> Self {
+        Self {
+            media_type: media_type.into(),
+            data,
+            stored: None,
+        }
+    }
+}
+
+/// Layers are equal when they hold the same files, however they are stored.
+impl PartialEq for Layer {
+    fn eq(&self, other: &Self) -> bool {
+        self.media_type == other.media_type && self.data == other.data
+    }
+}
+
+impl Eq for Layer {}
+
+/// A layer's blob in an OCI layout, which holds the layer's tar or that tar
+/// compressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    /// Its OCI media type: a tar, or one compressed with gzip or zstd
+    pub media_type: String,
+    pub digest: String,
+    pub size: u64,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Image {
     pub config: Config,
     pub layers: Vec<Layer>,
+    /// The manifest this image's manifest refers to, such as the ModelPack
+    /// artifact an image twin runs, which a registry lists it under
+    pub subject: Option<Descriptor>,
 }
 
+/// An OCI content descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Descriptor {
+pub struct Descriptor {
     #[serde(rename = "mediaType")]
-    media_type: String,
-    digest: String,
-    size: u64,
+    pub media_type: String,
+    pub digest: String,
+    pub size: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    annotations: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    platform: Option<serde_json::Value>,
+    pub platform: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -181,6 +225,20 @@ struct Manifest {
     media_type: String,
     config: Descriptor,
     layers: Vec<Descriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subject: Option<Descriptor>,
+}
+
+/// The OCI image layer media type for a layer stored as `media_type`, which
+/// may be Docker's or ModelPack's: the same bytes, by their compression.
+fn layer_type(media_type: &str) -> &'static str {
+    if media_type.ends_with("gzip") {
+        GZIP_TYPE
+    } else if media_type.ends_with("zstd") {
+        LAYER_TYPE
+    } else {
+        TAR_TYPE
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -307,7 +365,29 @@ impl Image {
                 _ => layer.data.clone(),
             };
             diff_ids.push(digest(&tar));
-            layers.push(put(LAYER_TYPE, &zstd::encode_all(&tar[..], ZSTD_LEVEL)?)?);
+            layers.push(match &layer.stored {
+                Some(stored) => {
+                    let target = blobs.join(&stored.digest["sha256:".len()..]);
+                    // A link where it can be one: weights are gigabytes
+                    if !target.exists() && std::fs::hard_link(&stored.path, &target).is_err() {
+                        std::fs::copy(&stored.path, &target).with_context(|| {
+                            format!(
+                                "copying layer {} from {}",
+                                stored.digest,
+                                stored.path.display()
+                            )
+                        })?;
+                    }
+                    Descriptor {
+                        media_type: stored.media_type.clone(),
+                        digest: stored.digest.clone(),
+                        size: stored.size,
+                        annotations: BTreeMap::new(),
+                        platform: None,
+                    }
+                }
+                None => put(LAYER_TYPE, &zstd::encode_all(&tar[..], ZSTD_LEVEL)?)?,
+            });
         }
         let config = put(
             OCI_CONFIG_TYPE,
@@ -318,6 +398,7 @@ impl Image {
             media_type: MANIFEST_TYPE.into(),
             config,
             layers,
+            subject: self.subject.clone(),
         };
         let mut descriptor = put(MANIFEST_TYPE, &serde_json::to_vec(&manifest)?)?;
         descriptor.platform = Some(serde_json::json!({ "architecture": "riscv32", "os": "linux" }));
@@ -407,13 +488,21 @@ impl Image {
                 } else {
                     data
                 };
-                let media_type = match d.media_type.as_str() {
-                    t if t.starts_with(STATE_TYPE) => STATE_TYPE,
-                    _ => ROOTFS_TYPE,
-                };
+                if d.media_type.starts_with(STATE_TYPE) {
+                    return Ok(Layer::new(STATE_TYPE, data));
+                }
+                let hex = d
+                    .digest
+                    .strip_prefix("sha256:")
+                    .context("unsupported digest")?;
                 Ok(Layer {
-                    media_type: media_type.into(),
-                    data,
+                    stored: Some(Stored {
+                        media_type: layer_type(&d.media_type).into(),
+                        digest: d.digest.clone(),
+                        size: d.size,
+                        path: dir.join("blobs/sha256").join(hex),
+                    }),
+                    ..Layer::new(ROOTFS_TYPE, data)
                 })
             })
             .collect::<anyhow::Result<_>>()?;
@@ -422,12 +511,13 @@ impl Image {
             && last.media_type == ROOTFS_TYPE
             && let Some(state) = layer::strip(&last.data, STATE_DIR)?
         {
-            *last = Layer {
-                media_type: STATE_TYPE.into(),
-                data: state,
-            };
+            *last = Layer::new(STATE_TYPE, state);
         }
-        Ok(Self { config, layers })
+        Ok(Self {
+            config,
+            layers,
+            subject: manifest.subject,
+        })
     }
 
     /// The manifest digest of the image's layout in `dir`.
@@ -604,6 +694,21 @@ impl Store {
             std::fs::rename(staging.keep(), &dir)?;
         }
         Ok(dir)
+    }
+
+    /// The layout of the image `reference` in the store, pulled from its
+    /// registry the first time, as `docker run` does. A ModelPack artifact
+    /// is kept as its image twin.
+    pub fn fetch(&self, reference: &str) -> anyhow::Result<PathBuf> {
+        let path = self.path(reference)?;
+        if !path.join("oci-layout").is_file() {
+            let Some(host) = registry_host(reference) else {
+                bail!("{reference}: no such executable or image (see `shem images`)");
+            };
+            let digest = pull(reference, &path, is_local(host))?;
+            eprintln!("shem: pulled {reference} {digest}");
+        }
+        Ok(path)
     }
 
     /// Where the image `reference` (`name` or `name:tag`) lives.

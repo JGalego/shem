@@ -19,7 +19,7 @@ The project is experimental. Current features include:
 
 - **Model images.** Import Llama, Mistral, Qwen, Gemma, Phi, OLMo and SmolLM checkpoints from Hugging Face, run text-generation sessions on a CPU or GPU, and save primed sessions with `WARM`. Models can call RV32 programs as tools on a compiled CPU layer ([models](docs/models.md)).
 - **Containers.** Run static musl programs and [🧰 BusyBox](https://busybox.net) with a root filesystem, processes, threads, pipes, signals, file mappings and a virtual clock. `shem run` supports host terminals; `--trace` prints system calls.
-- **Images.** Build OCI images with `shem build` or the BuildKit frontend. `WARM` saves guest state at build time; `shem run` resumes it. Push and pull images through OCI registries ([Shemfile](docs/shemfile.md)).
+- **Images.** Build OCI images with `shem build` or the BuildKit frontend. `WARM` saves guest state at build time; `shem run` resumes it. Push and pull images through OCI registries, and run [ModelPack](https://github.com/modelpack/model-spec) artifacts as image twins that share their weights' blobs ([Shemfile](docs/shemfile.md), [models](docs/models.md#modelpack-artifacts)).
 - **VMs.** Boot no-MMU [🐧 Linux](https://kernel.org) 6.8 with `shem boot`, or resume a booted VM image on either vCPU ([VM mode](docs/vm.md)).
 - **[🐳 Docker](https://www.docker.com), [📦 containerd](https://containerd.io) and Kubernetes.** Run images through `io.containerd.shem.v1`, including live model sessions with `docker exec` and `docker commit` ([containerd](docs/containerd.md), [Kubernetes](docs/kubernetes.md)).
 - **Neural vCPU.** Execute RV32IM instructions with [🔥 PyTorch](https://pytorch.org), one instruction per forward pass. Tests compare it with the reference interpreter. The server batches compatible guests and shares memory pages; GPU benchmarks use [🤗 Hugging Face Jobs](https://huggingface.co/docs/huggingface_hub/guides/jobs) ([design and benchmarks](docs/neural.md)).
@@ -115,15 +115,15 @@ sudo rm /usr/local/bin/containerd-shim-shem-v1
 
 | | ModelPack | shem |
 |---|---|---|
-| OCI object | An artifact, with `artifactType` `application/vnd.cncf.model.manifest.v1+json` | A container image for `linux/riscv32` |
+| OCI object | An artifact, with `artifactType` `application/vnd.cncf.model.manifest.v1+json` (`vnd.cnai` in artifacts modctl 0.2 builds) | A container image for `linux/riscv32` |
 | Weights | The checkpoint's files, unchanged, in any format: safetensors, GGUF, ONNX and others | One safetensors file per block, each in its own layer, imported from Hugging Face (Llama, Mistral, Qwen2 to Qwen3.5, Gemma 2 and 3, Phi-3 and Phi-4-mini, OLMo 2 and 3, SmolLM3). The tensors keep their names and an index finds them, so the directory is also a checkpoint transformers can load |
 | Metadata | A model config: name, family, licences, format, precision, parameter count and capabilities | The OCI image config, with `ENTRYPOINT`, `CMD` and `dev.shem.*` labels, and `shem.json`, which lists the blocks the runtime executes |
 | Session state | None | An optional layer under `/.shem`, written by `WARM` or `docker commit` |
-| Running | Mounted read-only into an inference server, for example as a Kubernetes image volume | Runs as a container: `shem run`, or `docker run --runtime io.containerd.shem.v1` |
-| Building with Docker | BuildKit rejects the model config type, so an artifact can't be a `FROM` base or a `COPY --from` source | `docker build` builds model images through shem's BuildKit frontend |
+| Running | Mounted read-only into an inference server, for example as a Kubernetes image volume | Runs as a container: `shem run`, or `docker run --runtime io.containerd.shem.v1`. A ModelPack artifact runs as its image twin |
+| Building with Docker | BuildKit rejects the model config type, so an artifact can't be a `FROM` base or a `COPY --from` source | `docker build` builds model images through shem's BuildKit frontend, on an artifact's image twin too |
 | Layer compression | Uncompressed weights recommended | zstd |
 
-shem can't use a ModelPack artifact as a base yet.
+shem runs a ModelPack artifact through its [image twin](docs/models.md#modelpack-artifacts): an image over the artifact's own layers, plus a layer with `shem.json`, whose `subject` is the artifact. `shem run` and `FROM` take an artifact like an image. When the artifact's layers are tars, the twin and the artifact share their weights' blobs in a registry. Raw layers, modctl's default, have to be wrapped, and so copied.
 
 ## Architecture
 

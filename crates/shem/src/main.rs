@@ -352,25 +352,14 @@ impl Drop for Terminal {
 fn load_image(target: &str) -> anyhow::Result<Image> {
     let dir = Path::new(target);
     if dir.join("oci-layout").is_file() {
+        if image::modelpack::is_artifact(dir) {
+            bail!(
+                "{target} is a ModelPack artifact: build an image on it with FROM {target}, or pull it from a registry"
+            );
+        }
         return Image::read_layout(dir);
     }
-    let path = Store::open()?.path(target)?;
-    if !path.join("oci-layout").is_file() {
-        let Some(host) = registry_host(target) else {
-            bail!("{target}: no such executable or image (see `shem images`)");
-        };
-        // Like `docker run`, pull an image from a registry the first time
-        let plain_http = host.starts_with("localhost") || host.starts_with("127.0.0.1");
-        let digest = image::pull(target, &path, plain_http)?;
-        eprintln!("shem: pulled {target} {digest}");
-    }
-    Image::read_layout(&path)
-}
-
-/// The registry a reference names, such as ghcr.io in ghcr.io/me/app:1.0.
-fn registry_host(reference: &str) -> Option<&str> {
-    let (first, _) = reference.split_once('/')?;
-    (first.contains('.') || first.contains(':') || first == "localhost").then_some(first)
+    Image::read_layout(&Store::open()?.fetch(target)?)
 }
 
 fn build(args: BuildArgs) -> anyhow::Result<u8> {

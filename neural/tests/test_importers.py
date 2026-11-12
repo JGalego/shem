@@ -188,8 +188,8 @@ def tokenizer_files(directory: Path, vocab_size: int) -> None:
 
 @pytest.fixture(scope="module", params=sorted(CONFIGS))
 def imported(request, tmp_path_factory):
-    """A tiny random checkpoint of one family, the reference model built from
-    it, and the checkpoint imported."""
+    """A tiny random checkpoint of one family: the reference model built from
+    it, the checkpoint imported, and the checkpoint itself."""
     torch.manual_seed(0)
     config = CONFIGS[request.param]()
     if request.param in VLMS:
@@ -208,7 +208,7 @@ def imported(request, tmp_path_factory):
     tokenizer_files(checkpoint, SMALL["vocab_size"])
     out = tmp_path_factory.mktemp("imported")
     import_checkpoint(checkpoint, out)
-    return request.param, reference, out
+    return request.param, reference, out, checkpoint
 
 
 def logits(reference, tokens: torch.Tensor) -> torch.Tensor:
@@ -229,7 +229,7 @@ def stepped(reference, tokens: torch.Tensor, split: int) -> torch.Tensor:
 
 
 def test_imported_models_match_transformers(imported):
-    name, reference, out = imported
+    name, reference, out, _ = imported
     tokens = torch.randint(0, SMALL["vocab_size"], (1, 12), generator=torch.Generator().manual_seed(1))
     expected = logits(reference, tokens)
     model = Model(out)
@@ -252,7 +252,7 @@ def test_imported_models_match_transformers(imported):
 def test_imported_directories_are_checkpoints(imported):
     """transformers loads the imported directory as it does the original:
     the same tensors, under the same names, found through the index."""
-    name, reference, out = imported
+    name, reference, out, _ = imported
     if name in VLMS:
         pytest.skip("the import leaves out the vision encoder, so it is a text model's checkpoint")
     loaded = transformers.AutoModelForCausalLM.from_pretrained(out).eval()
@@ -261,7 +261,7 @@ def test_imported_directories_are_checkpoints(imported):
 
 
 def test_each_block_is_a_file_of_its_own_tensors(imported):
-    _, _, out = imported
+    _, _, out, _ = imported
     manifest = Manifest.load(out)
     weight_map = manifest.weight_map(out)
     for i, block in enumerate(manifest.blocks):
@@ -277,15 +277,54 @@ def test_templates_see_the_special_tokens(imported):
     `eos_token`."""
     from shem_neural.model.tokenizer import Tokenizer
 
-    _, _, out = imported
+    _, _, out, _ = imported
     tokenizer = Tokenizer(out, Manifest.load(out).tokenizer)
     assert tokenizer.render([{"role": "user", "content": "t5"}], reply=False) == "t3 t5 t1 "
+
+
+def test_in_place_imports_run_the_checkpoint_as_it_is(imported, tmp_path):
+    """An import in place writes only what the checkpoint lacks, and the two
+    together run as the full import does: the image twin of a ModelPack
+    artifact is its files, unchanged, and a layer with these."""
+    import hashlib
+    import shutil
+
+    from shem_neural.model.manifest import locate
+
+    _, _, out, checkpoint = imported
+    before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in checkpoint.iterdir()}
+    extra = tmp_path / "extra"
+    import_checkpoint(checkpoint, extra, in_place=True)
+    assert {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in checkpoint.iterdir()} == before
+    assert not set(p.name for p in extra.iterdir()) & set(before), "it writes nothing the checkpoint has"
+
+    twin = tmp_path / "twin"
+    shutil.copytree(checkpoint, twin)
+    shutil.copytree(extra, twin, dirs_exist_ok=True)
+    assert locate(twin) == (twin, twin)
+    tokens = torch.arange(9)[None, :] % SMALL["vocab_size"]
+    in_place, full = Model(twin), Model(out)
+    assert torch.equal(in_place.forward(tokens, in_place.init_state(), 0), full.forward(tokens, full.init_state(), 0))
+
+
+def test_models_are_found_in_images_and_alone(tmp_path):
+    from shem_neural.model.manifest import locate
+
+    for model in (tmp_path / "image" / "model", tmp_path / "twin", tmp_path / "alone"):
+        model.mkdir(parents=True)
+        (model / FILE).write_text("{}")
+    assert locate(tmp_path / "image") == (tmp_path / "image" / "model", tmp_path / "image")
+    assert locate(tmp_path / "image" / "model") == (tmp_path / "image" / "model", tmp_path / "image")
+    assert locate(tmp_path / "twin") == (tmp_path / "twin", tmp_path / "twin")
+    assert locate(tmp_path / "alone") == (tmp_path / "alone", tmp_path / "alone")
+    with pytest.raises(FileNotFoundError):
+        locate(tmp_path)
 
 
 def test_v1_manifests_still_load(imported, tmp_path):
     """A model in the v1 layout, each block's file holding its tensors under
     its type's names, runs as its v2 import does."""
-    _, _, out = imported
+    _, _, out, _ = imported
     manifest = Manifest.load(out)
     weight_map = manifest.weight_map(out)
     for name in ("tokenizer.json", "chat_template.jinja"):

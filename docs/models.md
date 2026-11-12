@@ -86,6 +86,33 @@ An attention or MLP block has a norm before it, after it, or both. Most families
 
 Qwen3.5's vision encoder and multi-token prediction layer are left out, so its import is a text model. The others' imports load in transformers with the original's logits, exactly. Every chat template renders as transformers renders it, special tokens such as Gemma's `<bos>` included. [`tests/test_model.py`](../neural/tests/test_model.py) does these comparisons; it downloads the checkpoints, so it runs with `SHEM_MODEL_TESTS=1`, and skips gated ones, such as Gemma, without access to them. Gemma 2, Phi-3, OLMo 3, SmolLM3, Mistral and every family's other options are checked on tiny random checkpoints instead, and on their real configs.
 
+## ModelPack artifacts
+
+[ModelPack](https://github.com/modelpack/model-spec) packages a model as an OCI artifact, for an inference server to load. shem runs one through its image twin: an image whose layers are the artifact's own, plus one layer with `shem.json` (and an index or a chat template, if the checkpoint has none), and whose `subject` is the artifact.
+
+```sh
+shem run registry.example.com/team/llama:modelpack "What is a golem?"   # pulled once, kept as its twin
+shem push registry.example.com/team/llama:modelpack registry.example.com/team/llama:shem
+```
+
+```dockerfile
+FROM registry.example.com/team/llama:modelpack
+ENTRYPOINT ["shem:generate", "--system", "You are a golem."]
+WARM --until=prompt
+```
+
+`FROM` also takes an artifact's OCI layout directory, such as the one `oras cp --to-oci-layout` writes.
+
+- **Tar layers stay shared.** A tar layer goes into the twin as the very same blob, so a registry keeps the weights once for the artifact and its twin, and pushing the twin beside the artifact uploads only shem's layer. modctl writes tar layers with `modctl build --raw=false`.
+- **Raw layers are copied.** A raw layer, modctl's default, is a file with no tar around it, which no image can use as a layer, so the twin wraps each one in a tar of its own.
+- **The model is at `/`.** ModelPack tars hold each file at its path in the model's directory, so the files land at the root, and the twin's `dev.shem.model` label is `/`. The driver finds a model at `/model` or at `/`.
+- **The weights are the checkpoint's own shards.** Nothing is re-split, so the twin's layers follow the checkpoint's files rather than its blocks. The checkpoint must be safetensors, of a family shem imports.
+- **Labels from the model config.** The config's descriptor becomes the standard OCI labels (title, licences, version, source and so on), and `org.opencontainers.image.base.digest` names the artifact.
+- **Both namespaces.** shem reads the spec's media types and annotations (`vnd.cncf.model`, `org.cncf.model`) and the older ones modctl 0.2 still writes (`vnd.cnai.model`, `org.cnai.model`).
+- **`docker build` builds on a twin**, like on any image, but not on an artifact itself, which BuildKit refuses: pull the artifact with shem and push its twin first.
+
+[`tests/modelpack.rs`](../crates/shem/tests/modelpack.rs) packs a tiny checkpoint as modctl does, in tar and raw layers. It checks that the twin keeps the artifact's blobs, replies as the checkpoint does, primes a session with `WARM`, and round-trips through a registry. Artifacts that modctl 0.2.2 builds, in both formats, run the same way.
+
 ## Sessions under Docker
 
 Model containers are live sessions, held by the model server (`shem-neural-server`) under the container's ID, so Docker's commands mean something for them:

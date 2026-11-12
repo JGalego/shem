@@ -101,7 +101,7 @@ pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8
 
     // The session, answering the command line's prompt if it has one
     let mut request = json!({
-        "model": bundle.root.join("model"),
+        "model": bundle.root,
         "argv": &bundle.args[1..],
         "session_id": bundle.id,
     });

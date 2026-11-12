@@ -107,3 +107,16 @@ class Manifest:
         if self.weights is None:
             return {}
         return json.loads((Path(directory) / self.weights).read_text())["weight_map"]
+
+
+def locate(path: Path) -> tuple[Path, Path]:
+    """The model's directory and the image's root, for `path`: an image's
+    root, whose model is at `/model` (where shem imports models) or at `/`
+    (where a ModelPack artifact's files land); or a model's own directory,
+    whose image is the one around it when it is `/model`."""
+    path = Path(path)
+    if (path / "model" / FILE).is_file():
+        return path / "model", path
+    if (path / FILE).is_file():
+        return path, path.parent if path.name == "model" else path
+    raise FileNotFoundError(f"{path}: no {FILE} here or in model/")

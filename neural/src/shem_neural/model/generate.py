@@ -20,6 +20,7 @@ import torch
 from safetensors.torch import load, load_file, save, save_file
 
 from .blocks import Model
+from .manifest import locate
 from .tokenizer import Detokenizer, Tokenizer
 from .tools import Tools, compiled_layers, tool_calls
 
@@ -230,21 +231,28 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
         args = parser.parse_intermixed_args(argv)
         args.model = model
         return args
-    parser.add_argument("model", help="the model's directory, holding shem.json")
+    parser.add_argument("model", help="the model's directory, holding shem.json, or an image's root holding one")
     parser.add_argument("prompt", nargs="*")
     return parser.parse_args(argv)
 
 
-def tools_for(model_dir: Path, directory: str, vcpu_socket: Path | None = None) -> Tools:
-    """The programs in `directory` of the image whose model is at
-    `model_dir`, run on its compiled RV32IM layer."""
+def tools_for(model_dir: Path, root: Path, directory: str, vcpu_socket: Path | None = None) -> Tools:
+    """The programs in `directory` of the image at `root`, whose model is at
+    `model_dir`, run on the model's compiled RV32IM layer."""
     layers = compiled_layers(model_dir)
     if "rv32im" not in layers:
         raise ValueError(
             "--tools runs programs on the model's compiled RV32IM layer, and this model has none: "
-            "add it with COPY --from=shem:rv32im / /model/compiled/rv32im/"
+            "copy it into the model's compiled/rv32im/, as in COPY --from=shem:rv32im / /model/compiled/rv32im/"
         )
-    return Tools(Path(model_dir).parent, directory, layers["rv32im"] / "model.safetensors", vcpu_socket)
+    return Tools(Path(root), directory, layers["rv32im"] / "model.safetensors", vcpu_socket)
+
+
+def resolve(args: argparse.Namespace) -> argparse.Namespace:
+    """`args` with the model's directory as `model` and the image's root as
+    `root`, for a `model` given as either."""
+    args.model, args.root = locate(args.model)
+    return args
 
 
 def start(
@@ -255,7 +263,7 @@ def start(
     with the system prompt. With `--tools`, the session offers the image's
     programs, run on a vCPU server at `vcpu_socket` or one of its own."""
     system = [{"role": "system", "content": args.system}] if args.system else []
-    runner = tools_for(Path(args.model), args.tools, vcpu_socket) if args.tools else None
+    runner = tools_for(Path(args.model), Path(args.root), args.tools, vcpu_socket) if args.tools else None
     tools = runner.schemas() if runner else []
     if args.warm:
         if not system:
@@ -287,7 +295,7 @@ def run(model: Model, tokenizer: Tokenizer, args: argparse.Namespace, prompt: st
 
 
 def main() -> None:
-    args = options(sys.argv[1:])
+    args = resolve(options(sys.argv[1:]))
     model = Model(args.model, device=args.device)
     tokenizer = Tokenizer(args.model, model.manifest.tokenizer)
     prompt = " ".join(args.prompt) or ("" if args.warm else sys.stdin.read())

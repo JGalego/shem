@@ -205,7 +205,8 @@ kubernetes-test:
     grep -q "hello from a shem image" target/k8s.out
     kind delete cluster --name shem
 
-# Push and pull an image through a local registry; needs Docker and oras
+# Push and pull an image through a local registry, and run ModelPack
+# artifacts as image twins; needs Docker, oras and uv
 registry-test:
     #!/bin/sh
     set -e
@@ -213,3 +214,4 @@ registry-test:
     trap 'docker stop shem-test-registry >/dev/null' EXIT
     sleep 1
     SHEM_TEST_REGISTRY=localhost:5000 cargo test --release --test image registry -- --ignored
+    SHEM_TEST_REGISTRY=localhost:5000 cargo test --release --test modelpack -- --ignored

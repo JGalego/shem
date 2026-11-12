@@ -1,11 +1,17 @@
 """Importers: Hugging Face checkpoints into shem's model layout.
 
     python -m shem_neural.model.importers Qwen/Qwen3-0.6B out/model [--revision REV]
+    python -m shem_neural.model.importers CHECKPOINT_DIR out/model [--in-place]
 
 Each importer maps one architecture's tensors onto shem's block types and
 writes one weights file per block. The tensors keep their names and types,
 and an index says which file holds each, so the output is also a sharded
 checkpoint that transformers loads as it would the original.
+
+In place, the checkpoint's files stay as they are, and the import writes
+only what a model needs besides them: the manifest, and an index and a chat
+template if the checkpoint has none. A ModelPack artifact's image twin is
+its files, unchanged, and a layer with these.
 
 Families are registered by the `architectures` name in the checkpoint's
 `config.json`. The decoders shem reads share one layout (Llama's) and differ
@@ -21,6 +27,7 @@ import argparse
 import json
 import math
 import shutil
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,22 +76,56 @@ class Checkpoint:
         with safe_open(str(self.files[name]), "pt") as handle:
             return handle.get_slice(name).get_shape()
 
+    def weight_map(self) -> dict[str, str]:
+        """Which of the checkpoint's own files holds each tensor."""
+        return {name: path.relative_to(self.directory).as_posix() for name, path in sorted(self.files.items())}
+
+    def size(self) -> int:
+        """The bytes of all the checkpoint's tensors."""
+        total = 0
+        for path in sorted(set(self.files.values())):
+            with safe_open(str(path), "pt") as handle:
+                for name in handle.keys():
+                    tensor = handle.get_slice(name)
+                    count = math.prod(tensor.get_shape())
+                    total += count * torch.empty(0, dtype=DTYPES[tensor.get_dtype()]).element_size()
+        return total
+
+
+#: safetensors' dtype names, as torch's
+DTYPES = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
 
 class Writer:
     """Writes block files into the output directory, numbered in order, and
-    keeps the index of which file holds each tensor."""
+    keeps the index of which file holds each tensor. In place, it writes no
+    weights, and the index is the checkpoint's own files."""
 
-    def __init__(self, out: Path, checkpoint: Checkpoint):
-        self.out, self.ckpt = out, checkpoint
+    def __init__(self, out: Path, checkpoint: Checkpoint, in_place: bool = False):
+        self.out, self.ckpt, self.in_place = out, checkpoint, in_place
         self.blocks: list[BlockSpec] = []
         self.weight_map: dict[str, str] = {}
         self.size = 0
-        (out / "blocks").mkdir(parents=True, exist_ok=True)
+        if not in_place:
+            (out / "blocks").mkdir(parents=True, exist_ok=True)
 
     def file(self, name: str, tensors: dict[str, str]) -> dict[str, str]:
         """Save the checkpoint's tensors `tensors` (block-local name to
         checkpoint name) as `name`, under the checkpoint's names, and return
-        `tensors`."""
+        `tensors`. In place, the tensors stay where they are."""
+        if self.in_place:
+            return dict(tensors)
         saved = {full: self.ckpt.tensor(full).contiguous() for full in tensors.values()}
         save_file(saved, str(self.out / name), metadata={"format": "pt"})
         for full, tensor in saved.items():
@@ -107,8 +148,15 @@ class Writer:
         return found
 
     def index(self) -> None:
-        """Write the checkpoint index, as Hugging Face names and lays it out."""
-        index = {"metadata": {"total_size": self.size}, "weight_map": dict(sorted(self.weight_map.items()))}
+        """Write the checkpoint index, as Hugging Face names and lays it out.
+        In place, a checkpoint with an index of its own keeps it, and one
+        without gets one for its own files, every tensor in them included."""
+        weight_map, size = dict(sorted(self.weight_map.items())), self.size
+        if self.in_place:
+            if (self.ckpt.directory / INDEX).exists():
+                return
+            weight_map, size = self.ckpt.weight_map(), self.ckpt.size()
+        index = {"metadata": {"total_size": size}, "weight_map": weight_map}
         (self.out / INDEX).write_text(json.dumps(index, indent=2) + "\n")
 
 
@@ -524,28 +572,32 @@ def import_model(repo: str, out: Path, revision: str | None = None) -> Manifest:
     return import_checkpoint(directory, out, {"repo": repo, "revision": directory.name})
 
 
-def import_checkpoint(directory: Path, out: Path, source: dict | None = None) -> Manifest:
+def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in_place: bool = False) -> Manifest:
     """Write the checkpoint in `directory` to `out` as a shem model. `source`
-    says where it came from, for the manifest."""
+    says where it came from, for the manifest. In place, `out` gets only what
+    the model needs besides the checkpoint's own files, and the model is
+    `out`'s files laid over `directory`'s."""
     directory, out = Path(directory), Path(out)
     checkpoint = Checkpoint(directory)
     architecture = checkpoint.config["architectures"][0]
     if architecture not in FAMILIES:
         raise SystemExit(f"{directory}: no importer for {architecture}; shem has {sorted(FAMILIES)}")
     out.mkdir(parents=True, exist_ok=True)
-    writer = Writer(out, checkpoint)
+    writer = Writer(out, checkpoint, in_place)
     embed, head, cfg = decoder(writer, FAMILIES[architecture])
     writer.index()
 
-    for name in CHECKPOINT_FILES:
-        if (directory / name).exists():
-            shutil.copy(directory / name, out / name)
-    # The weights' licence and notices travel with them
-    for notice in sorted(directory.glob("LICENSE*")) + sorted(directory.glob("NOTICE*")):
-        shutil.copy(notice, out / notice.name)
+    if not in_place:
+        for name in CHECKPOINT_FILES:
+            if (directory / name).exists():
+                shutil.copy(directory / name, out / name)
+        # The weights' licence and notices travel with them
+        for notice in sorted(directory.glob("LICENSE*")) + sorted(directory.glob("NOTICE*")):
+            shutil.copy(notice, out / notice.name)
     template = directory / "chat_template.jinja"
     if template.exists():
-        shutil.copy(template, out / "chat_template.jinja")
+        if not in_place:
+            shutil.copy(template, out / "chat_template.jinja")
     else:
         settings = json.loads((directory / "tokenizer_config.json").read_text())
         (out / "chat_template.jinja").write_text(settings["chat_template"])
@@ -568,12 +620,23 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None) ->
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("repo", help="a Hugging Face model, such as Qwen/Qwen3-0.6B")
+    parser.add_argument("source", help="a Hugging Face model, such as Qwen/Qwen3-0.6B, or a checkpoint's directory")
     parser.add_argument("out", type=Path, help="the directory to write the model to")
-    parser.add_argument("--revision", help="a branch, tag or commit of the repo")
+    parser.add_argument("--revision", help="a branch, tag or commit of the Hugging Face model")
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="for a checkpoint's directory: leave its files where they are, and write only the rest of the model",
+    )
     args = parser.parse_args()
-    manifest = import_model(args.repo, args.out, args.revision)
-    print(f"{args.repo}: {len(manifest.blocks)} blocks", flush=True)
+    if Path(args.source).is_dir():
+        manifest = import_checkpoint(Path(args.source), args.out, in_place=args.in_place)
+    elif args.in_place:
+        raise SystemExit("--in-place imports a checkpoint's directory")
+    else:
+        manifest = import_model(args.source, args.out, args.revision)
+    # Progress goes to stderr: a pull may import a model on its way to a run
+    print(f"{args.source}: {len(manifest.blocks)} blocks", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

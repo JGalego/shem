@@ -14,6 +14,8 @@ pub const MODEL_DIR: &str = "model";
 /// The registry prefix that names a Hugging Face model in `FROM`.
 pub const HF_PREFIX: &str = "hf.co/";
 pub const DRIVER_PREFIX: &str = "shem:";
+/// The driver that runs a model's text-generation sessions.
+pub const DRIVER: &str = "shem:generate";
 /// Overlay filesystems stack at most about 128 layers, so a model with more
 /// weights files than this shares layers between neighbouring blocks.
 const MAX_MODEL_LAYERS: usize = 96;
@@ -97,6 +99,25 @@ pub fn import(repo: &str, revision: Option<&str>, out: &Path) -> anyhow::Result<
     Ok(())
 }
 
+/// Write into `out` what the checkpoint in `dir` needs to run as a model
+/// besides its own files, which stay where they are: the manifest, and an
+/// index or a chat template if the checkpoint has none.
+pub fn import_in_place(dir: &Path, out: &Path) -> anyhow::Result<()> {
+    let status = python("shem_neural.model.importers")
+        .arg(dir)
+        .arg(out)
+        .arg("--in-place")
+        .status()
+        .context("running the model importer, which needs uv")?;
+    if !status.success() {
+        bail!(
+            "importing the checkpoint in {} failed ({status})",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// The standard OCI labels for an imported model: where it comes from, and
 /// the licence its model card declares, which also travels as the model's
 /// `LICENSE` and `NOTICE` files.
@@ -147,18 +168,19 @@ pub fn layer_groups(root: &Path) -> anyhow::Result<Vec<Vec<PathBuf>>> {
 /// `shem run` or `docker load` has unpacked its state layer.
 pub const SESSION_DIR: &str = ".shem";
 
-/// Prime a session of the model at `root` with the driver's options in
-/// `entrypoint`, and save it in `out`: what `WARM --until=prompt` freezes.
+/// Prime a session of the model in the image at `root` with the driver's
+/// options in `entrypoint`, and save it in `out`: what `WARM --until=prompt`
+/// freezes. The driver finds the model at `/model` or `/`.
 pub fn warm(entrypoint: &[String], root: &Path, out: &Path) -> anyhow::Result<()> {
     let (driver, options) = entrypoint.split_first().context("no entrypoint")?;
-    if driver != "shem:generate" {
+    if driver != DRIVER {
         bail!("WARM --until=prompt needs the shem:generate driver, not {driver}");
     }
     let status = python("shem_neural.model.generate")
         .args(options)
         .arg("--warm")
         .arg(out)
-        .arg(root.join(MODEL_DIR))
+        .arg(root)
         .status()
         .context("running the model, which needs uv")?;
     if !status.success() {
@@ -187,7 +209,7 @@ pub fn run_driver(entrypoint: &[String], args: &[String], root: &Path) -> anyhow
     if session.join("session.json").is_file() {
         command.arg("--session").arg(session);
     }
-    command.arg(root.join(MODEL_DIR)).arg("--").args(args);
+    command.arg(root).arg("--").args(args);
     let status = command
         .status()
         .context("running the model, which needs uv")?;

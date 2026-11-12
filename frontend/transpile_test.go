@@ -136,8 +136,8 @@ CMD ["Who are you?"]
 	for _, line := range []string{
 		"FROM scratch AS shem-0-before-warm-0",
 		"FROM --platform=$BUILDPLATFORM shem-neural:test AS shem-0-warm-0",
-		"COPY --from=shem-0-before-warm-0 /model /model",
-		`RUN ["shem-neural-generate","--system","You are a golem.","--warm","/out/.shem","/model"]`,
+		"COPY --from=shem-0-before-warm-0 / /image",
+		`RUN ["shem-neural-generate","--system","You are a golem.","--warm","/out/.shem","/image"]`,
 		"FROM shem-0-before-warm-0 AS golem",
 		"COPY --from=shem-0-warm-0 /out/.shem /.shem",
 		`CMD ["Who are you?"]`,
