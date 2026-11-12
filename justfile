@@ -73,6 +73,13 @@ neural-server socket="/tmp/shem-neural.sock":
 gpu-job flavor="l4x1":
     uvx --from huggingface_hub hf jobs uv run --flavor {{ flavor }} --timeout 1h neural/jobs/gpu.py --rev $(git rev-parse HEAD)
 
+# Compare imported models with transformers on Hugging Face Jobs, at the pushed HEAD: gated checkpoints with your token, and those that need 256 GB; needs `hf auth login`
+models-job flavor="cpu-performance" tests="tests/test_model.py":
+    uvx --from huggingface_hub hf jobs run --flavor {{ flavor }} --timeout 6h --secrets HF_TOKEN \
+        -e SHEM_MODEL_TESTS=1 -e SHEM_LARGE_MODEL_TESTS=1 -e SHEM_HUGE_MODEL_TESTS=1 -e HF_XET_HIGH_PERFORMANCE=1 \
+        ghcr.io/astral-sh/uv:python3.12-bookworm bash -c \
+        "curl -fsSL https://github.com/JGalego/shem/archive/$(git rev-parse HEAD).tar.gz | tar xz && cd shem-*/neural && uv sync -q --frozen && uv run pytest -v -rs --durations=0 {{ tests }}"
+
 # Build the BusyBox rootfs as a Docker image, for Shemfiles to COPY --from
 busybox-image:
     docker build -q --target busybox -t shem-busybox toolchain

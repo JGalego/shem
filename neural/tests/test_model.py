@@ -3,7 +3,9 @@
 These download checkpoints from Hugging Face, so they run only with
 SHEM_MODEL_TESTS=1. Gated checkpoints, such as Gemma's, are skipped without
 access to them. Each test holds one model in memory at a time, so a 1B
-model's comparison fits in 16 GB.
+model's comparison fits in 16 GB. Larger checkpoints are compared with
+SHEM_LARGE_MODEL_TESTS=1, in bfloat16 in 16 GB, and SHEM_HUGE_MODEL_TESTS=1,
+which needs 256 GB, such as a Hugging Face Job's (just models-job).
 """
 
 import gc
@@ -40,14 +42,38 @@ REPOS = [
     "ibm-granite/granite-3.1-1b-a400m-instruct",
     "state-spaces/mamba-130m-hf",
 ]
-#: The imports that are a text model's whole checkpoint: Qwen3.5's leaves out its vision encoder
-TEXT_REPOS = [repo for repo in REPOS if "3.5" not in repo]
+#: Checkpoints of 1 to 30 billion parameters, compared as the others are, in
+#: float32, a model at a time: up to 122 GB in memory, for Qwen3-30B-A3B
+HUGE_REPOS = [
+    "unsloth/Llama-3.2-1B-Instruct",
+    "mistralai/Mistral-7B-Instruct-v0.3",
+    "microsoft/Phi-3.5-mini-instruct",
+    "google/gemma-3-4b-it",
+    "allenai/Olmo-3-7B-Instruct",
+    "allenai/OLMoE-1B-7B-0125-Instruct",
+    "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+    "Qwen/Qwen3-30B-A3B",
+]
+if os.environ.get("SHEM_HUGE_MODEL_TESTS"):
+    REPOS += HUGE_REPOS
+#: Checkpoints of a vision-language model, whose imports leave out the vision
+#: encoder (and Qwen3.5's multi-token prediction layer): text models
+VLMS = {"Qwen/Qwen3.5-0.8B", "google/gemma-3-4b-it"}
+#: The imports that are a text model's whole checkpoint
+TEXT_REPOS = [repo for repo in REPOS if repo not in VLMS]
 #: The token that ends a turn in each chat template, where it isn't ChatML's
 END_OF_TURN = {
     "google/gemma-3-270m-it": "<end_of_turn>",
     "allenai/OLMo-2-0425-1B-Instruct": "<|endoftext|>",
     "ibm-granite/granite-3.1-1b-a400m-instruct": "<|end_of_text|>",
     "state-spaces/mamba-130m-hf": "<|endoftext|>",
+    "unsloth/Llama-3.2-1B-Instruct": "<|eot_id|>",
+    "mistralai/Mistral-7B-Instruct-v0.3": "</s>",
+    "microsoft/Phi-3.5-mini-instruct": "<|end|>",
+    "google/gemma-3-4b-it": "<end_of_turn>",
+    # OLMoE's instruct release ends a turn with the token its vocabulary
+    # names `|||IP_ADDRESS|||`, as transformers ends it
+    "allenai/OLMoE-1B-7B-0125-Instruct": "|||IP_ADDRESS|||",
 }
 #: Base models, without a chat template: shem gives them one that runs
 #: their messages' text together, and transformers has none to compare
@@ -88,7 +114,7 @@ MESSAGES = [{"role": "user", "content": "Name three uses of clay."}]
 def reference(repo: str):
     import transformers
 
-    model = transformers.AutoModelForImageTextToText if "3.5" in repo else transformers.AutoModelForCausalLM
+    model = transformers.AutoModelForImageTextToText if repo in VLMS else transformers.AutoModelForCausalLM
     return model.from_pretrained(repo, dtype=torch.float32).eval()
 
 
@@ -147,8 +173,10 @@ def test_imported_directories_load_in_transformers(repo, imports):
         got = loaded(input_ids=tokens).logits
     free(loaded)
     loaded = None
+    # Equal up to the order of floating-point sums, which a mixture of
+    # experts' many small products may change with how tensors sit in memory
     with torch.no_grad():
-        assert torch.equal(got, reference(repo)(input_ids=tokens).logits)
+        assert torch.allclose(got, reference(repo)(input_ids=tokens).logits, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.parametrize("repo", REPOS)
@@ -346,12 +374,22 @@ BF16_REPOS = [
     "HuggingFaceTB/SmolLM3-3B",
     "ibm-granite/granite-3.3-2b-instruct",
 ]
-
-
-@pytest.mark.skipif(
+#: Checkpoints too large to compare in float32 even in 256 GB: Mixtral's
+#: 47 billion parameters are 94 GB in bfloat16
+HUGE_BF16_REPOS = ["mistralai/Mixtral-8x7B-Instruct-v0.1"]
+LARGE = pytest.mark.skipif(
     not os.environ.get("SHEM_LARGE_MODEL_TESTS"), reason="20 GB of checkpoints: set SHEM_LARGE_MODEL_TESTS=1"
 )
-@pytest.mark.parametrize("repo", BF16_REPOS)
+HUGE = pytest.mark.skipif(
+    not os.environ.get("SHEM_HUGE_MODEL_TESTS"), reason="256 GB of memory: set SHEM_HUGE_MODEL_TESTS=1"
+)
+
+
+@pytest.mark.parametrize(
+    "repo",
+    [pytest.param(repo, marks=LARGE) for repo in BF16_REPOS]
+    + [pytest.param(repo, marks=HUGE) for repo in HUGE_BF16_REPOS],
+)
 def test_large_models_agree_with_transformers_in_bfloat16(repo, imports):
     """In bfloat16 the two can't agree to the last bit, as they round in
     different places, but a block read wrong is far off: the next token they
