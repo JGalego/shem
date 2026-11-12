@@ -1,6 +1,42 @@
 # Changelog
 
 
+## 0.2.0 (2026-11-12)
+
+### Features
+
+- Llama, Mistral and Qwen2 imports, and model directories that load as Hugging Face checkpoints
+- Gemma, Phi-3, OLMo and SmolLM3 imports, and chat templates that see the tokenizer's special tokens
+- Run ModelPack artifacts as image twins that share their blobs
+- Publish model images as ModelPack artifacts with shem push --modelpack
+- Publish sessions as artifacts linked to their models, and resume them with shem run --state
+- Keep block files at the top of the model directory, where vLLM looks for weights
+- Run ModelPack layout directories as twins, and export uncompressed artifacts with their files at the root
+- Mixtures of experts, Granite, Mamba and GGUF imports, docker build on ModelPack artifacts, and model images as Kubernetes image volumes
+- Shemfile syntax highlighting and file icon for VS Code
+- --system-file adds a file of the image to the system prompt, and --stop ends a reply at a text, as base models need
+- Examples for SmolLM2, Granite MoE, Mamba, a Llama GGUF, Gemma, a handbook primed at build time, a ModelPack round trip and an image volume, tested in CI and on Hugging Face Jobs
+- Version session state by block type and precision
+
+### Fixes
+
+- Leave out the second copy of the weights that Mistral's repos carry in their own format
+- Keep a layout's blob that is already there, as a read-only link oras left, when an image built on a ModelPack twin exports uncompressed
+- Commit new formulas to the Homebrew tap and skip unchanged ones
+
+### Documentation
+
+- A blog post on LLMs as containers
+- Name ModelPack in the blog post's prior art
+- Compare ModelPack and shem in the README
+- The large checkpoints compared in bfloat16
+- The checkpoints compared on a Hugging Face Job, up to Qwen3-30B-A3B and Mixtral-8x7B, the driver's new options and the examples
+
+### Tests
+
+- Compare same-weight logits within float rounding, as math libraries order a mixture of experts' sums by memory layout
+- Compare checkpoints of up to 47 billion parameters with transformers on a Hugging Face Job with 256 GB, with just models-job
+
 ## 0.1.0 (2026-11-11)
 
 ### Features

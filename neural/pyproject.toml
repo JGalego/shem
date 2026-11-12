@@ -1,6 +1,6 @@
 [project]
 name = "shem-neural"
-version = "0.1.0"
+version = "0.2.0"
 description = "shem's neural side: an RV32IM CPU compiled into network weights, and model images"
 readme = "README.md"
 license = "MIT"
