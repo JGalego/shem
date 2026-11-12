@@ -12,7 +12,7 @@ const neural = "shem-neural:test"
 
 func transpile(t *testing.T, src string, imported map[string]Imported) string {
 	t.Helper()
-	out, err := Transpile([]byte(src), imported, neural)
+	out, err := Transpile([]byte(src), imported, nil, neural)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestShemStagesRefuseWhatTheyCannotDo(t *testing.T) {
 		"FROM alpine AS build\nWARM --until=prompt\nFROM scratch\n",
 		"ARG ONLY=1\n",
 	} {
-		if _, err := Transpile([]byte(src), map[string]Imported{}, neural); err == nil {
+		if _, err := Transpile([]byte(src), map[string]Imported{}, nil, neural); err == nil {
 			t.Errorf("want an error for\n%s", src)
 		}
 	}
@@ -188,5 +188,30 @@ func TestHeredocsSurvive(t *testing.T) {
 	out := transpile(t, "FROM alpine AS build\nRUN <<EOF\necho one\necho two\nEOF\nFROM scratch\n", nil)
 	if !strings.Contains(out, "RUN <<EOF\necho one\necho two\nEOF\n") {
 		t.Error(out)
+	}
+}
+
+func TestModelPackArtifactsLandAtTheRoot(t *testing.T) {
+	src := "FROM ghcr.io/team/model:modelpack AS weights\nFROM weights\nCMD [\"hi\"]\n"
+	imported := map[string]Imported{"shem-artifact-0": {
+		Files: []string{"config.json", "model.safetensors", "shem.json", "tokenizer.json"},
+		Model: "/",
+	}}
+	artifacts := map[string]string{"ghcr.io/team/model:modelpack": "shem-artifact-0"}
+	out, err := Transpile([]byte(src), imported, artifacts, neural)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `FROM scratch AS weights
+COPY --link --from=shem-artifact-0 /out/artifact/config.json /out/artifact/shem.json /out/artifact/tokenizer.json /
+COPY --link --from=shem-artifact-0 /out/artifact/model.safetensors /
+LABEL dev.shem.machine="rv32im" dev.shem.model="/"
+LABEL org.opencontainers.image.base.name="ghcr.io/team/model:modelpack"
+ENTRYPOINT ["shem:generate"]
+FROM weights
+CMD ["hi"]
+`
+	if out != want {
+		t.Errorf("got\n%s\nwant\n%s", out, want)
 	}
 }

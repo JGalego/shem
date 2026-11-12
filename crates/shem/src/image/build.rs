@@ -78,8 +78,8 @@ pub fn build(options: &BuildOptions) -> anyhow::Result<Image> {
 }
 
 /// The base a shem stage starts from: nothing, an image's layout directory,
-/// a Hugging Face model or checkpoint directory, or a ModelPack artifact's
-/// layout directory.
+/// a Hugging Face model, checkpoint directory or GGUF file, or a ModelPack
+/// artifact's layout directory.
 enum Base {
     Scratch,
     Image(PathBuf),
@@ -104,6 +104,14 @@ fn shem_base(stage: &Stage, context: &Path) -> Option<Base> {
         });
     }
     let dir = context.join(&stage.from);
+    // A GGUF file, dequantized into a checkpoint and imported
+    if dir.extension().is_some_and(|e| e == "gguf") && dir.is_file() {
+        let file = dir.canonicalize().ok()?;
+        return Some(Base::Model {
+            repo: file.to_string_lossy().into_owned(),
+            revision: None,
+        });
+    }
     // A Hugging Face checkpoint's directory, imported as `hf.co/` imports one
     if dir.join("config.json").is_file() && !dir.join("oci-layout").exists() {
         let dir = dir.canonicalize().ok()?;

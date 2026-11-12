@@ -21,6 +21,7 @@ dependencies = [
     "safetensors>=0.4",
     "tokenizers>=0.23.3",
     "torch>=2.5",
+    "zstandard>=0.23",
 ]
 
 [project.urls]
@@ -33,9 +34,19 @@ shem-neural-server = "shem_neural.server:main"
 shem-neural-generate = "shem_neural.model.generate:main"
 shem-neural-import = "shem_neural.model.importers:main"
 shem-neural-export = "shem_neural.export:main"
+shem-neural-modelpack = "shem_neural.modelpack:main"
+
+[project.optional-dependencies]
+gguf = [
+    "accelerate>=1.15.0",
+    "gguf>=0.19.0",
+    "transformers>=5.22.2",
+]
 
 [dependency-groups]
 dev = [
+    "accelerate>=1.15.0",
+    "gguf>=0.19.0",
     "pytest>=8",
     "transformers>=5.22.2",
 ]

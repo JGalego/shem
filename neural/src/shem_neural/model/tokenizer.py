@@ -4,6 +4,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from jinja2 import nodes
+from jinja2.ext import Extension
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import Tokenizer as HfTokenizer
 
@@ -12,12 +14,23 @@ def _raise(message: str):
     raise ValueError(message)
 
 
+class Generation(Extension):
+    """transformers' `{% generation %}` blocks, which mark the assistant's
+    text for training masks; rendering a conversation, they are their text."""
+
+    tags = {"generation"}
+
+    def parse(self, parser) -> list[nodes.Node]:
+        next(parser.stream)
+        return parser.parse_statements(("name:endgeneration",), drop_needle=True)
+
+
 class Tokenizer:
     def __init__(self, directory: Path, spec: dict):
         directory = Path(directory)
         self.inner = HfTokenizer.from_file(str(directory / spec["file"]))
         env = ImmutableSandboxedEnvironment(
-            trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"]
+            trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols", Generation]
         )
         env.filters["tojson"] = lambda value, indent=None, **_: json.dumps(value, ensure_ascii=False, indent=indent)
         env.globals["raise_exception"] = _raise

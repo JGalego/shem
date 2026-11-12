@@ -215,3 +215,90 @@ registry-test:
     sleep 1
     SHEM_TEST_REGISTRY=localhost:5000 cargo test --release --test image registry -- --ignored
     SHEM_TEST_REGISTRY=localhost:5000 cargo test --release --test modelpack -- --ignored
+
+# docker build model images through the frontend and the shem-neural image
+# built from this checkout: a Hugging Face model primed with WARM, a
+# ModelPack artifact as a base, and a GGUF file; needs Docker, oras, uv and
+# a registry
+frontend-models-test registry="localhost:5000":
+    #!/bin/sh
+    set -e
+    reg={{registry}}
+    cargo build --release -p shem
+    shem=target/release/shem
+    docker build -q -t $reg/shem-neural:ci neural >/dev/null
+    docker push -q $reg/shem-neural:ci >/dev/null
+    docker build -q -t $reg/shem-dockerfile:ci frontend >/dev/null
+    docker push -q $reg/shem-dockerfile:ci >/dev/null
+    dir=target/frontend-models
+    rm -rf $dir && mkdir -p $dir/warm $dir/model $dir/artifact $dir/gguf
+    export SHEM_HOME=$PWD/$dir/home
+    model=hf.co/trl-internal-testing/tiny-Qwen3ForCausalLM
+    # The registry is on localhost, which a build's fetch reaches on the host's network
+    build() { docker build -q --platform linux/riscv32 --allow network.host --build-arg SHEM_NEURAL_IMAGE=$reg/shem-neural:ci -t "$1" "$2" >/dev/null; }
+    layout() { docker save "$1" -o $dir/$1.tar && mkdir -p $dir/$1 && tar -xf $dir/$1.tar -C $dir/$1; }
+    same() { [ "$1" = "$2" ] || { echo "expected the same reply:"; echo "$1"; echo "$2"; exit 1; }; }
+
+    echo "--- WARM through docker build, as shem build primes it"
+    shemfile="FROM $model\nENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"8\", \"--system\", \"You are a golem.\"]\nWARM --until=prompt\n"
+    printf "# syntax=$reg/shem-dockerfile:ci\n$shemfile" > $dir/warm/Dockerfile
+    printf "$shemfile" > $dir/warm/Shemfile
+    build shem-warm $dir/warm
+    layout shem-warm
+    $shem build -t warm $dir/warm
+    same "$($shem run $dir/shem-warm 'Who are you?')" "$($shem run warm 'Who are you?')"
+
+    echo "--- a ModelPack artifact as a base"
+    printf "FROM $model\n" > $dir/model/Shemfile
+    $shem build -t tiny $dir/model
+    $shem push --plain-http --modelpack --uncompressed tiny $reg/shem-tests/tiny:modelpack
+    printf "# syntax=$reg/shem-dockerfile:ci\nFROM $reg/shem-tests/tiny:modelpack\n" > $dir/artifact/Dockerfile
+    build shem-artifact $dir/artifact
+    layout shem-artifact
+    same "$($shem run $dir/shem-artifact 'Hello')" "$($shem run $reg/shem-tests/tiny:modelpack 'Hello')"
+
+    echo "--- a GGUF file"
+    printf "# syntax=$reg/shem-dockerfile:ci\nFROM hf.co/Qwen/Qwen3-0.6B-GGUF:Q8_0\nENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"8\"]\n" > $dir/gguf/Dockerfile
+    build shem-gguf $dir/gguf
+    layout shem-gguf
+    $shem run $dir/shem-gguf 'Say hi.' | tee $dir/gguf.out
+    test -s $dir/gguf.out
+
+# Mount a model image as a Kubernetes image volume, as a model server would
+# read it: its /model is a Hugging Face checkpoint; needs Docker, kind and
+# kubectl, and uv for the import
+kubernetes-model-volume-test:
+    #!/bin/sh
+    set -e
+    cargo build --release -p shem
+    dir=target/model-volume && rm -rf $dir && mkdir -p $dir/model
+    export SHEM_HOME=$PWD/$dir/home
+    printf 'FROM hf.co/trl-internal-testing/tiny-Qwen3ForCausalLM\n' > $dir/model/Shemfile
+    target/release/shem build -t shem-model-volume:latest $dir/model
+    # Listed for the node's platform too, which image volumes are pulled for
+    target/release/shem save --platform linux/amd64 shem-model-volume:latest -o $dir/image.tar
+    kind delete cluster --name shem-volume >/dev/null 2>&1 || true
+    printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nfeatureGates:\n  ImageVolume: true\n' > $dir/kind.yaml
+    kind create cluster --name shem-volume --config $dir/kind.yaml --wait 120s
+    trap 'kind delete cluster --name shem-volume >/dev/null 2>&1' EXIT
+    node=shem-volume-control-plane
+    docker exec -i "$node" ctr -n k8s.io images import --all-platforms - < $dir/image.tar
+    kubectl apply -f - <<YAML
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: shem-model-volume}
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: reader
+        image: busybox:1.37
+        command: ["sh", "-c", "ls /models/model && sha256sum /models/model/block-000-attention.safetensors && head -c 120 /models/model/shem.json"]
+        volumeMounts: [{name: model, mountPath: /models}]
+      volumes:
+      - name: model
+        image: {reference: docker.io/library/shem-model-volume:latest, pullPolicy: Never}
+    YAML
+    kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/shem-model-volume --timeout=120s || { kubectl describe pod shem-model-volume | tail -20; exit 1; }
+    kubectl logs shem-model-volume | tee $dir/out
+    grep -q "model.safetensors.index.json" $dir/out
+    grep -q '"format": "shem.model/v2"' $dir/out

@@ -5,11 +5,14 @@ entry per block per session:
 
 - `attention`: key/value caches, growing with the token count.
 - `gated_deltanet`: fixed-size convolution history and matrix memory.
+- `mamba`: fixed-size convolution history and selective-scan state.
 - `mlp`: stateless gated feed-forward (SwiGLU or GeGLU).
+- `moe`: stateless mixture of gated feed-forward experts, a few per token.
 
 An attention or MLP block normalises its input when it has a `norm` and its
 output when it has a `post_norm`: Llama has the first, OLMo 2 the second and
 Gemma both. A projection `x` adds its bias `x_bias` when the block has one.
+A block's `residual_scale` scales what it adds to the stream (Granite).
 RMSNorm's weight offset is 0 for ordinary weights and 1 for zero-centred
 weights. Computation defaults to float32; CUDA execution disables TF32.
 """
@@ -199,7 +202,7 @@ class Attention(Block):
         out = project(out, t, "o")
         if "post_norm" in t:
             out = rmsnorm(out, t["post_norm"], eps, offset)
-        return x + out
+        return x + out * p.get("residual_scale", 1.0)
 
 
 class GatedDeltaNet(Block):
@@ -267,13 +270,102 @@ class MLP(Block):
         out = project(ACTIVATIONS[p.get("activation", "silu")](gate) * up, t, "down")
         if "post_norm" in t:
             out = rmsnorm(out, t["post_norm"], eps, offset)
-        return x + out
+        return x + out * p.get("residual_scale", 1.0)
+
+
+class MoE(Block):
+    """A mixture of experts: a router picks `top_k` of `experts` gated
+    feed-forward networks for each token and weighs their outputs, either
+    from a softmax over all the router's logits, renormalised over those
+    picked when `normalize` (Mixtral, Qwen), or from a softmax over the
+    picked logits alone (`routing: topk_softmax`, GraniteMoe). Experts are
+    tensors of their own (`gate.E`, `up.E`, `down.E`) or stacked (`gate_up`
+    and `down`). A shared expert (`shared_*`), weighed by a sigmoid gate,
+    adds to every token's output (Qwen2-MoE)."""
+
+    def forward(self, x, state, start):
+        p, t = self.p, self.t
+        offset, eps = p.get("norm_offset", 0.0), p["eps"]
+        h = rmsnorm(x, t["norm"], eps, offset) if "norm" in t else x
+        flat = h.reshape(-1, h.shape[-1])
+        logits = F.linear(flat, t["router"]).float()
+        if p.get("routing") == "topk_softmax":
+            top, index = logits.topk(p["top_k"], dim=-1)
+            weights = top.softmax(dim=-1)
+        else:
+            weights, index = logits.softmax(dim=-1).topk(p["top_k"], dim=-1)
+            if p.get("normalize"):
+                weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights.to(flat.dtype)
+        act = ACTIVATIONS[p.get("activation", "silu")]
+        out = torch.zeros_like(flat)
+        stacked = "gate_up" in t
+        for expert in range(p["experts"]):
+            slot, token = torch.where(index.T == expert)
+            if token.numel() == 0:
+                continue
+            chosen = flat[token]
+            if stacked:
+                gate, up = F.linear(chosen, t["gate_up"][expert]).chunk(2, dim=-1)
+                down = t["down"][expert]
+            else:
+                gate, up = F.linear(chosen, t[f"gate.{expert}"]), F.linear(chosen, t[f"up.{expert}"])
+                down = t[f"down.{expert}"]
+            y = F.linear(act(gate) * up, down) * weights[token, slot, None]
+            out.index_add_(0, token, y)
+        if "shared_up" in t:
+            shared = F.linear(act(F.linear(flat, t["shared_gate"])) * F.linear(flat, t["shared_up"]), t["shared_down"])
+            out = out + torch.sigmoid(F.linear(flat, t["shared_router"])) * shared
+        out = out.view_as(h)
+        if "post_norm" in t:
+            out = rmsnorm(out, t["post_norm"], eps, offset)
+        return x + out * p.get("residual_scale", 1.0)
+
+
+class Mamba(Block):
+    """Mamba: a projection into a stream and its gate, a causal depthwise
+    convolution over the stream, then a selective scan, whose state is a
+    `state_size` vector per channel, decayed and written at each token with
+    step sizes, inputs and outputs that depend on the token."""
+
+    def init_state(self, batch):
+        p = self.p
+        dtype, device = self.t["out"].dtype, self.t["out"].device
+        return {
+            "conv": torch.zeros(batch, p["inner"], p["conv_kernel"] - 1, dtype=dtype, device=device),
+            "ssm": torch.zeros(batch, p["inner"], p["state_size"], dtype=torch.float32, device=device),
+        }
+
+    def forward(self, x, state, start):
+        p, t = self.p, self.t
+        h = rmsnorm(x, t["norm"], p["eps"], p.get("norm_offset", 0.0))
+        stream, gate = project(h, t, "in").transpose(1, 2).chunk(2, dim=1)
+        mixed = torch.cat((state["conv"], stream), dim=-1)
+        state["conv"] = mixed[:, :, -(p["conv_kernel"] - 1) :]
+        u = F.silu(F.conv1d(mixed, t["conv"], t.get("conv_bias"), groups=p["inner"]))
+        rank, n = p["time_step_rank"], p["state_size"]
+        step, b, c = (u.transpose(1, 2) @ t["x"].T).split([rank, n, n], dim=-1)
+        delta = F.softplus(t["dt"] @ step.transpose(1, 2) + t["dt_bias"][..., None].float())
+        a = -torch.exp(t["A_log"].float())
+        decay = torch.exp(a[None, :, None, :] * delta[:, :, :, None])
+        written = delta[:, :, :, None] * b[:, None, :, :].float() * u[:, :, :, None].float()
+        ssm = state["ssm"]
+        outputs = []
+        for i in range(u.shape[-1]):
+            ssm = decay[:, :, i, :] * ssm + written[:, :, i, :]
+            outputs.append(torch.matmul(ssm.to(u.dtype), c[:, i, :].unsqueeze(-1))[:, :, 0])
+        state["ssm"] = ssm
+        y = torch.stack(outputs, dim=-1) + u * t["D"][None, :, None]
+        y = y * F.silu(gate)
+        return x + project(y.transpose(1, 2), t, "out")
 
 
 BLOCKS: dict[str, type[Block]] = {
     "attention": Attention,
     "gated_deltanet": GatedDeltaNet,
+    "mamba": Mamba,
     "mlp": MLP,
+    "moe": MoE,
 }
 
 
@@ -343,4 +435,6 @@ class Model:
             x = block.forward(x, block_state, start)
         p = self.head_params
         logits = rmsnorm(x, self.head_norm, p["eps"], p.get("norm_offset", 0.0)) @ self.head_weight.T
+        if p.get("logit_divisor"):
+            logits = logits / p["logit_divisor"]
         return softcap(logits, p.get("softcap"))

@@ -163,6 +163,54 @@ CONFIGS = {
     ),
     # No rotary positions in the second layer
     "smollm3": lambda: transformers.SmolLM3Config(**SMALL, **TOKENS, no_rope_layers=[1, 0]),
+    # Experts, two of four per token, renormalised
+    "mixtral": lambda: transformers.MixtralConfig(**SMALL, **TOKENS, num_local_experts=4, num_experts_per_tok=2),
+    # A dense layer, then experts, not renormalised
+    "qwen3-moe": lambda: transformers.Qwen3MoeConfig(
+        **SMALL,
+        **TOKENS,
+        head_dim=8,
+        moe_intermediate_size=16,
+        num_experts=4,
+        num_experts_per_tok=2,
+        mlp_only_layers=[0],
+    ),
+    # A shared expert beside the routed ones
+    "qwen2-moe": lambda: transformers.Qwen2MoeConfig(
+        **SMALL,
+        **TOKENS,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=24,
+        num_experts=4,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+    ),
+    # Norms on all queries and keys at once, and experts
+    "olmoe": lambda: transformers.OlmoeConfig(**SMALL, **TOKENS, num_experts=4, num_experts_per_tok=2),
+    # Multipliers on embeddings, attention, residuals and logits
+    "granite": lambda: transformers.GraniteConfig(
+        **SMALL,
+        **TOKENS,
+        embedding_multiplier=3.0,
+        attention_multiplier=0.2,
+        residual_multiplier=0.5,
+        logits_scaling=2.0,
+    ),
+    # Stacked experts, weighed by a softmax over the picked ones, and multipliers
+    "granitemoe": lambda: transformers.GraniteMoeConfig(
+        **SMALL,
+        **TOKENS,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        embedding_multiplier=3.0,
+        attention_multiplier=0.2,
+        residual_multiplier=0.5,
+        logits_scaling=2.0,
+    ),
+    # A selective scan instead of attention
+    "mamba": lambda: transformers.MambaConfig(
+        vocab_size=SMALL["vocab_size"], hidden_size=32, state_size=8, num_hidden_layers=2, **TOKENS
+    ),
 }
 #: Vision-language models, whose imports leave the vision encoder out
 VLMS = {
@@ -417,3 +465,35 @@ def test_phi3_longrope_by_any_name(kind):
     params = rope(FAMILIES["Phi3ForCausalLM"].config(raw), 4)
     assert params["rope_scaling"]["type"] == "longrope"
     assert params["rope_scaling"]["attention_factor"] == pytest.approx((1 + math.log(4) / math.log(16)) ** 0.5)
+
+
+def test_gguf_files_are_picked_by_their_quantization():
+    from shem_neural.model.importers import pick_gguf
+
+    files = ["Qwen3-0.6B-Q8_0.gguf", "Qwen3-0.6B-Q4_K_M.gguf", "Qwen3-0.6B-f16.gguf"]
+    assert pick_gguf("Qwen/Qwen3-0.6B-GGUF", files, "q4_k_m") == "Qwen3-0.6B-Q4_K_M.gguf"
+    assert pick_gguf("Qwen/Qwen3-0.6B-GGUF", files[:1], None) == "Qwen3-0.6B-Q8_0.gguf"
+    with pytest.raises(SystemExit, match="several GGUF files"):
+        pick_gguf("Qwen/Qwen3-0.6B-GGUF", files, None)
+    with pytest.raises(SystemExit, match="matches none"):
+        pick_gguf("Qwen/Qwen3-0.6B-GGUF", files, "IQ2_XS")
+
+
+def test_templates_with_generation_blocks_render_their_text(tmp_path):
+    """transformers' `{% generation %}` tag, which some chat templates use
+    to mark the assistant's text, renders the text inside it."""
+    from tokenizers import Tokenizer as Words
+    from tokenizers import models
+
+    from shem_neural.model.tokenizer import Tokenizer
+
+    Words(models.WordLevel({"t0": 0}, unk_token="t0")).save(str(tmp_path / "tokenizer.json"))
+    template = (
+        "{% for m in messages %}{% if m.role == 'assistant' %}"
+        "{% generation %}{{ m.content }}{% endgeneration %}"
+        "{% else %}{{ m.content }}{% endif %} {% endfor %}"
+    )
+    (tmp_path / "chat_template.jinja").write_text(template)
+    tokenizer = Tokenizer(tmp_path, {"file": "tokenizer.json", "chat_template": "chat_template.jinja", "eos": []})
+    messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    assert tokenizer.render(messages, reply=False) == "hi hello "

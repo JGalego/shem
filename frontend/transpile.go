@@ -11,14 +11,16 @@ import (
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 )
 
-// Lower Shemfiles to Dockerfiles: model imports and compiled layers use named
-// contexts, WARM adds a priming stage, and KERNEL becomes config labels.
-// Ordinary Docker stages run on the build platform.
+// Lower Shemfiles to Dockerfiles: model imports, ModelPack artifacts and
+// compiled layers use named contexts, WARM adds a priming stage, and KERNEL
+// becomes config labels. Ordinary Docker stages run on the build platform.
 
 const (
 	hfPrefix  = "hf.co/"
 	modelDir  = "/model"
 	importDir = "/out/model"
+	// artifactDir is where a ModelPack artifact's files are laid out
+	artifactDir = "/out/artifact"
 	// imageDir is where WARM sees the image's filesystem: the driver finds
 	// the model in it, at /model or, in a ModelPack artifact's twin, at /
 	imageDir       = "/image"
@@ -31,11 +33,13 @@ type Import struct {
 	Name, Repo, Revision string
 }
 
-// An Imported model: its files, relative to the model's directory, and the
-// SPDX licence its model card declares, if any.
+// An Imported model: its files, relative to the model's directory, the SPDX
+// licence its model card declares, if any, and for a ModelPack artifact,
+// where its model is once its files are at the image's root.
 type Imported struct {
 	Files   []string
 	License string
+	Model   string
 }
 
 type stage struct {
@@ -130,8 +134,9 @@ func Imports(src []byte) ([]Import, error) {
 }
 
 // Transpile writes the Dockerfile for a Shemfile, given what each import
-// holds (by import name), and the image that runs shem's neural side.
-func Transpile(src []byte, imported map[string]Imported, neuralImage string) (string, error) {
+// holds (by import name), the context name of each stage base that is a
+// ModelPack artifact, and the image that runs shem's neural side.
+func Transpile(src []byte, imported map[string]Imported, artifacts map[string]string, neuralImage string) (string, error) {
 	globals, stages, err := parse(src)
 	if err != nil {
 		return "", err
@@ -145,7 +150,8 @@ func Transpile(src []byte, imported map[string]Imported, neuralImage string) (st
 	for i, st := range stages {
 		last := i == len(stages)-1
 		repo, _, isModel := hfReference(st.base)
-		shem := last || isModel || st.base == "scratch"
+		artifact, isArtifact := artifacts[st.base]
+		shem := last || isModel || isArtifact || st.base == "scratch"
 		warms := 0
 		for _, node := range st.nodes {
 			if strings.EqualFold(node.Value, "warm") {
@@ -181,7 +187,7 @@ func Transpile(src []byte, imported map[string]Imported, neuralImage string) (st
 				return "", fmt.Errorf("no files for the import of %s", repo)
 			}
 			write("FROM scratch%s", as(part(0)))
-			for _, line := range modelCopies(name, model.Files) {
+			for _, line := range modelCopies(name, model.Files, importDir, modelDir) {
 				write("%s", line)
 			}
 			write(`LABEL dev.shem.machine="rv32im" dev.shem.model="%s"`, modelDir)
@@ -189,6 +195,20 @@ func Transpile(src []byte, imported map[string]Imported, neuralImage string) (st
 			if model.License != "" {
 				write(`LABEL org.opencontainers.image.licenses=%s`, jsonString(model.License))
 			}
+			write(`ENTRYPOINT ["shem:generate"]`)
+			entrypoint = []string{"shem:generate"}
+		case isArtifact:
+			// The artifact's files at the root, as in the twin shem makes of it
+			model, ok := imported[artifact]
+			if !ok {
+				return "", fmt.Errorf("no files for the ModelPack artifact %s", st.base)
+			}
+			write("FROM scratch%s", as(part(0)))
+			for _, line := range modelCopies(artifact, model.Files, artifactDir, "/") {
+				write("%s", line)
+			}
+			write(`LABEL dev.shem.machine="rv32im" dev.shem.model=%s`, jsonString(model.Model))
+			write(`LABEL org.opencontainers.image.base.name=%s`, jsonString(st.base))
 			write(`ENTRYPOINT ["shem:generate"]`)
 			entrypoint = []string{"shem:generate"}
 		case !shem && !strings.Contains(flags, "--platform"):
@@ -255,10 +275,11 @@ func Transpile(src []byte, imported map[string]Imported, neuralImage string) (st
 	return out.String(), nil
 }
 
-// modelCopies copies an import's files into the model's directory: the small
-// files together, then each weights file in a layer of its own, or a few
-// together when there would otherwise be too many layers, as shem build does.
-func modelCopies(name string, files []string) []string {
+// modelCopies copies an import's files, from `from` in its context to `to`:
+// the small files together, then each weights file in a layer of its own, or
+// a few together when there would otherwise be too many layers, as shem
+// build does.
+func modelCopies(name string, files []string, from, to string) []string {
 	var small, weights []string
 	for _, file := range files {
 		if strings.HasSuffix(file, ".safetensors") {
@@ -273,12 +294,12 @@ func modelCopies(name string, files []string) []string {
 	copyFiles := func(group []string, dest string) {
 		sources := make([]string, len(group))
 		for i, file := range group {
-			sources[i] = path.Join(importDir, file)
+			sources[i] = path.Join(from, file)
 		}
-		lines = append(lines, fmt.Sprintf("COPY --link --from=%s %s %s/", name, strings.Join(sources, " "), dest))
+		lines = append(lines, fmt.Sprintf("COPY --link --from=%s %s %s/", name, strings.Join(sources, " "), strings.TrimSuffix(dest, "/")))
 	}
 	if len(small) > 0 {
-		copyFiles(small, modelDir)
+		copyFiles(small, to)
 	}
 	perLayer := max(1, (len(weights)+maxModelLayers-2)/(maxModelLayers-1))
 	for start := 0; start < len(weights); start += perLayer {
@@ -290,7 +311,7 @@ func modelCopies(name string, files []string) []string {
 			for n < len(group) && path.Dir(group[n]) == dir {
 				n++
 			}
-			copyFiles(group[:n], path.Join(modelDir, dir))
+			copyFiles(group[:n], path.Join(to, dir))
 			group = group[n:]
 		}
 	}

@@ -16,10 +16,12 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/client/llb/sourceresolver"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/frontend/gateway/grpcclient"
 	"github.com/moby/buildkit/solver/pb"
@@ -94,7 +96,25 @@ func build(ctx context.Context, c client.Client) (*client.Result, error) {
 		forward["context:"+CompiledContext(name)] = "input:" + CompiledContext(name)
 	}
 
-	dockerfile, err := Transpile(src, imported, neuralImage)
+	// ModelPack artifacts, which BuildKit can't build on, laid out by shem-neural
+	bases, err := artifactBases(ctx, c, src, buildPlatform)
+	if err != nil {
+		return nil, err
+	}
+	artifacts := map[string]string{}
+	for i, base := range bases {
+		name := fmt.Sprintf("shem-artifact-%d", i)
+		def, model, err := importArtifact(ctx, c, base, neuralImage, buildPlatform)
+		if err != nil {
+			return nil, fmt.Errorf("fetching the ModelPack artifact %s: %w", base, err)
+		}
+		imported[name] = model
+		inputs[name] = def
+		forward["context:"+name] = "input:" + name
+		artifacts[base] = name
+	}
+
+	dockerfile, err := Transpile(src, imported, artifacts, neuralImage)
 	if err != nil {
 		return nil, err
 	}
@@ -215,5 +235,102 @@ func importModel(ctx context.Context, c client.Client, imp Import, neuralImage s
 		return nil, model, fmt.Errorf("the model's manifest: %w", err)
 	}
 	model.License = parsed.Source.SPDX
+	return def.ToPB(), model, nil
+}
+
+// artifactBases lists the stage bases that are ModelPack artifacts, by what
+// BuildKit says when it resolves them: their configs are a model's, not an
+// image's. Other bases are left to BuildKit, errors and all.
+func artifactBases(ctx context.Context, c client.Client, src []byte, platform ocispecs.Platform) ([]string, error) {
+	_, stages, err := parse(src)
+	if err != nil {
+		return nil, err
+	}
+	stageNames := map[string]bool{}
+	found := map[string]bool{}
+	for _, st := range stages {
+		base := st.base
+		_, _, isModel := hfReference(base)
+		skip := base == "scratch" || isModel || stageNames[strings.ToLower(base)] ||
+			strings.Contains(base, "$") || strings.HasPrefix(base, compiledPrefix)
+		if st.name != "" {
+			stageNames[strings.ToLower(st.name)] = true
+		}
+		if skip || found[base] {
+			continue
+		}
+		opt := sourceresolver.Opt{ImageOpt: &sourceresolver.ResolveImageOpt{Platform: &platform}}
+		if _, _, _, err := c.ResolveImageConfig(ctx, base, opt); err != nil && isModelConfig(err) {
+			found[base] = true
+		}
+	}
+	bases := make([]string, 0, len(found))
+	for base := range found {
+		bases = append(bases, base)
+	}
+	sort.Strings(bases)
+	return bases, nil
+}
+
+// isModelConfig is whether BuildKit refused a base for its ModelPack config.
+func isModelConfig(err error) bool {
+	return strings.Contains(err.Error(), ".model.config.v1+json")
+}
+
+// importArtifact fetches the ModelPack artifact `ref` in shem-neural and
+// returns its files, laid out with the model's manifest beside them, as a
+// named context. A registry's credentials come from the optional build
+// secret `docker_config`, a Docker config file; a registry on localhost is
+// reached on the host's network.
+func importArtifact(ctx context.Context, c client.Client, ref, neuralImage string, platform ocispecs.Platform) (*pb.Definition, Imported, error) {
+	var model Imported
+	args := []string{"shem-neural-modelpack", ref, artifactDir}
+	host, _, _ := strings.Cut(ref, "/")
+	opts := []llb.RunOption{
+		llb.AddSecret("/run/secrets/docker_config", llb.SecretID("docker_config"), llb.SecretOptional),
+		llb.AddEnv("REGISTRY_AUTH_FILE", "/run/secrets/docker_config"),
+		llb.WithCustomName("[shem] fetching the ModelPack artifact " + ref),
+	}
+	if strings.HasPrefix(host, "localhost") || strings.HasPrefix(host, "127.0.0.1") {
+		args = append(args, "--plain-http")
+		opts = append(opts, llb.Network(pb.NetMode_HOST))
+	}
+	opts = append(opts, llb.Args(args))
+	state := llb.Image(neuralImage, llb.Platform(platform), llb.WithMetaResolver(c)).Run(opts...).Root()
+	def, err := state.Marshal(ctx, llb.Platform(platform))
+	if err != nil {
+		return nil, model, err
+	}
+	res, err := c.Solve(ctx, client.SolveRequest{Definition: def.ToPB(), Evaluate: true})
+	if err != nil {
+		return nil, model, err
+	}
+	fetched, err := res.SingleRef()
+	if err != nil {
+		return nil, model, err
+	}
+	dirs := []string{""}
+	for len(dirs) > 0 {
+		dir := dirs[0]
+		dirs = dirs[1:]
+		entries, err := fetched.ReadDir(ctx, client.ReadDirRequest{Path: path.Join(artifactDir, dir)})
+		if err != nil {
+			return nil, model, err
+		}
+		for _, entry := range entries {
+			name := strings.TrimPrefix(path.Join(dir, entry.GetPath()), "/")
+			if entry.IsDir() {
+				dirs = append(dirs, name)
+			} else {
+				model.Files = append(model.Files, name)
+			}
+		}
+	}
+	model.Model = "/"
+	for _, file := range model.Files {
+		if file == "model/shem.json" {
+			model.Model = "/model"
+		}
+	}
 	return def.ToPB(), model, nil
 }

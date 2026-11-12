@@ -84,7 +84,8 @@ pub fn compile(name: &str, out: &Path) -> anyhow::Result<()> {
 }
 
 /// Import `repo` at `revision` into `out`, as a manifest and weights files:
-/// a Hugging Face model, or a checkpoint's directory, by its full path.
+/// a Hugging Face model (in a repo of GGUF files, `revision` names a
+/// quantization), or a checkpoint's directory or GGUF file, by its full path.
 pub fn import(repo: &str, revision: Option<&str>, out: &Path) -> anyhow::Result<()> {
     let mut command = python("shem_neural.model.importers");
     command.arg(repo).arg(out);

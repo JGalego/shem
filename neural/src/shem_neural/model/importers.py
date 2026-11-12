@@ -2,11 +2,17 @@
 
     python -m shem_neural.model.importers Qwen/Qwen3-0.6B out/model [--revision REV]
     python -m shem_neural.model.importers CHECKPOINT_DIR out/model [--in-place]
+    python -m shem_neural.model.importers Qwen/Qwen3-0.6B-GGUF out/model --revision Q8_0
+    python -m shem_neural.model.importers model.gguf out/model
 
 Each importer maps one architecture's tensors onto shem's block types and
 writes one weights file per block. The tensors keep their names and types,
 and an index says which file holds each, so the output is also a sharded
 checkpoint that transformers loads as it would the original.
+
+A GGUF file is dequantized by transformers, with the `gguf` extra, into a
+checkpoint that imports like any other, its weights in float32. A Hugging
+Face repo of GGUF files picks one by the revision, as a quantization's name.
 
 In place, the checkpoint's files stay as they are, and the import writes
 only what a model needs besides them: the manifest, and an index and a chat
@@ -29,6 +35,7 @@ import json
 import math
 import shutil
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -333,6 +340,10 @@ def attention_block(
         params["qk_norm"] = "projection"
     if cfg.get("query_pre_attn_scalar"):
         params["scale"] = cfg["query_pre_attn_scalar"] ** -0.5
+    if cfg.get("attention_multiplier"):
+        params["scale"] = cfg["attention_multiplier"]
+    if cfg.get("residual_multiplier"):
+        params["residual_scale"] = cfg["residual_multiplier"]
     if cfg.get("attn_logit_softcapping"):
         params["softcap"] = cfg["attn_logit_softcapping"]
     window = sliding_window(cfg)
@@ -378,16 +389,57 @@ def decoder_layers(w: Writer, cfg: dict, prefix: str, offset: float) -> None:
             w.block("gated_deltanet", params, names)
         else:
             raise ValueError(f"layer {i}: unknown layer type {kind!r}")
-        mlp = layer + "mlp."
-        if w.ckpt.has(mlp + "gate_up_proj.weight"):
-            names = {"gate_up": mlp + "gate_up_proj.weight", "down": mlp + "down_proj.weight"}
-        else:
-            names = {part: f"{mlp}{part}_proj.weight" for part in ("gate", "up", "down")}
-        names |= w.biases(names) | mlp_norms
-        params = {"eps": eps, "norm_offset": offset}
+        kind, params, names = feed_forward(w, cfg, layer)
+        params |= {"eps": eps, "norm_offset": offset}
         if gate != "silu":
             params["activation"] = gate
-        w.block("mlp", params, names)
+        if cfg.get("residual_multiplier"):
+            params["residual_scale"] = cfg["residual_multiplier"]
+        w.block(kind, params, names | mlp_norms)
+
+
+def feed_forward(w: Writer, cfg: dict, layer: str) -> tuple[str, dict, dict[str, str]]:
+    """A layer's feed-forward block, by what the checkpoint holds: an MLP,
+    or a mixture of experts, routed as each family routes them."""
+    mlp, moe = layer + "mlp.", layer + "block_sparse_moe."
+    top_k = cfg.get("num_experts_per_tok")
+    if w.ckpt.has(moe + "router.layer.weight"):
+        # GraniteMoe: experts stacked, weighed by a softmax over the picked logits
+        names = {
+            "router": moe + "router.layer.weight",
+            "gate_up": moe + "input_linear.weight",
+            "down": moe + "output_linear.weight",
+        }
+        experts = w.ckpt.shape(names["router"])[0]
+        return "moe", {"experts": experts, "top_k": top_k, "routing": "topk_softmax"}, names
+    if w.ckpt.has(moe + "gate.weight"):
+        # Mixtral: w1, w3 and w2 are each expert's gate, up and down
+        names = {"router": moe + "gate.weight"}
+        experts = w.ckpt.shape(names["router"])[0]
+        for e in range(experts):
+            expert = f"{moe}experts.{e}."
+            names |= {
+                f"gate.{e}": expert + "w1.weight",
+                f"up.{e}": expert + "w3.weight",
+                f"down.{e}": expert + "w2.weight",
+            }
+        return "moe", {"experts": experts, "top_k": top_k, "normalize": True}, names
+    if w.ckpt.has(mlp + "gate.weight") and w.ckpt.has(mlp + "experts.0.gate_proj.weight"):
+        # Qwen2-MoE, Qwen3-MoE and OLMoE, Qwen2-MoE with a shared expert
+        names = {"router": mlp + "gate.weight"}
+        experts = w.ckpt.shape(names["router"])[0]
+        for e in range(experts):
+            names |= {f"{part}.{e}": f"{mlp}experts.{e}.{part}_proj.weight" for part in ("gate", "up", "down")}
+        if w.ckpt.has(mlp + "shared_expert.gate_proj.weight"):
+            names |= {f"shared_{part}": f"{mlp}shared_expert.{part}_proj.weight" for part in ("gate", "up", "down")}
+            names["shared_router"] = mlp + "shared_expert_gate.weight"
+        normalize = bool(cfg.get("norm_topk_prob", False))
+        return "moe", {"experts": experts, "top_k": top_k, "normalize": normalize}, names
+    if w.ckpt.has(mlp + "gate_up_proj.weight"):
+        names = {"gate_up": mlp + "gate_up_proj.weight", "down": mlp + "down_proj.weight"}
+    else:
+        names = {part: f"{mlp}{part}_proj.weight" for part in ("gate", "up", "down")}
+    return "mlp", {}, names | w.biases(names)
 
 
 def decoder(w: Writer, family: "Family") -> tuple[BlockSpec, BlockSpec, dict]:
@@ -396,6 +448,8 @@ def decoder(w: Writer, family: "Family") -> tuple[BlockSpec, BlockSpec, dict]:
     cfg = family.config(w.ckpt.config)
     prefix = next((p for p in family.prefixes if w.ckpt.has(p + "embed_tokens.weight")), family.prefixes[0])
     embed_params = {"scale": cfg["hidden_size"] ** 0.5} if family.embed_scale else {}
+    if cfg.get("embedding_multiplier"):
+        embed_params = {"scale": cfg["embedding_multiplier"]}
     embed_names = {"weight": prefix + "embed_tokens.weight"}
     embed = BlockSpec("embedding", embed_params, w.file("embed.safetensors", embed_names))
     decoder_layers(w, cfg, prefix, family.offset)
@@ -409,7 +463,47 @@ def decoder(w: Writer, family: "Family") -> tuple[BlockSpec, BlockSpec, dict]:
     params = {"eps": cfg["rms_norm_eps"], "norm_offset": family.offset, "tied": bool(tied)}
     if cfg.get("final_logit_softcapping"):
         params["softcap"] = cfg["final_logit_softcapping"]
+    if cfg.get("logits_scaling", 1.0) != 1.0:
+        params["logit_divisor"] = cfg["logits_scaling"]
     return embed, BlockSpec("head", params, w.file("head.safetensors", names)), cfg
+
+
+def mamba(w: Writer, family: "Family") -> tuple[BlockSpec, BlockSpec, dict]:
+    """Mamba: its embedding, then a block per layer, each a norm and a mixer,
+    then a final norm and a head, tied to the embedding or not. A block's
+    sizes are its tensors'."""
+    cfg = family.config(w.ckpt.config)
+    eps = cfg.get("layer_norm_epsilon", 1e-5)
+    embed = BlockSpec("embedding", {}, w.file("embed.safetensors", {"weight": "backbone.embeddings.weight"}))
+    for i in range(cfg["num_hidden_layers"]):
+        layer = f"backbone.layers.{i}."
+        mixer = layer + "mixer."
+        names = {"norm": layer + "norm.weight"}
+        names |= {
+            local: f"{mixer}{name}.weight" for local, name in [("in", "in_proj"), ("x", "x_proj"), ("out", "out_proj")]
+        }
+        names |= w.biases(names)
+        names |= {"conv": mixer + "conv1d.weight", "dt": mixer + "dt_proj.weight", "dt_bias": mixer + "dt_proj.bias"}
+        names |= {"A_log": mixer + "A_log", "D": mixer + "D"}
+        if w.ckpt.has(mixer + "conv1d.bias"):
+            names["conv_bias"] = mixer + "conv1d.bias"
+        inner, state = w.ckpt.shape(names["A_log"])
+        params = {
+            "inner": inner,
+            "state_size": state,
+            "conv_kernel": w.ckpt.shape(names["conv"])[-1],
+            "time_step_rank": w.ckpt.shape(names["dt"])[1],
+            "eps": eps,
+        }
+        w.block("mamba", params, names)
+    tied = cfg.get("tie_word_embeddings")
+    if tied is None:
+        tied = not w.ckpt.has("lm_head.weight")
+    names = {"norm": "backbone.norm_f.weight"}
+    if not tied:
+        names["weight"] = "lm_head.weight"
+    head = BlockSpec("head", {"eps": eps, "norm_offset": 0.0, "tied": bool(tied)}, w.file("head.safetensors", names))
+    return embed, head, cfg
 
 
 def per_kind_rope(cfg: dict, sliding_theta: float, full_theta: float) -> dict:
@@ -512,13 +606,17 @@ class Family:
     offset: float = 0.0
     #: Whether embeddings are scaled by the square root of the width, as Gemma's are
     embed_scale: bool = False
+    #: What reads the checkpoint: a decoder in Llama's layout, or another
+    reader: Callable[[Writer, "Family"], tuple[BlockSpec, BlockSpec, dict]] = decoder
 
 
 GEMMA = {"offset": 1.0, "embed_scale": True}
 #: The architectures shem imports, by the name in their config. Llama,
 #: Mistral, Qwen2, Qwen3 and OLMo 2 differ only in what their checkpoints
 #: and configs turn on; Phi-3 fuses projections, which the blocks split;
-#: Gemma puts norms around its blocks and softcaps
+#: Gemma puts norms around its blocks and softcaps; Mixtral, Qwen-MoE, OLMoE
+#: and GraniteMoe route tokens to experts; Granite scales its residuals,
+#: embeddings and logits; Mamba is a reader of its own
 FAMILIES: dict[str, Family] = {
     "LlamaForCausalLM": Family(),
     "MistralForCausalLM": Family(),
@@ -533,6 +631,13 @@ FAMILIES: dict[str, Family] = {
     "Gemma3ForConditionalGeneration": Family(
         gemma3_config, ("model.language_model.", "language_model.model."), **GEMMA
     ),
+    "MixtralForCausalLM": Family(),
+    "Qwen2MoeForCausalLM": Family(),
+    "Qwen3MoeForCausalLM": Family(),
+    "OlmoeForCausalLM": Family(),
+    "GraniteForCausalLM": Family(),
+    "GraniteMoeForCausalLM": Family(),
+    "MambaForCausalLM": Family(reader=mamba),
     "Qwen3_5ForCausalLM": Family(offset=1.0),
     "Qwen3_5ForConditionalGeneration": Family(text_config, ("model.language_model.",), offset=1.0),
 }
@@ -573,6 +678,8 @@ def fingerprint(checkpoint: Checkpoint, specs: list[BlockSpec]) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+#: The chat template of a base model, which has none: the messages' text, run together
+PLAIN_TEMPLATE = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
 #: The special tokens transformers hands a chat template, as `bos_token` and so on
 SPECIAL_TOKENS = ["bos_token", "eos_token", "unk_token", "sep_token", "pad_token", "cls_token", "mask_token"]
 
@@ -614,9 +721,77 @@ def model_license(directory: Path) -> dict:
 
 
 def import_model(repo: str, out: Path, revision: str | None = None) -> Manifest:
-    """Download `repo` from Hugging Face and write it to `out` as a shem model."""
+    """Download `repo` from Hugging Face and write it to `out` as a shem model.
+    A repo of GGUF files, without a checkpoint, imports the one `revision`
+    names as a quantization, such as `Q8_0`."""
+    files = repo_files(repo)
+    ggufs = [f for f in files if f.endswith(".gguf")]
+    if ggufs and "config.json" not in files:
+        gguf = pick_gguf(repo, ggufs, revision)
+        return import_gguf(repo, gguf, out, {"repo": repo, "gguf": gguf})
     directory = Path(snapshot_download(repo, revision=revision, allow_patterns=PATTERNS))
     return import_checkpoint(directory, out, {"repo": repo, "revision": directory.name})
+
+
+def repo_files(repo: str) -> list[str]:
+    """The files of a Hugging Face repo, or offline, those the cache has."""
+    import requests
+    from huggingface_hub import list_repo_files
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    try:
+        return list_repo_files(repo)
+    except (OfflineModeIsEnabled, requests.ConnectionError, requests.Timeout):
+        cached = Path(snapshot_download(repo, allow_patterns=["*.gguf", "config.json"], local_files_only=True))
+        return [path.name for path in cached.iterdir()]
+
+
+def pick_gguf(repo: str, files: list[str], quantization: str | None) -> str:
+    """The GGUF file of `repo` whose name has the quantization, as Ollama
+    and Docker pick them, or its only one."""
+    if quantization:
+        chosen = [f for f in files if quantization.lower() in Path(f).name.lower()]
+        if len(chosen) == 1:
+            return chosen[0]
+        problem = "matches none" if not chosen else "matches several"
+        raise SystemExit(f"{repo}: {quantization} {problem} of its GGUF files: {', '.join(sorted(files))}")
+    if len(files) == 1:
+        return files[0]
+    raise SystemExit(f"{repo} has several GGUF files: name one's quantization, as in :{guess(files)}")
+
+
+def guess(files: list[str]) -> str:
+    """A quantization's name in one of `files`, for an error's example."""
+    name = Path(sorted(files)[0]).stem
+    return name.rsplit("-", 1)[-1] if "-" in name else name
+
+
+def import_gguf(location: str, gguf: str, out: Path, source: dict) -> Manifest:
+    """Dequantize the GGUF file `gguf`, in a Hugging Face repo or a local
+    directory at `location`, into a checkpoint, with transformers, and
+    import that. The weights become float32, which holds any quantization's
+    values exactly."""
+    try:
+        import transformers
+        from huggingface_hub import save_torch_state_dict
+    except ImportError as error:
+        raise SystemExit("importing GGUF needs transformers, gguf and accelerate: install shem-neural[gguf]") from error
+    model = transformers.AutoModelForCausalLM.from_pretrained(location, gguf_file=gguf, dtype=torch.float32)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(location, gguf_file=gguf)
+    config = model.config.to_dict()
+    config.pop("quantization_config", None)
+    # A config from GGUF metadata names no architecture: the model's class is it
+    config["architectures"] = [type(model).__name__]
+    weights = {name: tensor.detach().clone().contiguous() for name, tensor in model.state_dict().items()}
+    if config.get("tie_word_embeddings"):
+        weights.pop("lm_head.weight", None)
+    with tempfile.TemporaryDirectory() as directory:
+        save_torch_state_dict(weights, directory)
+        (Path(directory) / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        tokenizer.save_pretrained(directory)
+        if model.generation_config is not None:
+            model.generation_config.save_pretrained(directory)
+        return import_checkpoint(Path(directory), out, source)
 
 
 def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in_place: bool = False) -> Manifest:
@@ -631,7 +806,8 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
         raise SystemExit(f"{directory}: no importer for {architecture}; shem has {sorted(FAMILIES)}")
     out.mkdir(parents=True, exist_ok=True)
     writer = Writer(out, checkpoint, in_place)
-    embed, head, cfg = decoder(writer, FAMILIES[architecture])
+    family = FAMILIES[architecture]
+    embed, head, cfg = family.reader(writer, family)
     writer.index()
 
     if not in_place:
@@ -646,8 +822,10 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
         if not in_place:
             shutil.copy(template, out / "chat_template.jinja")
     else:
-        settings = json.loads((directory / "tokenizer_config.json").read_text())
-        (out / "chat_template.jinja").write_text(settings["chat_template"])
+        config = directory / "tokenizer_config.json"
+        settings = json.loads(config.read_text()) if config.exists() else {}
+        # A base model without one gets a template that runs on from its text
+        (out / "chat_template.jinja").write_text(settings.get("chat_template") or PLAIN_TEMPLATE)
     # What the model holds: the tensors it runs, the vision encoder of a
     # vision-language model's checkpoint not among them
     used = {name for spec in [embed, *writer.blocks, head] for name in spec.tensors.values()}
@@ -676,9 +854,14 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("source", help="a Hugging Face model, such as Qwen/Qwen3-0.6B, or a checkpoint's directory")
+    parser.add_argument(
+        "source", help="a Hugging Face model, such as Qwen/Qwen3-0.6B, a checkpoint's directory, or a GGUF file"
+    )
     parser.add_argument("out", type=Path, help="the directory to write the model to")
-    parser.add_argument("--revision", help="a branch, tag or commit of the Hugging Face model")
+    parser.add_argument(
+        "--revision",
+        help="a branch, tag or commit of the Hugging Face model, or in a repo of GGUF files, a quantization",
+    )
     parser.add_argument(
         "--in-place",
         action="store_true",
@@ -687,6 +870,9 @@ def main() -> None:
     args = parser.parse_args()
     if Path(args.source).is_dir():
         manifest = import_checkpoint(Path(args.source), args.out, in_place=args.in_place)
+    elif Path(args.source).suffix == ".gguf" and Path(args.source).is_file():
+        gguf = Path(args.source).resolve()
+        manifest = import_gguf(str(gguf.parent), gguf.name, args.out, {"gguf": gguf.name})
     elif args.in_place:
         raise SystemExit("--in-place imports a checkpoint's directory")
     else:

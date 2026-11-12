@@ -9,6 +9,7 @@ model's comparison fits in 16 GB.
 import gc
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -36,14 +37,24 @@ REPOS = [
     "Qwen/Qwen2.5-0.5B-Instruct",
     "google/gemma-3-270m-it",
     "allenai/OLMo-2-0425-1B-Instruct",
+    "ibm-granite/granite-3.1-1b-a400m-instruct",
+    "state-spaces/mamba-130m-hf",
 ]
 #: The imports that are a text model's whole checkpoint: Qwen3.5's leaves out its vision encoder
 TEXT_REPOS = [repo for repo in REPOS if "3.5" not in repo]
 #: The token that ends a turn in each chat template, where it isn't ChatML's
-END_OF_TURN = {"google/gemma-3-270m-it": "<end_of_turn>", "allenai/OLMo-2-0425-1B-Instruct": "<|endoftext|>"}
+END_OF_TURN = {
+    "google/gemma-3-270m-it": "<end_of_turn>",
+    "allenai/OLMo-2-0425-1B-Instruct": "<|endoftext|>",
+    "ibm-granite/granite-3.1-1b-a400m-instruct": "<|end_of_text|>",
+    "state-spaces/mamba-130m-hf": "<|endoftext|>",
+}
+#: Base models, without a chat template: shem gives them one that runs
+#: their messages' text together, and transformers has none to compare
+BASE = {"state-spaces/mamba-130m-hf"}
 #: Models too small to recall a name from two turns back: transformers,
 #: given the same tokens, forgets it the same way
-FORGETFUL = {"google/gemma-3-270m-it"}
+FORGETFUL = {"google/gemma-3-270m-it"} | BASE
 _IMPORTED: dict = {}
 
 
@@ -141,14 +152,26 @@ def test_imported_directories_load_in_transformers(repo, imports):
 
 
 @pytest.mark.parametrize("repo", REPOS)
-def test_chat_templates_render_as_in_transformers(repo, imports):
+def test_chat_templates_render_as_in_transformers(repo, imports, monkeypatch):
     """A conversation in the chat template, as shem renders it and as
     transformers does, special tokens included."""
     import transformers
 
+    if repo in BASE:
+        pytest.skip("a base model has no chat template to compare")
     tokenizer = Tokenizer(imports(repo), Manifest.load(imports(repo)).tokenizer)
     theirs = transformers.AutoTokenizer.from_pretrained(repo)
     system = [{"role": "system", "content": "You are a golem."}]
+    # shem's templates see the guest's virtual clock, so a session renders the
+    # same any day: transformers' templates get the same day
+    from transformers.utils import chat_template_utils
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 1, tzinfo=tz)
+
+    monkeypatch.setattr(chat_template_utils, "datetime", Clock)
     for messages in (MESSAGES, system + MESSAGES):
         want = theirs.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         assert tokenizer.render(messages) == want
@@ -225,6 +248,12 @@ CONFIG_REPOS = [
     "allenai/OLMo-2-0425-1B-Instruct",
     "allenai/Olmo-3-7B-Instruct",
     "HuggingFaceTB/SmolLM3-3B",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "Qwen/Qwen3-30B-A3B",
+    "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+    "allenai/OLMoE-1B-7B-0125-Instruct",
+    "ibm-granite/granite-3.3-2b-instruct",
+    "ibm-granite/granite-3.1-1b-a400m-instruct",
 ]
 
 
@@ -246,7 +275,8 @@ def test_configs_read_as_transformers_reads_them(repo):
     assert (heads, cfg["num_key_value_heads"]) == (text.num_attention_heads, text.num_key_value_heads)
     assert cfg["rms_norm_eps"] == text.rms_norm_eps
     assert activation(cfg) == ACTIVATIONS[getattr(text, "hidden_activation", None) or text.hidden_act]
-    for key in ("query_pre_attn_scalar", "attn_logit_softcapping", "final_logit_softcapping"):
+    multipliers = ("attention_multiplier", "residual_multiplier", "embedding_multiplier", "logits_scaling")
+    for key in ("query_pre_attn_scalar", "attn_logit_softcapping", "final_logit_softcapping", *multipliers):
         assert cfg.get(key) == getattr(text, key, None), key
 
     kinds = getattr(text, "layer_types", None)
@@ -281,3 +311,66 @@ def test_configs_read_as_transformers_reads_them(repo):
                 want, want_scale = function(text, None, seq_len=end, layer_type=layer_type)
             assert torch.allclose(got, want, rtol=1e-6, atol=0), (i, kind, end)
             assert got_scale == pytest.approx(want_scale), (i, kind, end)
+
+
+@pytest.mark.parametrize("repo, quantization", [("Qwen/Qwen3-0.6B-GGUF", "Q8_0")])
+def test_gguf_imports_match_transformers(repo, quantization, tmp_path):
+    """A GGUF file imports as transformers dequantizes it, with its tokenizer
+    and chat template, and replies as transformers does."""
+    import transformers
+
+    gguf = f"{repo.split('/')[1].removesuffix('-GGUF')}-{quantization}.gguf"
+    gated(lambda: import_model(repo, tmp_path, quantization))
+    tokenizer = Tokenizer(tmp_path, Manifest.load(tmp_path).tokenizer)
+    theirs = transformers.AutoTokenizer.from_pretrained(repo, gguf_file=gguf)
+    want = theirs.apply_chat_template(MESSAGES, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    assert tokenizer.render(MESSAGES) == want
+    tokens = torch.tensor([tokenizer.chat(MESSAGES)])
+    ref = transformers.AutoModelForCausalLM.from_pretrained(repo, gguf_file=gguf, dtype=torch.float32).eval()
+    with torch.no_grad():
+        expected = ref(input_ids=tokens).logits
+    free(ref)
+    ref = None
+    model = Model(tmp_path)
+    got = model.forward(tokens, model.init_state(), 0)
+    assert torch.allclose(got, expected, atol=1e-3, rtol=1e-3), (got - expected).abs().max()
+
+
+#: Checkpoints too large to compare in float32 on 16 GB, compared in bfloat16
+#: instead, a model at a time: Gemma 2's softcaps, Phi-4-mini's fused
+#: projections and longrope, SmolLM3's layers without rotary positions,
+#: and dense Granite
+BF16_REPOS = [
+    "google/gemma-2-2b-it",
+    "microsoft/Phi-4-mini-instruct",
+    "HuggingFaceTB/SmolLM3-3B",
+    "ibm-granite/granite-3.3-2b-instruct",
+]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("SHEM_LARGE_MODEL_TESTS"), reason="20 GB of checkpoints: set SHEM_LARGE_MODEL_TESTS=1"
+)
+@pytest.mark.parametrize("repo", BF16_REPOS)
+def test_large_models_agree_with_transformers_in_bfloat16(repo, imports):
+    """In bfloat16 the two can't agree to the last bit, as they round in
+    different places, but a block read wrong is far off: the next token they
+    predict must agree almost everywhere along a prompt, and their last
+    logits must point the same way."""
+    import transformers
+
+    directory = imports(repo)
+    tokenizer = Tokenizer(directory, Manifest.load(directory).tokenizer)
+    tokens = torch.tensor(
+        [tokenizer.chat(MESSAGES + [{"role": "assistant", "content": "Bricks, pottery and sculpture."}])]
+    )
+    ref = transformers.AutoModelForCausalLM.from_pretrained(repo, dtype=torch.bfloat16).eval()
+    with torch.no_grad():
+        expected = ref(input_ids=tokens).logits[0].float()
+    free(ref)
+    ref = None
+    model = Model(directory, dtype=torch.bfloat16)
+    got = model.forward(tokens, model.init_state(), 0)[0].float()
+    agree = (got.argmax(-1) == expected.argmax(-1)).float().mean().item()
+    assert agree >= 0.9, agree
+    assert torch.nn.functional.cosine_similarity(got[-1], expected[-1], dim=0) > 0.99

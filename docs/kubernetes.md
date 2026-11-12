@@ -56,3 +56,19 @@ kubectl logs shem-hello
 ```
 
 Any shem image works, model images included, with the model server running on the node for them (see [containerd.md](containerd.md)). A test builds a kind cluster, configures its node this way, and runs an RV32 program in a Pod; CI runs it on every push.
+
+## Model images as image volumes
+
+A model image's `/model` is a Hugging Face checkpoint, so a Pod can also mount it as an [image volume](https://kubernetes.io/docs/concepts/storage/volumes/#image) and give it to a model server, without running shem at all. Image volumes are pulled for the node's platform, so push the image listed for it too (`shem push --platform linux/amd64`), and turn on the `ImageVolume` feature gate where it is still off:
+
+```yaml
+volumes:
+- name: model
+  image: {reference: registry.example.com/team/qwen3:0.6b}
+containers:
+- name: server
+  volumeMounts: [{name: model, mountPath: /models}]
+  # the checkpoint is /models/model
+```
+
+`just kubernetes-model-volume-test` builds a model image, mounts it in a Pod on a kind cluster, and checks that the Pod reads the checkpoint's files. A ModelPack artifact that `shem push --modelpack` publishes holds the same blobs, for runtimes that mount artifacts.

@@ -141,6 +141,46 @@ jobs:
       - name: Run an RV32 program in a Pod on shem
         run: PATH="$PATH:$(go env GOPATH)/bin" just kubernetes-test
 
+  model-volumes:
+    name: Kubernetes (model images as image volumes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: neural/uv.lock
+      - uses: extractions/setup-just@v4
+      - name: Install kind
+        run: command -v kind || go install sigs.k8s.io/kind@latest
+      - name: Mount a model image in a Pod, as a model server would read it
+        run: PATH="$PATH:$(go env GOPATH)/bin" just kubernetes-model-volume-test
+
+  frontend-models:
+    name: BuildKit frontend (models, WARM, ModelPack, GGUF)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: neural/uv.lock
+      - uses: oras-project/setup-oras@v2.0.3
+      - uses: extractions/setup-just@v4
+      - name: docker build a primed model, a model on a ModelPack artifact, and a GGUF file
+        run: just frontend-models-test localhost:5000
+
   frontend:
     name: BuildKit frontend (docker build)
     runs-on: ubuntu-latest
