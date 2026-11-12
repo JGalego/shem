@@ -6,6 +6,8 @@
       "hidden_size": 1024,
       "tokenizer": {"file": "tokenizer.json", "chat_template": "chat_template.jinja", "eos": [151645]},
       "weights": "model.safetensors.index.json",
+      "parameters": 596049920,
+      "precision": ["bfloat16"],
       "embed": {"type": "embedding", "tensors": {"weight": "model.embed_tokens.weight"}},
       "blocks": [{"type": "attention", "params": {...},
                   "tensors": {"q": "model.layers.0.self_attn.q_proj.weight", ...}}, ...],
@@ -68,6 +70,10 @@ class Manifest:
     source: dict = field(default_factory=dict)
     #: The checkpoint index, in a v2 manifest
     weights: str | None = INDEX
+    #: How many numbers the model's tensors hold, and their types, as
+    #: ModelPack's config names them, such as `bfloat16`
+    parameters: int | None = None
+    precision: list[str] = field(default_factory=list)
     format: str = FORMAT
 
     def save(self, directory: Path) -> None:
@@ -79,6 +85,10 @@ class Manifest:
         }
         if self.weights is not None:
             data["weights"] = self.weights
+        if self.parameters is not None:
+            data["parameters"] = self.parameters
+        if self.precision:
+            data["precision"] = self.precision
         data |= {
             "embed": self.embed.to_json(),
             "blocks": [block.to_json() for block in self.blocks],
@@ -99,6 +109,8 @@ class Manifest:
             head=BlockSpec.from_json(data["head"]),
             source=data.get("source", {}),
             weights=data.get("weights"),
+            parameters=data.get("parameters"),
+            precision=data.get("precision", []),
             format=data["format"],
         )
 

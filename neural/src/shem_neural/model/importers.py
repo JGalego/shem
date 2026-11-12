@@ -54,12 +54,19 @@ SPDX = {"apache-2.0": "Apache-2.0", "mit": "MIT", "bsd-3-clause": "BSD-3-Clause"
 
 
 class Checkpoint:
-    """A downloaded checkpoint: its config and its tensors by name."""
+    """A checkpoint's directory: its config and its tensors by name, found
+    through its index when it has one, which may name files in directories
+    of their own (as shem's imports do), or else in its safetensors files."""
 
     def __init__(self, directory: Path):
         self.directory = directory
         self.config = json.loads((directory / "config.json").read_text())
         self.files = {}
+        index = directory / INDEX
+        if index.exists():
+            weight_map = json.loads(index.read_text())["weight_map"]
+            self.files = {name: directory / file for name, file in weight_map.items()}
+            return
         for path in sorted(directory.glob("*.safetensors")):
             with safe_open(str(path), "pt") as handle:
                 for name in handle.keys():
@@ -75,6 +82,13 @@ class Checkpoint:
     def shape(self, name: str) -> list[int]:
         with safe_open(str(self.files[name]), "pt") as handle:
             return handle.get_slice(name).get_shape()
+
+    def info(self, name: str) -> tuple[int, str]:
+        """How many numbers the tensor `name` holds, and their type, by
+        safetensors' name for it, without reading it."""
+        with safe_open(str(self.files[name]), "pt") as handle:
+            tensor = handle.get_slice(name)
+            return math.prod(tensor.get_shape()), tensor.get_dtype()
 
     def weight_map(self) -> dict[str, str]:
         """Which of the checkpoint's own files holds each tensor."""
@@ -92,6 +106,21 @@ class Checkpoint:
         return total
 
 
+#: safetensors' dtype names, as ModelPack's config names precisions
+PRECISIONS = {
+    "F64": "float64",
+    "F32": "float32",
+    "F16": "float16",
+    "BF16": "bfloat16",
+    "F8_E4M3": "float8_e4m3",
+    "F8_E5M2": "float8_e5m2",
+    "I64": "int64",
+    "I32": "int32",
+    "I16": "int16",
+    "I8": "int8",
+    "U8": "uint8",
+    "BOOL": "bool",
+}
 #: safetensors' dtype names, as torch's
 DTYPES = {
     "F64": torch.float64,
@@ -601,6 +630,11 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
     else:
         settings = json.loads((directory / "tokenizer_config.json").read_text())
         (out / "chat_template.jinja").write_text(settings["chat_template"])
+    # What the model holds: the tensors it runs, the vision encoder of a
+    # vision-language model's checkpoint not among them
+    used = {name for spec in [embed, *writer.blocks, head] for name in spec.tensors.values()}
+    infos = [checkpoint.info(name) for name in sorted(used)]
+    family = {"family": checkpoint.config["model_type"]} if checkpoint.config.get("model_type") else {}
     manifest = Manifest(
         hidden_size=cfg["hidden_size"],
         tokenizer={
@@ -612,7 +646,9 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
         embed=embed,
         blocks=writer.blocks,
         head=head,
-        source=(source or {}) | {"architecture": architecture} | model_license(directory),
+        source=(source or {}) | {"architecture": architecture} | family | model_license(directory),
+        parameters=sum(count for count, _ in infos),
+        precision=sorted({PRECISIONS.get(dtype, dtype.lower()) for _, dtype in infos}),
     )
     manifest.save(out)
     return manifest

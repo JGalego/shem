@@ -260,6 +260,17 @@ def test_imported_directories_are_checkpoints(imported):
     assert torch.equal(logits(loaded, tokens), logits(reference, tokens))
 
 
+def test_manifests_count_the_models_parameters(imported):
+    """The parameters and precision the manifest records, which a ModelPack
+    config publishes, are those of the tensors the model runs."""
+    name, reference, out, _ = imported
+    manifest = Manifest.load(out)
+    assert manifest.precision == ["float32"]
+    if name not in VLMS:
+        assert manifest.parameters == sum(p.numel() for p in reference.parameters())
+        assert manifest.source["family"] == reference.config.model_type
+
+
 def test_each_block_is_a_file_of_its_own_tensors(imported):
     _, _, out, _ = imported
     manifest = Manifest.load(out)

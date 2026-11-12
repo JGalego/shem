@@ -83,7 +83,8 @@ pub fn compile(name: &str, out: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Import `repo` at `revision` into `out`, as a manifest and weights files.
+/// Import `repo` at `revision` into `out`, as a manifest and weights files:
+/// a Hugging Face model, or a checkpoint's directory, by its full path.
 pub fn import(repo: &str, revision: Option<&str>, out: &Path) -> anyhow::Result<()> {
     let mut command = python("shem_neural.model.importers");
     command.arg(repo).arg(out);

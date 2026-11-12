@@ -10,8 +10,16 @@
 //! registry keeps the weights once for both. A raw layer is a file without
 //! a tar around it, which no image can use, so the twin wraps it in one.
 //!
+//! The other way, `export` publishes a model image as an artifact: the
+//! image's layers that hold the model's files, as they are, with a model
+//! config filled in from `shem.json`, and the image as the artifact's
+//! `subject`. Its files are where they are in the image, under `model/` for
+//! an imported model, and its layers are the image's blobs: compressed with
+//! zstd, which the spec allows and modctl 0.2 can't extract, unless written
+//! uncompressed, as new blobs.
+//!
 //! The spec names its media types and annotations `cncf`; modctl and older
-//! artifacts name them `cnai`. shem reads both.
+//! artifacts name them `cnai`. shem reads both, and writes the spec's.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -249,4 +257,264 @@ fn wrap(path: &str, mode: u32, data: &[u8]) -> anyhow::Result<Vec<u8>> {
     header.set_size(data.len() as u64);
     builder.append_data(&mut header, path, data)?;
     Ok(builder.into_inner()?)
+}
+
+/// The spec's names for what `export` writes.
+const ARTIFACT_TYPE: &str = "application/vnd.cncf.model.manifest.v1+json";
+const CONFIG_TYPE: &str = "application/vnd.cncf.model.config.v1+json";
+const FILEPATH: &str = "org.cncf.model.filepath";
+/// Top-level directories of an image that hold no model, wherever the model is.
+const NOT_MODEL: [&str; 17] = [
+    "compiled", ".shem", "usr", "bin", "sbin", "lib", "lib64", "etc", "opt", "var", "tmp", "home",
+    "root", "dev", "proc", "sys", "run",
+];
+
+/// Write the model of `image`, whose layout is `layout`, as a ModelPack
+/// artifact, in an OCI layout at `out` tagged `tag`: the image's layers
+/// whose files are all the model's, typed by what they hold, and a model
+/// config from the model's manifest, which the image's filesystem, unpacked
+/// at `root`, holds. Layers keep their blobs, unless `uncompressed`, which
+/// writes each as a plain tar. The image is the artifact's `subject`, so the
+/// layout holds it too, untagged, and a push sends both. Returns the
+/// artifact's manifest digest.
+pub fn export(
+    image: &Image,
+    layout: &Path,
+    root: &Path,
+    out: &Path,
+    tag: &str,
+    uncompressed: bool,
+) -> anyhow::Result<String> {
+    let subject = Image::layout_descriptor(layout)?;
+    let model = (image.config.model.as_deref())
+        .context("not a model image: it has no dev.shem.model")?
+        .trim_matches('/');
+    let manifest: Value = serde_json::from_slice(
+        &std::fs::read(root.join(model).join("shem.json"))
+            .context("reading the model's shem.json")?,
+    )?;
+    let index = manifest["weights"]
+        .as_str()
+        .context("the model's manifest is shem.model/v1: rebuild the image")?;
+    let weight_map: Value = serde_json::from_slice(&std::fs::read(root.join(model).join(index))?)?;
+    let mut needed: Vec<String> = vec!["shem.json".into(), index.into()];
+    needed.extend(
+        (weight_map["weight_map"].as_object().into_iter().flatten())
+            .filter_map(|(_, f)| f.as_str().map(String::from)),
+    );
+    for key in ["file", "chat_template"] {
+        needed.extend(manifest["tokenizer"][key].as_str().map(String::from));
+    }
+
+    let blobs = out.join("blobs/sha256");
+    std::fs::create_dir_all(&blobs)?;
+    // The image the artifact names as its subject, links to its blobs
+    for entry in std::fs::read_dir(layout.join("blobs/sha256"))? {
+        let entry = entry?;
+        let target = blobs.join(entry.file_name());
+        if std::fs::hard_link(entry.path(), &target).is_err() {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    let put = |data: &[u8]| -> anyhow::Result<(String, u64)> {
+        let digest = digest(data);
+        std::fs::write(blobs.join(&digest["sha256:".len()..]), data)?;
+        Ok((digest, data.len() as u64))
+    };
+    let mut layers = Vec::new();
+    let mut diff_ids = Vec::new();
+    let mut covered = Vec::new();
+    for layer in image.layers.iter().filter(|l| l.media_type == ROOTFS_TYPE) {
+        let Some(files) = model_files(&layer.data, model)? else {
+            continue;
+        };
+        let kind = if files.iter().all(|f| f.ends_with(".safetensors")) {
+            "weight"
+        } else if files.iter().all(|f| is_doc(f)) {
+            "doc"
+        } else {
+            "weight.config"
+        };
+        let (format, digest, size) = match &layer.stored {
+            Some(stored) if !uncompressed => {
+                let target = blobs.join(&stored.digest["sha256:".len()..]);
+                if !target.exists() && std::fs::hard_link(&stored.path, &target).is_err() {
+                    std::fs::copy(&stored.path, &target)?;
+                }
+                let format = match stored.media_type.rsplit_once('+') {
+                    Some((_, compression)) => format!("tar+{compression}"),
+                    None => "tar".into(),
+                };
+                (format, stored.digest.clone(), stored.size)
+            }
+            _ => {
+                let (digest, size) = put(&layer.data)?;
+                ("tar".into(), digest, size)
+            }
+        };
+        let mut annotations = BTreeMap::new();
+        if let [file] = files.as_slice() {
+            let path = Path::new(model).join(file);
+            annotations.insert(FILEPATH.into(), path.to_string_lossy().into_owned());
+        }
+        layers.push(Descriptor {
+            media_type: format!("application/vnd.cncf.model.{kind}.v1.{format}"),
+            digest,
+            size,
+            annotations,
+            platform: None,
+        });
+        diff_ids.push(super::digest(&layer.data));
+        covered.extend(files);
+    }
+    if let Some(missing) = needed.iter().find(|f| !covered.contains(f)) {
+        bail!(
+            "the model's {missing} shares a layer with files outside the model, so no artifact can hold it alone"
+        );
+    }
+
+    let config = model_config(&manifest, image, diff_ids);
+    let (config_digest, config_size) = put(&serde_json::to_vec(&config)?)?;
+    let artifact = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": MANIFEST_TYPE,
+        "artifactType": ARTIFACT_TYPE,
+        "config": {"mediaType": CONFIG_TYPE, "digest": config_digest, "size": config_size},
+        "layers": layers,
+        "subject": subject,
+    });
+    let (digest, size) = put(&serde_json::to_vec(&artifact)?)?;
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [{
+            "mediaType": MANIFEST_TYPE,
+            "artifactType": ARTIFACT_TYPE,
+            "digest": digest,
+            "size": size,
+            "annotations": {"org.opencontainers.image.ref.name": tag},
+        }],
+    });
+    std::fs::write(out.join("index.json"), serde_json::to_vec(&index)?)?;
+    std::fs::write(out.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#)?;
+    Ok(digest)
+}
+
+/// The regular files of a layer, by their paths in the model's directory
+/// `model`, if all of them are the model's; None if any is elsewhere, or
+/// the layer has no files.
+fn model_files(layer: &[u8], model: &str) -> anyhow::Result<Option<Vec<String>>> {
+    let mut files = Vec::new();
+    for entry in tar::Archive::new(layer).entries()? {
+        let entry = entry?;
+        let path = entry
+            .path()?
+            .to_string_lossy()
+            .trim_start_matches("./")
+            .to_string();
+        let path = path.trim_end_matches('/');
+        let inside = if model.is_empty() {
+            Some(path)
+        } else if path == model {
+            Some("")
+        } else {
+            path.strip_prefix(model)
+                .and_then(|rest| rest.strip_prefix('/'))
+        };
+        let Some(inside) = inside else {
+            return Ok(None);
+        };
+        let top = inside.split('/').next().unwrap_or_default();
+        if NOT_MODEL.contains(&top) {
+            return Ok(None);
+        }
+        if entry.header().entry_type().is_file() {
+            files.push(inside.to_string());
+        }
+    }
+    Ok((!files.is_empty()).then_some(files))
+}
+
+fn is_doc(file: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    ["LICENSE", "NOTICE", "README"]
+        .iter()
+        .any(|doc| name.starts_with(doc))
+}
+
+/// A model's parameter count as ModelPack writes sizes: a count with at
+/// most one decimal and a scale, such as `596m` or `1.5b`.
+pub fn param_size(count: u64) -> String {
+    let scales = [(1e12, "t"), (1e9, "b"), (1e6, "m"), (1e3, "k")];
+    let (scale, suffix) = scales
+        .into_iter()
+        .find(|(scale, _)| count as f64 >= *scale)
+        .unwrap_or((1.0, ""));
+    let value = format!("{:.1}", count as f64 / scale);
+    format!("{}{suffix}", value.trim_end_matches(".0"))
+}
+
+/// The ModelPack config for a model, from its manifest's `source`,
+/// `parameters` and `precision`, and the image's labels.
+fn model_config(manifest: &Value, image: &Image, diff_ids: Vec<String>) -> Value {
+    let source = &manifest["source"];
+    let repo = source["repo"].as_str();
+    let labels = &image.config.labels;
+    let label = |key: &str| {
+        labels
+            .get(&format!("org.opencontainers.image.{key}"))
+            .cloned()
+    };
+    let mut descriptor = serde_json::Map::new();
+    let mut set = |key: &str, value: Option<String>| {
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            descriptor.insert(key.into(), value.into());
+        }
+    };
+    let name = repo
+        .and_then(|r| r.rsplit('/').next())
+        .map(String::from)
+        .or(label("title"));
+    set("name", name);
+    set("family", source["family"].as_str().map(String::from));
+    set(
+        "vendor",
+        repo.and_then(|r| r.split_once('/'))
+            .map(|(org, _)| org.to_string())
+            .or(label("vendor")),
+    );
+    set(
+        "revision",
+        source["revision"]
+            .as_str()
+            .map(String::from)
+            .or(label("revision")),
+    );
+    let url = repo.map(|r| format!("https://huggingface.co/{r}"));
+    set("sourceURL", url.clone().or(label("source")));
+    set("docURL", url.or(label("documentation")));
+    set("description", label("description"));
+    set("version", label("version"));
+    let licenses = (source["spdx"].as_str().map(String::from)).or(label("licenses"));
+    if let Some(licenses) = licenses {
+        descriptor.insert("licenses".into(), serde_json::json!([licenses]));
+    }
+    let mut config = serde_json::json!({
+        "architecture": "transformer",
+        "format": "safetensors",
+        "capabilities": {"inputTypes": ["text"], "outputTypes": ["text"]},
+    });
+    if let Some(count) = manifest["parameters"].as_u64() {
+        config["paramSize"] = param_size(count).into();
+    }
+    let precision: Vec<&str> = (manifest["precision"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect();
+    if !precision.is_empty() {
+        config["precision"] = precision.join(",").into();
+    }
+    serde_json::json!({
+        "descriptor": descriptor,
+        "config": config,
+        "modelfs": {"type": "layers", "diffIds": diff_ids},
+    })
 }

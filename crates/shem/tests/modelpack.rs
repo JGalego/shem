@@ -342,3 +342,176 @@ fn artifacts_pull_as_twins_that_push_beside_them() {
     assert_eq!(layer_digests(&manifest)[..blobs.len()], blobs[..]);
     assert_eq!(manifest["subject"]["digest"], artifact.as_str());
 }
+
+/// A context holding a copy of the checkpoint, as `ckpt`, and a model image
+/// built `FROM` it, which imports it as `hf.co/` imports a model: its layout
+/// directory, and the image.
+fn checkpoint_image(home: &Path) -> (tempfile::TempDir, PathBuf, shem::image::Image) {
+    let context = tempfile::tempdir().unwrap();
+    let ckpt = context.path().join("ckpt");
+    std::fs::create_dir(&ckpt).unwrap();
+    for entry in std::fs::read_dir(checkpoint()).unwrap() {
+        let path = entry.unwrap().path();
+        std::fs::copy(&path, ckpt.join(path.file_name().unwrap())).unwrap();
+    }
+    let shemfile = "FROM ckpt\nENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"8\"]\n";
+    std::fs::write(context.path().join("Shemfile"), shemfile).unwrap();
+    let out = home.join("image");
+    let args = [
+        "build",
+        "-o",
+        out.to_str().unwrap(),
+        context.path().to_str().unwrap(),
+    ];
+    ok(shem(home, &args));
+    let image = shem::image::Image::read_layout(&out).unwrap();
+    (context, out, image)
+}
+
+/// Export the image in the layout `dir` as a ModelPack artifact in `out`.
+fn export(dir: &Path, image: &shem::image::Image, out: &Path, uncompressed: bool) -> String {
+    let root = tempfile::tempdir().unwrap();
+    image.unpack_rootfs(root.path()).unwrap();
+    shem::image::modelpack::export(image, dir, root.path(), out, "latest", uncompressed).unwrap()
+}
+
+/// The files an artifact's tar layers hold, unpacked into `dest`, as modctl
+/// extracts them or a runtime mounts them.
+fn extract(artifact: &Path, dest: &Path) {
+    let (manifest, _) = read_image(artifact);
+    for layer in manifest["layers"].as_array().unwrap() {
+        let digest = layer["digest"].as_str().unwrap();
+        let blob = std::fs::read(artifact.join("blobs/sha256").join(&digest[7..])).unwrap();
+        let tar = match layer["mediaType"].as_str().unwrap() {
+            t if t.ends_with("+zstd") => zstd::decode_all(&blob[..]).unwrap(),
+            _ => blob,
+        };
+        shem::image::unpack(&tar, dest).unwrap();
+    }
+}
+
+/// Whether transformers gives the same logits for the checkpoint at `dir`
+/// as for the original.
+fn loads_as_the_checkpoint(dir: &Path) -> bool {
+    let script = r#"
+import sys, torch, transformers
+tokens = torch.arange(3, 12)[None, :]
+logits = lambda path: transformers.AutoModelForCausalLM.from_pretrained(path).eval()(input_ids=tokens).logits
+print(torch.equal(logits(sys.argv[1]), logits(sys.argv[2])))
+"#;
+    let out = python(&[
+        "-c",
+        script,
+        dir.to_str().unwrap(),
+        checkpoint().to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim() == "True"
+}
+
+#[test]
+#[ignore = "needs uv and the neural package's dev dependencies"]
+fn images_publish_as_artifacts_whose_layers_are_their_own() {
+    let home = tempfile::tempdir().unwrap();
+    let (_context, dir, image) = checkpoint_image(home.path());
+    let (image_manifest, _) = read_image(&dir);
+    let shared = home.path().join("shared");
+    export(&dir, &image, &shared, false);
+
+    let (manifest, config) = read_image(&shared);
+    assert_eq!(
+        manifest["artifactType"],
+        "application/vnd.cncf.model.manifest.v1+json"
+    );
+    assert_eq!(
+        layer_digests(&manifest),
+        layer_digests(&image_manifest),
+        "the image's own blobs"
+    );
+    assert_eq!(
+        manifest["subject"]["digest"],
+        shem::image::Image::layout_digest(&dir).unwrap().as_str()
+    );
+    let types: Vec<&str> = manifest["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["mediaType"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types[0],
+        "application/vnd.cncf.model.weight.config.v1.tar+zstd"
+    );
+    assert!(
+        types[1..]
+            .iter()
+            .all(|t| *t == "application/vnd.cncf.model.weight.v1.tar+zstd"),
+        "{types:?}"
+    );
+    assert_eq!(config["descriptor"]["family"], "llama");
+    assert_eq!(config["config"]["format"], "safetensors");
+    assert_eq!(config["config"]["precision"], "float32");
+    // 64 × 32 embeddings and head, 2 layers of 4 × 32 × 32 attention and 3 × 32 × 48 MLP, 5 norms of 32
+    let parameters = 2 * 64 * 32 + 2 * (2 * 32 * 32 + 2 * 16 * 32 + 3 * 32 * 48) + 5 * 32;
+    assert_eq!(
+        config["config"]["paramSize"],
+        shem::image::modelpack::param_size(parameters)
+    );
+
+    let plain = home.path().join("plain");
+    export(&dir, &image, &plain, true);
+    let (plain_manifest, plain_config) = read_image(&plain);
+    assert!(
+        plain_manifest["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|l| l["mediaType"].as_str().unwrap().ends_with(".v1.tar"))
+    );
+    assert_eq!(
+        plain_config["modelfs"], config["modelfs"],
+        "the same tars, uncompressed"
+    );
+
+    for artifact in [&shared, &plain] {
+        let files = tempfile::tempdir().unwrap();
+        extract(artifact, files.path());
+        assert!(loads_as_the_checkpoint(&files.path().join("model")));
+    }
+
+    // And back: the artifact is a base like any other, whose twin replies as the image does
+    let context = tempfile::tempdir().unwrap();
+    std::fs::rename(&shared, context.path().join("artifact")).unwrap();
+    let shemfile = "FROM artifact\nENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"8\"]\n";
+    let (_, reply, _) = build_and_run(context.path(), shemfile, home.path());
+    assert_eq!(reply, reference(&["--max-tokens", "8"]));
+}
+
+#[test]
+#[ignore = "needs uv, oras and a registry: set SHEM_TEST_REGISTRY"]
+fn images_push_as_artifacts_that_run_as_twins() {
+    let registry = std::env::var("SHEM_TEST_REGISTRY").unwrap_or_else(|_| "localhost:5000".into());
+    let home = tempfile::tempdir().unwrap();
+    let (_context, dir, _) = checkpoint_image(home.path());
+    let remote = format!("{registry}/shem-tests/tiny-llama:exported");
+    ok(shem(
+        home.path(),
+        &[
+            "push",
+            "--plain-http",
+            "--modelpack",
+            dir.to_str().unwrap(),
+            &remote,
+        ],
+    ));
+    let mut args = vec!["run", remote.as_str()];
+    args.extend(PROMPT);
+    // The twin of the artifact runs the model with the driver's defaults: an
+    // artifact carries the model, not the image's entrypoint
+    let fresh = tempfile::tempdir().unwrap();
+    assert_eq!(ok(shem(fresh.path(), &args)), reference(&[]));
+}

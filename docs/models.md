@@ -19,7 +19,7 @@ ENTRYPOINT ["shem:generate", "--max-tokens", "128"]
 CMD ["Introduce yourself in one sentence."]
 ```
 
-`FROM hf.co/ORG/NAME[:REVISION]` imports a Hugging Face checkpoint. The base sets `ENTRYPOINT ["shem:generate"]`, the way `FROM python` brings `python3`, and an image can override it with options.
+`FROM hf.co/ORG/NAME[:REVISION]` imports a Hugging Face checkpoint, and `FROM DIR` imports one from a directory in the build context, such as one `huggingface-cli download --local-dir` writes. The base sets `ENTRYPOINT ["shem:generate"]`, the way `FROM python` brings `python3`, and an image can override it with options.
 
 ENTRYPOINT and CMD keep their Docker meanings: the entrypoint is what runs, and CMD is its default input, which `shem run` arguments replace.
 
@@ -111,7 +111,20 @@ WARM --until=prompt
 - **Both namespaces.** shem reads the spec's media types and annotations (`vnd.cncf.model`, `org.cncf.model`) and the older ones modctl 0.2 still writes (`vnd.cnai.model`, `org.cnai.model`).
 - **`docker build` builds on a twin**, like on any image, but not on an artifact itself, which BuildKit refuses: pull the artifact with shem and push its twin first.
 
-[`tests/modelpack.rs`](../crates/shem/tests/modelpack.rs) packs a tiny checkpoint as modctl does, in tar and raw layers. It checks that the twin keeps the artifact's blobs, replies as the checkpoint does, primes a session with `WARM`, and round-trips through a registry. Artifacts that modctl 0.2.2 builds, in both formats, run the same way.
+### Publishing an image as an artifact
+
+```sh
+shem push --modelpack qwen3 registry.example.com/team/qwen3:modelpack
+shem push --modelpack --uncompressed qwen3 registry.example.com/team/qwen3:modelpack-tar
+```
+
+`--modelpack` publishes a model image's model as a ModelPack artifact: the image's layers that hold the model's files, and a model config filled in from `shem.json` (name, family, vendor, revision, licences, source, parameter count and precision). The image is the artifact's `subject` and is pushed with it, so a registry lists the artifact among the image's referrers (`oras discover`).
+
+- **The layers are the image's own blobs**, so the artifact takes no room of its own in a registry. They're compressed with zstd, which ModelPack allows but modctl 0.2 can't extract, and the spec recommends uncompressed weights for runtimes that mount them. `--uncompressed` writes plain tars instead, as new blobs, which modctl pulls and extracts.
+- **The files keep their paths in the image**, under `model/` for an imported model. Those files are a Hugging Face checkpoint sharded by block, so transformers loads `model/` from an extracted artifact. A twin's files are at the root.
+- **Only the model goes in.** A layer goes into the artifact if it holds nothing but the model's files: the image's tools, compiled layers and session state stay out.
+
+[`tests/modelpack.rs`](../crates/shem/tests/modelpack.rs) packs a tiny checkpoint as modctl does, in tar and raw layers. It checks that the twin keeps the artifact's blobs, replies as the checkpoint does, primes a session with `WARM`, and round-trips through a registry. The other way, it checks that an image publishes as an artifact over its own blobs, that the artifact's files load in transformers with the checkpoint's logits, and that the artifact runs again as a twin. Artifacts that modctl 0.2.2 builds, in both formats, run the same way. modctl 0.2.2 also pulls and extracts an `--uncompressed` artifact that shem publishes, and transformers loads what it extracts with the checkpoint's logits.
 
 ## Sessions under Docker
 

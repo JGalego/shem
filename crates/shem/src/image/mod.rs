@@ -522,13 +522,19 @@ impl Image {
 
     /// The manifest digest of the image's layout in `dir`.
     pub fn layout_digest(dir: &Path) -> anyhow::Result<String> {
+        Ok(Self::layout_descriptor(dir)?.digest)
+    }
+
+    /// The descriptor of the manifest (or index) the layout in `dir` holds,
+    /// as another manifest's `subject` names it.
+    pub fn layout_descriptor(dir: &Path) -> anyhow::Result<Descriptor> {
         let index: Index = serde_json::from_slice(&std::fs::read(dir.join("index.json"))?)?;
-        Ok(index
-            .manifests
-            .first()
-            .context("no manifest")?
-            .digest
-            .clone())
+        let entry = index.manifests.into_iter().next().context("no manifest")?;
+        Ok(Descriptor {
+            annotations: BTreeMap::new(),
+            platform: None,
+            ..entry
+        })
     }
 }
 

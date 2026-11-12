@@ -78,13 +78,13 @@ riscv32
 
 ## Stages
 
-The last stage is the image. With `shem build`, it must start from `scratch`, a Hugging Face model (`hf.co/ORG/NAME[:REVISION]`), or a shem image or a [ModelPack artifact](models.md#modelpack-artifacts), either in a registry (pulled into the store the first time) or as an OCI layout directory relative to the build context. Other stages supply files through `COPY --from`; ordinary Docker stages are built only when their files are needed.
+The last stage is the image. With `shem build`, it must start from `scratch`, a Hugging Face model (`hf.co/ORG/NAME[:REVISION]`) or checkpoint directory, or a shem image or a [ModelPack artifact](models.md#modelpack-artifacts), either in a registry (pulled into the store the first time) or as an OCI layout directory relative to the build context. Other stages supply files through `COPY --from`; ordinary Docker stages are built only when their files are needed.
 
 ## Instructions
 
 | Instruction | In a shem stage |
 |---|---|
-| `FROM` | `scratch`, a Hugging Face model ([models.md](models.md)), or a shem image or a ModelPack artifact ([models.md](models.md#modelpack-artifacts)), in a registry or a layout directory |
+| `FROM` | `scratch`, a Hugging Face model or checkpoint directory ([models.md](models.md)), or a shem image or a ModelPack artifact ([models.md](models.md#modelpack-artifacts)), in a registry or a layout directory |
 | `COPY --from=shem:rv32im src dest` | Copies a compiled layer, which shem compiles at build time: the RV32IM CPU, for a model's tools ([models.md](models.md#compiled-layers-and-tools)) |
 | `COPY [--from=stage] src... dest` | As in Docker: a directory's contents are copied into `dest`; a file goes to `dest`, or into it when `dest` ends in `/` or there are several sources. Each `COPY` is one layer. Sources must stay inside the context. |
 | `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`, `ARG`, `LABEL` | As in Docker, including shell and exec forms, and `$NAME` and `${NAME}` substitution from `ARG` and `ENV` |

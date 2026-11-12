@@ -145,8 +145,16 @@ struct PushArgs {
     plain_http: bool,
     /// Also list the image under these platforms, such as linux/amd64, for
     /// runtimes that pick images by the host's platform (see docs/kubernetes.md)
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', conflicts_with = "modelpack")]
     platform: Vec<String>,
+    /// Push a model image's model as a ModelPack artifact, whose layers are
+    /// the image's own and whose subject is the image (see docs/models.md)
+    #[arg(long)]
+    modelpack: bool,
+    /// With --modelpack, write the layers as plain tars, as the spec
+    /// recommends and modctl 0.2 needs, instead of sharing the image's blobs
+    #[arg(long, requires = "modelpack")]
+    uncompressed: bool,
     /// The image: name[:tag] in the store, or an OCI layout directory
     image: String,
     /// Where to push it, such as ghcr.io/me/app:1.0
@@ -499,7 +507,15 @@ fn image_dir(target: &str) -> anyhow::Result<PathBuf> {
 
 fn push(args: PushArgs) -> anyhow::Result<u8> {
     let staged = tempfile::tempdir()?;
-    let dir = if args.platform.is_empty() {
+    let dir = if args.modelpack {
+        let dir = image_dir(&args.image)?;
+        let image = Image::read_layout(&dir)?;
+        let root = Store::open()?.rootfs(&image, &Image::layout_digest(&dir)?)?;
+        let (_, tag) = image::parse_reference(&args.remote)?;
+        let out = staged.path().join("artifact");
+        image::modelpack::export(&image, &dir, &root, &out, tag, args.uncompressed)?;
+        out
+    } else if args.platform.is_empty() {
         image_dir(&args.image)?
     } else {
         let (_, tag) = image::parse_reference(&args.remote)?;
