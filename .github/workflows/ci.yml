@@ -206,8 +206,10 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
-          key: huggingface-qwen3-0.6b-qwen3.5-0.8b
-      - name: Import Qwen3 and Qwen3.5, compare them with transformers, and resume saved sessions
+          # The checkpoints are the ones the tests list
+          key: huggingface-${{ hashFiles('neural/tests/test_model.py') }}
+          restore-keys: huggingface-
+      - name: Import checkpoints, compare them and their configs with transformers, and resume saved sessions
         run: uv run --project neural pytest -q neural/tests/test_model.py
         env:
           SHEM_MODEL_TESTS: "1"

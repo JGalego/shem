@@ -1,15 +1,17 @@
 """Residual blocks and model loading.
 
-Blocks use pre-norm and add their output to the residual stream. State is
-caller-owned, one entry per block per session:
+Blocks add their output to the residual stream. State is caller-owned, one
+entry per block per session:
 
 - `attention`: key/value caches, growing with the token count.
 - `gated_deltanet`: fixed-size convolution history and matrix memory.
-- `mlp`: stateless SwiGLU.
+- `mlp`: stateless gated feed-forward (SwiGLU or GeGLU).
 
+An attention or MLP block normalises its input when it has a `norm` and its
+output when it has a `post_norm`: Llama has the first, OLMo 2 the second and
+Gemma both. A projection `x` adds its bias `x_bias` when the block has one.
 RMSNorm's weight offset is 0 for ordinary weights and 1 for zero-centred
-weights. A projection `x` adds its bias `x_bias` when the block has one.
-Computation defaults to float32; CUDA execution disables TF32.
+weights. Computation defaults to float32; CUDA execution disables TF32.
 """
 
 import math
@@ -37,30 +39,56 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 
-def rope_frequencies(p: dict, device: torch.device) -> torch.Tensor:
-    """The rotary frequencies of an attention block: one per pair of its
-    first `rotary_dim` dimensions, stretched as its `rope_scaling` says.
-    `linear` divides them all by the factor; `llama3` divides only the slow
-    ones, those whose wavelength is longer than the context the model was
-    trained on, and blends between the two around it."""
+def rope_frequencies(p: dict, device: torch.device, end: int) -> tuple[torch.Tensor, float]:
+    """The rotary frequencies of an attention block, one per pair of its
+    first `rotary_dim` dimensions, for a pass whose last position is
+    `end - 1`, and the factor its cosines and sines are scaled by.
+
+    `rope_scaling` stretches them for contexts longer than the model was
+    trained on: `linear` divides them all by the factor; `llama3` divides
+    only the slow ones and blends around them; `yarn` blends the same way by
+    dimension; `longrope` multiplies each wavelength by a factor of its own,
+    from a long list once a pass reaches past the original context and a
+    short list before."""
     rotary = p.get("rotary_dim", p["head_dim"])
-    inv_freq = 1.0 / (p["rope_theta"] ** (torch.arange(0, rotary, 2, device=device).float() / rotary))
+    theta = p["rope_theta"]
+    exponents = torch.arange(0, rotary, 2, device=device).float() / rotary
+    inv_freq = 1.0 / (theta**exponents)
     scaling = p.get("rope_scaling")
     if scaling is None:
-        return inv_freq
-    factor = scaling["factor"]
-    if scaling["type"] == "linear":
-        return inv_freq / factor
-    if scaling["type"] == "llama3":
-        context = scaling["original_max_position_embeddings"]
-        low, high = scaling["low_freq_factor"], scaling["high_freq_factor"]
+        return inv_freq, 1.0
+    kind, context = scaling["type"], scaling.get("original_max_position_embeddings")
+    if kind == "linear":
+        return inv_freq / scaling["factor"], 1.0
+    if kind == "llama3":
+        factor, low, high = scaling["factor"], scaling["low_freq_factor"], scaling["high_freq_factor"]
         wavelength = 2 * math.pi / inv_freq
         scaled = torch.where(wavelength > context / low, inv_freq / factor, inv_freq)
         smooth = (context / wavelength - low) / (high - low)
         blended = (1 - smooth) * scaled / factor + smooth * scaled
         between = (wavelength >= context / high) & (wavelength <= context / low)
-        return torch.where(between, blended, scaled)
-    raise ValueError(f"unknown RoPE scaling {scaling['type']!r}")
+        return torch.where(between, blended, scaled), 1.0
+    if kind == "yarn":
+
+        def dimension(rotations):
+            return rotary * math.log(context / (rotations * 2 * math.pi)) / (2 * math.log(theta))
+
+        low, high = dimension(scaling["beta_fast"]), dimension(scaling["beta_slow"])
+        if scaling.get("truncate", True):
+            low, high = math.floor(low), math.ceil(high)
+        low, high = max(low, 0), min(high, rotary - 1)
+        if low == high:
+            high += 0.001
+        ramp = ((torch.arange(rotary // 2, dtype=torch.float32, device=device) - low) / (high - low)).clamp(0, 1)
+        positions = theta**exponents
+        extrapolated = 1 - ramp
+        inv_freq = (1.0 / (scaling["factor"] * positions)) * (1 - extrapolated) + (1.0 / positions) * extrapolated
+        return inv_freq, scaling["attention_factor"]
+    if kind == "longrope":
+        factors = scaling["long_factor"] if end > context else scaling["short_factor"]
+        factors = torch.tensor(factors, dtype=torch.float32, device=device)
+        return 1.0 / (factors * theta**exponents), scaling["attention_factor"]
+    raise ValueError(f"unknown RoPE scaling {kind!r}")
 
 
 def project(h: torch.Tensor, t: dict, name: str) -> torch.Tensor:
@@ -68,6 +96,19 @@ def project(h: torch.Tensor, t: dict, name: str) -> torch.Tensor:
     out = h @ t[name].T
     bias = t.get(f"{name}_bias")
     return out if bias is None else out + bias
+
+
+def softcap(x: torch.Tensor, cap: float | None) -> torch.Tensor:
+    """`x` squashed smoothly into (-cap, cap), as Gemma 2 bounds its scores."""
+    return x if not cap else torch.tanh(x / cap) * cap
+
+
+#: The gates of `mlp` blocks: SwiGLU's SiLU, and GeGLU's GELU, exact or tanh-approximated
+ACTIVATIONS = {
+    "silu": F.silu,
+    "gelu": F.gelu,
+    "gelu_tanh": lambda x: F.gelu(x, approximate="tanh"),
+}
 
 
 class Block:
@@ -95,33 +136,45 @@ class Attention(Block):
         batch, length, _ = x.shape
         heads, kv_heads, head_dim = p["heads"], p["kv_heads"], p["head_dim"]
         offset, eps = p.get("norm_offset", 0.0), p["eps"]
-        h = rmsnorm(x, t["norm"], eps, offset)
+        h = rmsnorm(x, t["norm"], eps, offset) if "norm" in t else x
 
-        q = project(h, t, "q")
         gate = None
-        if p.get("output_gate"):
-            q, gate = q.view(batch, length, heads, 2 * head_dim).chunk(2, dim=-1)
-            gate = gate.reshape(batch, length, heads * head_dim)
+        if "qkv" in t:
+            # One projection for queries, keys and values together (Phi-3)
+            sizes = [heads * head_dim, kv_heads * head_dim, kv_heads * head_dim]
+            q, k, v = project(h, t, "qkv").split(sizes, dim=-1)
+        else:
+            q, k, v = project(h, t, "q"), project(h, t, "k"), project(h, t, "v")
+            if p.get("output_gate"):
+                q, gate = q.view(batch, length, heads, 2 * head_dim).chunk(2, dim=-1)
+                gate = gate.reshape(batch, length, heads * head_dim)
+        per_head = p.get("qk_norm", "head") == "head"
+        if "q_norm" in t and not per_head:
+            # Norms over every head's queries and keys at once (OLMo 2)
+            q, k = rmsnorm(q, t["q_norm"], eps, offset), rmsnorm(k, t["k_norm"], eps, offset)
         q = q.reshape(batch, length, heads, head_dim)
-        k = project(h, t, "k").view(batch, length, kv_heads, head_dim)
-        v = project(h, t, "v").view(batch, length, kv_heads, head_dim)
-        if "q_norm" in t:
-            q = rmsnorm(q, t["q_norm"], eps, offset)
-            k = rmsnorm(k, t["k_norm"], eps, offset)
+        k = k.reshape(batch, length, kv_heads, head_dim)
+        v = v.reshape(batch, length, kv_heads, head_dim)
+        if "q_norm" in t and per_head:
+            q, k = rmsnorm(q, t["q_norm"], eps, offset), rmsnorm(k, t["k_norm"], eps, offset)
 
-        # Rotary positions on the first `rotary_dim` dimensions of each head
+        # Rotary positions on the first `rotary_dim` dimensions of each head,
+        # if any: a block with none has no positions but the mask (SmolLM3)
         rotary = p.get("rotary_dim", head_dim)
-        positions = torch.arange(start, start + length, dtype=torch.float32, device=x.device)
-        freqs = positions[:, None] * rope_frequencies(p, x.device)
-        angles = torch.cat((freqs, freqs), dim=-1)
-        cos, sin = angles.cos().to(x.dtype)[:, None, :], angles.sin().to(x.dtype)[:, None, :]
+        if rotary:
+            inv_freq, scale = rope_frequencies(p, x.device, start + length)
+            positions = torch.arange(start, start + length, dtype=torch.float32, device=x.device)
+            freqs = positions[:, None] * inv_freq
+            angles = torch.cat((freqs, freqs), dim=-1)
+            cos = (angles.cos() * scale).to(x.dtype)[:, None, :]
+            sin = (angles.sin() * scale).to(x.dtype)[:, None, :]
 
-        def rope(z):
-            turned = z[..., :rotary] * cos + rotate_half(z[..., :rotary]) * sin
-            return torch.cat((turned, z[..., rotary:]), dim=-1)
+            def rope(z):
+                turned = z[..., :rotary] * cos + rotate_half(z[..., :rotary]) * sin
+                return torch.cat((turned, z[..., rotary:]), dim=-1)
 
-        q, k = rope(q).transpose(1, 2), rope(k).transpose(1, 2)
-        v = v.transpose(1, 2)
+            q, k = rope(q), rope(k)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         if "k" in state:
             k = torch.cat((state["k"], k), dim=2)
             v = torch.cat((state["v"], v), dim=2)
@@ -130,7 +183,7 @@ class Attention(Block):
         group = heads // kv_heads
         k = k.repeat_interleave(group, dim=1)
         v = v.repeat_interleave(group, dim=1)
-        scores = (q @ k.transpose(2, 3)) * head_dim**-0.5
+        scores = softcap((q @ k.transpose(2, 3)) * p.get("scale", head_dim**-0.5), p.get("softcap"))
         total = k.shape[2]
         # Each query sees the keys up to its own, or with a sliding window,
         # only the last `sliding_window` of them
@@ -143,7 +196,10 @@ class Attention(Block):
         out = (scores.softmax(-1) @ v).transpose(1, 2).reshape(batch, length, heads * head_dim)
         if gate is not None:
             out = out * torch.sigmoid(gate)
-        return x + project(out, t, "o")
+        out = project(out, t, "o")
+        if "post_norm" in t:
+            out = rmsnorm(out, t["post_norm"], eps, offset)
+        return x + out
 
 
 class GatedDeltaNet(Block):
@@ -200,9 +256,18 @@ class GatedDeltaNet(Block):
 
 class MLP(Block):
     def forward(self, x, state, start):
-        t = self.t
-        h = rmsnorm(x, t["norm"], self.p["eps"], self.p.get("norm_offset", 0.0))
-        return x + project(F.silu(project(h, t, "gate")) * project(h, t, "up"), t, "down")
+        p, t = self.p, self.t
+        offset, eps = p.get("norm_offset", 0.0), p["eps"]
+        h = rmsnorm(x, t["norm"], eps, offset) if "norm" in t else x
+        if "gate_up" in t:
+            # One projection for the gate and the values together (Phi-3)
+            gate, up = project(h, t, "gate_up").chunk(2, dim=-1)
+        else:
+            gate, up = project(h, t, "gate"), project(h, t, "up")
+        out = project(ACTIVATIONS[p.get("activation", "silu")](gate) * up, t, "down")
+        if "post_norm" in t:
+            out = rmsnorm(out, t["post_norm"], eps, offset)
+        return x + out
 
 
 BLOCKS: dict[str, type[Block]] = {
@@ -252,6 +317,8 @@ class Model:
             return {name: tensor.to(dtype) for name, tensor in loaded.items()}
 
         self.embed = tensors(m.embed)["weight"]
+        #: What embeddings are multiplied by before the first block: Gemma's square root of the width
+        self.embed_scale = m.embed.params.get("scale")
         self.blocks: list[Block] = []
         for spec in m.blocks:
             if spec.type not in BLOCKS:
@@ -270,7 +337,10 @@ class Model:
         """Next-token logits (batch, tokens, vocabulary) for `tokens`, which
         continue a session at position `start` whose blocks' state is `state`."""
         x = self.embed[tokens.to(self.device)]
+        if self.embed_scale:
+            x = x * self.embed_scale
         for block, block_state in zip(self.blocks, state, strict=True):
             x = block.forward(x, block_state, start)
         p = self.head_params
-        return rmsnorm(x, self.head_norm, p["eps"], p.get("norm_offset", 0.0)) @ self.head_weight.T
+        logits = rmsnorm(x, self.head_norm, p["eps"], p.get("norm_offset", 0.0)) @ self.head_weight.T
+        return softcap(logits, p.get("softcap"))

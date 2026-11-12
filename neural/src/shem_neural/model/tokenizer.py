@@ -24,6 +24,8 @@ class Tokenizer:
         env.globals["strftime_now"] = lambda fmt: datetime(2026, 1, 1).strftime(fmt)  # the guest's virtual clock
         self.template = env.from_string((directory / spec["chat_template"]).read_text())
         self.eos = set(spec["eos"])
+        #: The special tokens the template sees, such as `bos_token`
+        self.special = spec.get("special", {})
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> list[int]:
         """The tokens of `messages`, ready for the assistant's reply."""
@@ -33,7 +35,7 @@ class Tokenizer:
         """The text of `messages` in the chat template, offering `tools`, and
         with `reply`, ready for the assistant's reply."""
         return self.template.render(
-            messages=messages, tools=tools or None, add_generation_prompt=reply, enable_thinking=False
+            messages=messages, tools=tools or None, add_generation_prompt=reply, enable_thinking=False, **self.special
         )
 
     def stop_texts(self) -> list[str]:
