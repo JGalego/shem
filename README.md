@@ -17,7 +17,7 @@ shem treats the host as a hypervisor and a model as the machine. The model suppl
 
 The project is experimental. Current features include:
 
-- **Model images.** Import Llama, Mistral, Qwen, Gemma, Phi, OLMo, SmolLM, Granite and Mamba checkpoints, and mixtures of experts, from Hugging Face, checkpoint directories or GGUF files, run text-generation sessions on a CPU or GPU, save primed sessions with `WARM`, and publish sessions as artifacts linked to their models. Models can call RV32 programs as tools on a compiled CPU layer ([models](docs/models.md)).
+- **Model images.** Import Llama, Mistral, Qwen, Gemma, Phi, OLMo, SmolLM, Granite and Mamba checkpoints, and mixtures of experts, from Hugging Face, checkpoint directories or GGUF files (compared with transformers up to Qwen3-30B-A3B and Mixtral-8x7B), run text-generation sessions on a CPU or GPU, save primed sessions with `WARM`, and publish sessions as artifacts linked to their models. Models can call RV32 programs as tools on a compiled CPU layer ([models](docs/models.md)).
 - **Containers.** Run static musl programs and [🧰 BusyBox](https://busybox.net) with a root filesystem, processes, threads, pipes, signals, file mappings and a virtual clock. `shem run` supports host terminals; `--trace` prints system calls.
 - **Images.** Build OCI images with `shem build` or the BuildKit frontend. `WARM` saves guest state at build time; `shem run` resumes it. Push and pull images through OCI registries, run [ModelPack](https://github.com/modelpack/model-spec) artifacts as image twins that share their weights' blobs, and publish model images as ModelPack artifacts ([Shemfile](docs/shemfile.md), [models](docs/models.md#modelpack-artifacts)).
 - **VMs.** Boot no-MMU [🐧 Linux](https://kernel.org) 6.8 with `shem boot`, or resume a booted VM image on either vCPU ([VM mode](docs/vm.md)).
@@ -49,7 +49,7 @@ On another machine with shem installed:
 shem run ghcr.io/your-user/qwen3:0.6b "Say hi in Portuguese"
 ```
 
-[`examples/qwen3.5`](examples/qwen3.5/Shemfile) builds Qwen3.5-0.8B, whose Gated DeltaNet layers keep a fixed-size memory in place of a growing cache. [docs/models.md](docs/models.md) explains model images, and the `shem` CLI also runs RV32 programs and Linux ([docs/shemfile.md](docs/shemfile.md), [docs/vm.md](docs/vm.md)).
+[`examples/qwen3.5`](examples/qwen3.5/Shemfile) builds Qwen3.5-0.8B, whose Gated DeltaNet layers keep a fixed-size memory in place of a growing cache. [`examples/`](examples/README.md) has more: SmolLM2, a Granite mixture of experts, Mamba, Llama from a GGUF file and Gemma, an assistant that reads a handbook at build time, and a model's round trip between ModelPack and shem. [docs/models.md](docs/models.md) explains model images, and the `shem` CLI also runs RV32 programs and Linux ([docs/shemfile.md](docs/shemfile.md), [docs/vm.md](docs/vm.md)).
 
 ### With Docker
 
@@ -63,7 +63,7 @@ FROM hf.co/Qwen/Qwen3-0.6B
 CMD ["Introduce yourself in one sentence."]
 ```
 
-There are also Dockerfiles for [Qwen3.5](examples/qwen3.5/Dockerfile) and a [primed golem session](examples/golem/Dockerfile). [Install the containerd shim](docs/containerd.md#with-docker) and [start the model server](docs/models.md#sessions-under-docker). Replace `your-user` with your registry namespace:
+Every model example has a Dockerfile too, such as [Qwen3.5](examples/qwen3.5/Dockerfile)'s and a [primed golem session](examples/golem/Dockerfile)'s. [Install the containerd shim](docs/containerd.md#with-docker) and [start the model server](docs/models.md#sessions-under-docker). Replace `your-user` with your registry namespace:
 
 ```sh
 image=ghcr.io/your-user/qwen3:0.6b
@@ -158,7 +158,7 @@ neural/         the neural vCPU: ISA table, weight compiler, network, executors,
   jobs/gpu.py    GPU differential test and benchmark, for Hugging Face Jobs
 toolchain/      the guest toolchain image and the riscv-tests environment
 guests/         C guest programs
-examples/       example Shemfiles
+examples/       example Shemfiles and Dockerfiles: models, use cases, programs and VMs
 docs/
   architecture.md  design, tech stack and roadmap
   neural.md        how the neural vCPU works, and its protocol

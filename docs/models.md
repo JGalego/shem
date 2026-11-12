@@ -28,7 +28,7 @@ ENTRYPOINT and CMD keep their Docker meanings: the entrypoint is what runs, and 
 | A program (`FROM scratch`) | A program in the image, run on the vCPU | Its default arguments | Replace the arguments |
 | A model | A driver: `["shem:generate", "--max-tokens", "128"]` | The default prompt | Your prompt |
 
-A `shem:` entrypoint names a host-side driver rather than a guest executable. `shem:generate` options include `--max-tokens N` (default 256) and `--system TEXT`. Decoding is greedy; results are repeatable for the same model, session, prompt and device.
+A `shem:` entrypoint names a host-side driver rather than a guest executable. `shem:generate` options include `--max-tokens N` (default 256), `--system TEXT`, `--system-file PATH`, a file of the image whose text the system prompt ends with, such as a document to answer from, and `--stop TEXT`, which ends a reply where it reaches the text, as a base model with no end of turn of its own needs ([`examples/mamba`](../examples/mamba/Shemfile)). Decoding is greedy; results are repeatable for the same model, session, prompt and device.
 
 ## Sessions as layers
 
@@ -42,6 +42,15 @@ WARM --until=prompt
 ```
 
 The builder runs the model over the conversation up to where the user's prompt goes, here the system prompt, and saves every block's state in the image's state layer: the attention layers' key and value caches, and the Gated DeltaNet layers' convolution inputs and memory matrices. `shem run` continues that session, so the system prompt is never read again, and the reply is exactly what an unprimed session would give; a test checks this for both models.
+
+A system prompt can be a whole document. [`examples/handbook`](../examples/handbook/Shemfile) copies a handbook into the image and primes OLMo 2 with it, 658 tokens read once at build time:
+
+```dockerfile
+FROM hf.co/allenai/OLMo-2-0425-1B-Instruct
+COPY handbook.md /etc/handbook.md
+ENTRYPOINT ["shem:generate", "--system", "Answer questions about shem from its handbook, below.", "--system-file", "/etc/handbook.md"]
+WARM --until=prompt
+```
 
 Attention caches grow with the token count. Gated DeltaNet's convolution state and memory matrices are fixed-size. Qwen3.5 combines both block types, so its total session state still grows with its attention caches.
 
@@ -102,7 +111,21 @@ An attention or MLP block has a norm before it, after it, or both. Most families
 | [state-spaces/mamba-130m-hf](https://huggingface.co/state-spaces/mamba-130m-hf) | 24 Mamba | 27 layers | The same, against transformers' Mamba, with a template that runs a base model's text together |
 | [Qwen/Qwen3-0.6B-GGUF](https://huggingface.co/Qwen/Qwen3-0.6B-GGUF) `:Q8_0` | As Qwen3-0.6B, dequantized | 59 layers | Logits within 1e-3 of transformers' own dequantization, and the same chat template |
 
-Qwen3.5's vision encoder and multi-token prediction layer are left out, so its import is a text model. The others' imports load in transformers with the original's logits, exactly. Every chat template renders as transformers renders it, special tokens such as Gemma's `<bos>` included. [`tests/test_model.py`](../neural/tests/test_model.py) does these comparisons; it downloads the checkpoints, so it runs with `SHEM_MODEL_TESTS=1`, and skips gated ones, such as Gemma, without access to them. Gemma-2-2B, Phi-4-mini, SmolLM3-3B and Granite-3.3-2B, too large to compare in float32 in 16 GB, are compared in bfloat16 (`SHEM_LARGE_MODEL_TESTS=1`): the next token each predicts agrees with transformers' at 90% or more of a prompt's positions, and their last logits point the same way. OLMo 3, Mistral, the larger mixtures of experts and every family's other options are checked on tiny random checkpoints instead, and on their real configs.
+Larger checkpoints are compared the same way on a [Hugging Face Job](https://huggingface.co/docs/huggingface_hub/guides/jobs) with 256 GB of memory (`just models-job`, about an hour on `cpu-performance`), a model at a time, in float32, which Qwen3-30B-A3B needs 122 GB for:
+
+| Model | Blocks | Verified |
+|---|---|---|
+| [unsloth/Llama-3.2-1B-Instruct](https://huggingface.co/unsloth/Llama-3.2-1B-Instruct) | 16 attention with Llama 3's rotary scaling, 16 MLP | Logits within 1e-3 of transformers, and the same 24 greedy tokens |
+| [mistralai/Mistral-7B-Instruct-v0.3](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3) | 32 attention, 32 MLP | The same, against transformers' Mistral |
+| [microsoft/Phi-3.5-mini-instruct](https://huggingface.co/microsoft/Phi-3.5-mini-instruct) | 32 attention with fused projections and longrope, 32 MLP | The same, against transformers' Phi-3 |
+| [google/gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it) | 34 attention (5 of 6 with sliding windows), 34 GeGLU MLP; the vision encoder left out | The same, against transformers' Gemma 3 vision-language model |
+| [allenai/Olmo-3-7B-Instruct](https://huggingface.co/allenai/Olmo-3-7B-Instruct) | 32 attention (24 with sliding windows) with YaRN scaling, 32 MLP | The same, against transformers' OLMo 3 |
+| [allenai/OLMoE-1B-7B-0125-Instruct](https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct) | 16 attention, 16 mixtures of 64 experts, 8 per token | The same, against transformers' OLMoE |
+| [Qwen/Qwen1.5-MoE-A2.7B-Chat](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat) | 24 attention, 24 mixtures of 60 experts, 4 per token, and a gated shared expert | The same, against transformers' Qwen2-MoE |
+| [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) | 48 attention, 48 mixtures of 128 experts, 8 per token | The same, against transformers' Qwen3-MoE |
+| [mistralai/Mixtral-8x7B-Instruct-v0.1](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1) | 32 attention, 32 mixtures of 8 experts, 2 per token | In bfloat16, as below: its 47 billion parameters take 188 GB in float32 |
+
+Qwen3.5's and Gemma 3 4B's vision encoders, and Qwen3.5's multi-token prediction layer, are left out, so their imports are text models. The others' imports load in transformers with the original's logits, up to the order of floating-point sums. Every chat template renders as transformers renders it, special tokens such as Gemma's `<bos>` included, and every model's saved sessions and conversations continue as if they had never stopped. [`tests/test_model.py`](../neural/tests/test_model.py) does these comparisons; it downloads the checkpoints, so it runs with `SHEM_MODEL_TESTS=1`, and the larger ones with `SHEM_HUGE_MODEL_TESTS=1`. Gated checkpoints, such as Gemma's, are skipped without access to them, so CI, which has no token, skips them, and the Hugging Face Job runs them with yours. Gemma-2-2B, Phi-4-mini, SmolLM3-3B and Granite-3.3-2B, too large to compare in float32 in 16 GB, are compared in bfloat16 (`SHEM_LARGE_MODEL_TESTS=1`), and so is Mixtral: the next token each predicts agrees with transformers' at 90% or more of a prompt's positions, and their last logits point the same way. Every family's other options are checked on tiny random checkpoints too, and on their real configs.
 
 ## ModelPack artifacts
 
