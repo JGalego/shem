@@ -148,7 +148,7 @@ class Writer:
         self.weight_map: dict[str, str] = {}
         self.size = 0
         if not in_place:
-            (out / "blocks").mkdir(parents=True, exist_ok=True)
+            out.mkdir(parents=True, exist_ok=True)
 
     def file(self, name: str, tensors: dict[str, str]) -> dict[str, str]:
         """Save the checkpoint's tensors `tensors` (block-local name to
@@ -164,7 +164,8 @@ class Writer:
         return dict(tensors)
 
     def block(self, kind: str, params: dict, tensors: dict[str, str]) -> None:
-        name = f"blocks/{len(self.blocks):03d}-{kind}.safetensors"
+        # At the top of the directory, where loaders such as vLLM look for weights
+        name = f"block-{len(self.blocks):03d}-{kind}.safetensors"
         self.blocks.append(BlockSpec(kind, params, self.file(name, tensors)))
 
     def biases(self, names: dict[str, str]) -> dict[str, str]:

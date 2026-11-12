@@ -65,7 +65,7 @@ The artifact's config says what a runtime needs to decide whether it can load th
 The importer (`shem_neural.model.importers`) writes the model into `/model`:
 
 - `shem.json`, the manifest: the embedding, the blocks in order, and the head, each with its type, its parameters and its tensors, plus the tokenizer;
-- `blocks/NNN-TYPE.safetensors`: one weights file per block, holding that block's tensors with the checkpoint's own names and types;
+- `block-NNN-TYPE.safetensors`: one weights file per block, holding that block's tensors with the checkpoint's own names and types, at the top of the directory, where loaders such as vLLM look for weights;
 - `embed.safetensors` and `head.safetensors`;
 - `model.safetensors.index.json`, the index that says which file holds each tensor;
 - the checkpoint's `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json` and `chat_template.jinja`, and its licence and notices.

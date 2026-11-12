@@ -137,14 +137,21 @@ pub fn labels(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
     Ok(labels)
 }
 
-/// The model's files under `root`, grouped into layers: the directories and
+/// The model's files under `root`, grouped into layers: the directory and
 /// small files first, then each weights file alone, or a few together when
 /// there would otherwise be too many layers. Paths are relative to `root`.
+/// Weights files are at the top of the model's directory, or in `blocks/`
+/// in imports by earlier versions.
 pub fn layer_groups(root: &Path) -> anyhow::Result<Vec<Vec<PathBuf>>> {
     let dir = Path::new(MODEL_DIR);
-    let mut small = vec![dir.to_path_buf(), dir.join("blocks")];
+    let mut small = vec![dir.to_path_buf()];
     let mut weights = Vec::new();
-    for sub in [dir.to_path_buf(), dir.join("blocks")] {
+    let mut subs = vec![dir.to_path_buf()];
+    if root.join(dir).join("blocks").is_dir() {
+        small.push(dir.join("blocks"));
+        subs.push(dir.join("blocks"));
+    }
+    for sub in subs {
         let mut entries: Vec<_> = std::fs::read_dir(root.join(&sub))?.collect::<Result<_, _>>()?;
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {

@@ -183,14 +183,22 @@ func importModel(ctx context.Context, c client.Client, imp Import, neuralImage s
 	if err != nil {
 		return nil, model, err
 	}
-	for _, dir := range []string{"", "blocks"} {
+	// The model's files, and those in its subdirectories, such as blocks/
+	// in imports by earlier versions of shem-neural
+	dirs := []string{""}
+	for len(dirs) > 0 {
+		dir := dirs[0]
+		dirs = dirs[1:]
 		entries, err := ref.ReadDir(ctx, client.ReadDirRequest{Path: path.Join(importDir, dir)})
 		if err != nil {
 			return nil, model, err
 		}
 		for _, entry := range entries {
-			if !entry.IsDir() {
-				model.Files = append(model.Files, strings.TrimPrefix(path.Join(dir, entry.GetPath()), "/"))
+			name := strings.TrimPrefix(path.Join(dir, entry.GetPath()), "/")
+			if entry.IsDir() {
+				dirs = append(dirs, name)
+			} else {
+				model.Files = append(model.Files, name)
 			}
 		}
 	}

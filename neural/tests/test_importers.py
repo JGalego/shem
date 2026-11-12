@@ -271,13 +271,22 @@ def test_manifests_count_the_models_parameters(imported):
         assert manifest.source["family"] == reference.config.model_type
 
 
+def test_weights_are_where_vllm_looks_for_them(imported):
+    """vLLM finds a checkpoint's weights with `*.safetensors` at the top of
+    its directory, and refuses an index that names a file it didn't find."""
+    _, _, out, _ = imported
+    found = {path.name for path in out.glob("*.safetensors")}
+    named = set(json.loads((out / "model.safetensors.index.json").read_text())["weight_map"].values())
+    assert named <= found
+
+
 def test_each_block_is_a_file_of_its_own_tensors(imported):
     _, _, out, _ = imported
     manifest = Manifest.load(out)
     weight_map = manifest.weight_map(out)
     for i, block in enumerate(manifest.blocks):
         files = {weight_map[name] for name in block.tensors.values()}
-        assert files == {f"blocks/{i:03d}-{block.type}.safetensors"}
+        assert files == {f"block-{i:03d}-{block.type}.safetensors"}
         with safe_open(str(out / files.pop()), "pt") as handle:
             assert set(handle.keys()) == set(block.tensors.values())
 
