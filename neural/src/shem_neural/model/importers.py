@@ -48,6 +48,9 @@ from safetensors.torch import save_file
 from .manifest import INDEX, BlockSpec, Manifest
 
 PATTERNS = ["*.json", "*.safetensors", "*.jinja", "LICENSE*", "NOTICE*", "README.md"]
+#: Mistral's own format, which its repos carry beside the checkpoint: a
+#: second copy of the weights under other names
+IGNORED = ["consolidated*"]
 #: The checkpoint's own files that travel with the model, so that its
 #: directory loads as a checkpoint: its configs and its tokenizer
 CHECKPOINT_FILES = [
@@ -729,7 +732,7 @@ def import_model(repo: str, out: Path, revision: str | None = None) -> Manifest:
     if ggufs and "config.json" not in files:
         gguf = pick_gguf(repo, ggufs, revision)
         return import_gguf(repo, gguf, out, {"repo": repo, "gguf": gguf})
-    directory = Path(snapshot_download(repo, revision=revision, allow_patterns=PATTERNS))
+    directory = Path(snapshot_download(repo, revision=revision, allow_patterns=PATTERNS, ignore_patterns=IGNORED))
     return import_checkpoint(directory, out, {"repo": repo, "revision": directory.name})
 
 
