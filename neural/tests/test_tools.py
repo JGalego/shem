@@ -6,7 +6,7 @@ import torch
 
 from shem_neural.compile import compile_weights, save
 from shem_neural.export import export
-from shem_neural.model.generate import _partial
+from shem_neural.model.generate import _partial, reply, system_file
 from shem_neural.model.tools import compiled_layers, tool_calls
 from shem_neural.server import Registry
 
@@ -54,3 +54,52 @@ def test_vcpus_run_on_the_compiled_layer_they_name(tmp_path):
     save({"x": torch.zeros(2)}, tmp_path / "junk.safetensors")
     with pytest.raises(ValueError):
         registry.cpu_for(tmp_path / "junk.safetensors")
+
+
+def test_system_files_are_read_from_the_image_alone(tmp_path):
+    root = tmp_path / "root"
+    (root / "etc").mkdir(parents=True)
+    (root / "etc" / "handbook.md").write_text("# Handbook\n\nGolems are made of clay.\n")
+    (tmp_path / "secret").write_text("the host's")
+    (root / "etc" / "link").symlink_to(tmp_path / "secret")
+    assert system_file(root, "/etc/handbook.md") == "# Handbook\n\nGolems are made of clay."
+    for path in ("/../secret", "/etc/link"):
+        with pytest.raises(ValueError, match="out of the image"):
+            system_file(root, path)
+
+
+class Scripted:
+    """A session whose model says `words` in turn, a token each, whatever it
+    reads, with a tokenizer whose tokens are those words."""
+
+    def __init__(self, words: list[str]):
+        self.words, self.read = words, []
+        self.eos: set[int] = set()
+        self.logits = self.say(0)
+
+    def say(self, i: int) -> torch.Tensor:
+        return torch.nn.functional.one_hot(torch.tensor(min(i, len(self.words) - 1)), len(self.words)).float()
+
+    def feed(self, tokens: list[int]) -> None:
+        self.read += tokens
+        self.logits = self.say(len(self.read))
+
+    def decode(self, ids: list[int]) -> str:
+        return "".join(self.words[i] for i in ids)
+
+
+def test_replies_end_before_a_stop_text():
+    import io
+
+    def run(words, stops, max_tokens=8):
+        session, out = Scripted(words), io.StringIO()
+        tokens = reply(session, session, max_tokens, out, stops=stops)
+        return out.getvalue(), tokens, session.read
+
+    # The token that reaches the stop is neither kept nor read
+    assert run([" Lisbon", "\n", "Spain", ":"], ["\n"]) == (" Lisbon\n", [0], [0])
+    # A stop across tokens: its start is held back, then left out
+    assert run([" Lis", "bon", "\n", "\n", "x"], ["\n\n"]) == (" Lisbon\n", [0, 1, 2], [0, 1, 2])
+    # Text that only began like a stop is written after all
+    assert run([" a", "\n", "b"], ["\nX"], max_tokens=3) == (" a\nb\n", [0, 1, 2], [0, 1, 2])
+    assert run([" a", "b"], [], max_tokens=2) == (" ab\n", [0, 1], [0, 1])

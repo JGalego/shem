@@ -8,6 +8,9 @@ The prompt comes from arguments or stdin; greedy decoding streams to stdout.
 `--warm` saves a system-prompt session; `--session` resumes one. The model
 server keeps sessions across turns and saves them for `docker commit`.
 `--tools DIR` offers programs run on the image's compiled CPU (see `tools`).
+`--system-file PATH` adds a file of the image to the system prompt, such as a
+document to answer from. `--stop TEXT` ends a reply where it reaches TEXT,
+which a base model, with no end of turn of its own, needs.
 """
 
 import argparse
@@ -140,7 +143,15 @@ def next_turn(session: Session, tokenizer: Tokenizer, new: list[dict]) -> list[i
     return tokenizer.encode(after[at + len(last) :])
 
 
-def converse(session: Session, tokenizer: Tokenizer, text: str, max_tokens: int, out=sys.stdout, err=sys.stderr):
+def converse(
+    session: Session,
+    tokenizer: Tokenizer,
+    text: str,
+    max_tokens: int,
+    out=sys.stdout,
+    err=sys.stderr,
+    stops: list[str] | None = None,
+):
     """One turn: the user's `text`, then the model's reply, written to `out`
     as it comes. When the reply calls tools, the host runs them on the
     compiled layer and the model replies again, up to `MAX_TOOL_ROUNDS`
@@ -148,7 +159,7 @@ def converse(session: Session, tokenizer: Tokenizer, text: str, max_tokens: int,
     new = [{"role": "user", "content": text}]
     for _ in range(MAX_TOOL_ROUNDS + 1):
         session.feed(next_turn(session, tokenizer, new))
-        replied = reply(session, tokenizer, max_tokens, out, hold=session.runner is not None)
+        replied = reply(session, tokenizer, max_tokens, out, hold=session.runner is not None, stops=stops)
         content = tokenizer.decode(replied).strip()
         session.messages += new
         calls = tool_calls(content) if session.runner is not None else []
@@ -167,13 +178,24 @@ def converse(session: Session, tokenizer: Tokenizer, text: str, max_tokens: int,
     return replied
 
 
-def reply(session: Session, tokenizer: Tokenizer, max_tokens: int, out=sys.stdout, hold: bool = False) -> list[int]:
+def reply(
+    session: Session,
+    tokenizer: Tokenizer,
+    max_tokens: int,
+    out=sys.stdout,
+    hold: bool = False,
+    stops: list[str] | None = None,
+) -> list[int]:
     """Continue `session` with the model's reply, writing the text to `out`
     as it comes. With `hold`, a tool call is not written: text stops at the
     first `<tool_call>`, holding back what may be its start, and a tool call
     may run past `max_tokens` to finish. Held text that turns out not to be a
-    complete tool call is written at the end. Returns the reply's tokens."""
+    complete tool call is written at the end. The reply ends before the
+    first of `stops` it reaches, whose start is held back until it is clear
+    whether it is one; the token that completes it is not read, as an end of
+    turn isn't. Returns the reply's tokens."""
     detokenizer = Detokenizer(tokenizer)
+    stops = [stop for stop in stops or [] if stop]
     tokens = []
     text, written = "", 0
 
@@ -185,18 +207,24 @@ def reply(session: Session, tokenizer: Tokenizer, max_tokens: int, out=sys.stdou
         token = int(session.logits.argmax())
         if token in tokenizer.eos:
             break
-        tokens.append(token)
         text += detokenizer.push(token)
+        ends = [at for at in (text.find(stop) for stop in stops) if at >= 0]
+        if ends:
+            text = text[: min(ends)]
+            break
+        tokens.append(token)
         shown = len(text)
         if hold:
             call = text.find(TOOL_CALL)
             shown = call if call >= 0 else len(text) - _partial(text, TOOL_CALL)
+        if stops:
+            shown = min(shown, len(text) - max(_partial(text, stop) for stop in stops))
         if shown > written:
             out.write(text[written:shown])
             out.flush()
             written = shown
         session.feed([token])
-    if hold and TOOL_CALL_END not in text[written:] and written < len(text):
+    if written < len(text) and not (hold and TOOL_CALL_END in text[written:]):
         out.write(text[written:])
         written = len(text)
     if written or not hold:
@@ -219,7 +247,13 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
     container's command line does."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument(
+        "--stop", action="append", default=[], help="end the reply where it reaches this text; may be given again"
+    )
     parser.add_argument("--system", help="a system prompt")
+    parser.add_argument(
+        "--system-file", help="a file of the image whose text the system prompt ends with, such as a document"
+    )
     parser.add_argument("--warm", type=Path, help="prime a session with the system prompt and save it here")
     parser.add_argument("--session", type=Path, help="continue the session saved here")
     parser.add_argument("--stats", action="store_true", help="print the token rate to stderr")
@@ -252,7 +286,21 @@ def resolve(args: argparse.Namespace) -> argparse.Namespace:
     """`args` with the model's directory as `model` and the image's root as
     `root`, for a `model` given as either."""
     args.model, args.root = locate(args.model)
+    if args.system_file:
+        text = system_file(Path(args.root), args.system_file)
+        args.system = f"{args.system}\n\n{text}" if args.system else text
     return args
+
+
+def system_file(root: Path, path: str) -> str:
+    """The text of the file at `path` in the image whose root is `root`. The
+    model server reads it with the host's view of the filesystem, so a path
+    or a link that leads out of the image is refused."""
+    base = root.resolve()
+    target = (base / path.lstrip("/")).resolve()
+    if not target.is_relative_to(base):
+        raise ValueError(f"--system-file {path} leads out of the image")
+    return target.read_text().strip()
 
 
 def start(
@@ -289,7 +337,7 @@ def run(model: Model, tokenizer: Tokenizer, args: argparse.Namespace, prompt: st
     if session is None:
         return
     started = time.perf_counter()
-    replied = converse(session, tokenizer, prompt, args.max_tokens, out, err)
+    replied = converse(session, tokenizer, prompt, args.max_tokens, out, err, args.stop)
     if args.stats:
         print(f"shem: {len(replied)} tokens in {time.perf_counter() - started:.1f} s", file=err)
 

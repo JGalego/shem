@@ -99,7 +99,9 @@ class Models:
         prompt = " ".join(args.prompt) or request.get("stdin", "")
         with _all_cores():
             if session is not None and prompt:
-                generate.converse(session, tokenizer, prompt, args.max_tokens, out=_Stream(write), err=_Stream(write))
+                generate.converse(
+                    session, tokenizer, prompt, args.max_tokens, _Stream(write), _Stream(write), args.stop
+                )
         if session is not None and request.get("session_id"):
             self.sessions[request["session_id"]] = Live(tokenizer, args, session)
 
@@ -114,8 +116,9 @@ class Models:
         if not text.strip():
             return
         max_tokens = args.max_tokens if "--max-tokens" in request.get("argv", []) else live.args.max_tokens
+        stops = args.stop or live.args.stop
         with live.lock, _all_cores():
-            generate.converse(live.session, live.tokenizer, text, max_tokens, out=_Stream(write), err=_Stream(write))
+            generate.converse(live.session, live.tokenizer, text, max_tokens, _Stream(write), _Stream(write), stops)
 
     def save(self, request: dict) -> bytes:
         """A live session's files, as `docker commit` freezes them into the
