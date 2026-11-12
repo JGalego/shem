@@ -109,6 +109,22 @@ Uninstall the containerd shim.
 sudo rm /usr/local/bin/containerd-shim-shem-v1
 ```
 
+## Compared with ModelPack
+
+[ModelPack](https://github.com/modelpack/model-spec) is a CNCF specification for packaging models as OCI artifacts, implemented by tools such as [KitOps](https://kitops.org), [modctl](https://github.com/modelpack/modctl) and [llmman](https://github.com/llmmanorg/llmman). A ModelPack artifact stores a model for a separate inference server to load; a shem model image is a container image that runs as a model session.
+
+| | ModelPack | shem |
+|---|---|---|
+| OCI object | An artifact, with `artifactType` `application/vnd.cncf.model.manifest.v1+json` | A container image for `linux/riscv32` |
+| Weights | The checkpoint's files, unchanged, in any format: safetensors, GGUF, ONNX and others | One safetensors file per block, each in its own layer, imported from Hugging Face (Qwen3 and Qwen3.5) |
+| Metadata | A model config: name, family, licences, format, precision, parameter count and capabilities | The OCI image config, with `ENTRYPOINT`, `CMD` and `dev.shem.*` labels, and `shem.json`, which lists the blocks the runtime executes |
+| Session state | None | An optional layer under `/.shem`, written by `WARM` or `docker commit` |
+| Running | Mounted read-only into an inference server, for example as a Kubernetes image volume | Runs as a container: `shem run`, or `docker run --runtime io.containerd.shem.v1` |
+| Building with Docker | BuildKit rejects the model config type, so an artifact can't be a `FROM` base or a `COPY --from` source | `docker build` builds model images through shem's BuildKit frontend |
+| Layer compression | Uncompressed weights recommended | zstd |
+
+shem can't use a ModelPack artifact as a base yet.
+
 ## Architecture
 
 [![OCI registries store the images. Docker reaches the host through the containerd shim; the shem CLI drives it directly. The host provides syscalls or VM devices and runs a neural or reference vCPU.](https://raw.githubusercontent.com/JGalego/shem/main/docs/assets/architecture.svg)](https://github.com/JGalego/shem/blob/main/docs/architecture.md)
