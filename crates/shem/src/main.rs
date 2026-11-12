@@ -108,6 +108,10 @@ struct RunArgs {
     /// Host directory to use as an executable's root filesystem
     #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
+    /// For a model image, continue this session: one `shem push --state`
+    /// published, in a registry or as an OCI layout directory
+    #[arg(long, value_name = "REF")]
+    state: Option<String>,
     /// An image (name[:tag] in the store, or an OCI layout directory), or an executable
     target: String,
     /// Arguments: for an image they replace its CMD
@@ -145,7 +149,7 @@ struct PushArgs {
     plain_http: bool,
     /// Also list the image under these platforms, such as linux/amd64, for
     /// runtimes that pick images by the host's platform (see docs/kubernetes.md)
-    #[arg(long, value_delimiter = ',', conflicts_with = "modelpack")]
+    #[arg(long, value_delimiter = ',', conflicts_with_all = ["modelpack", "state"])]
     platform: Vec<String>,
     /// Push a model image's model as a ModelPack artifact, whose layers are
     /// the image's own and whose subject is the image (see docs/models.md)
@@ -155,6 +159,10 @@ struct PushArgs {
     /// recommends and modctl 0.2 needs, instead of sharing the image's blobs
     #[arg(long, requires = "modelpack")]
     uncompressed: bool,
+    /// Push a model image's session as an artifact of its own, whose subject
+    /// is the image without it, for `shem run --state` (see docs/models.md)
+    #[arg(long, conflicts_with = "modelpack")]
+    state: bool,
     /// The image: name[:tag] in the store, or an OCI layout directory
     image: String,
     /// Where to push it, such as ghcr.io/me/app:1.0
@@ -255,6 +263,9 @@ fn launch<V: Vcpu + Clone>(
     // An image's filesystem is unpacked fresh for each run, and removed after.
     let mut rootfs = None;
     let mut container = if Path::new(&args.target).is_file() {
+        if args.state.is_some() {
+            bail!("--state is for model images, not executables");
+        }
         let elf =
             std::fs::read(&args.target).with_context(|| format!("reading {}", args.target))?;
         let argv: Vec<String> = std::iter::once(args.target.clone())
@@ -276,6 +287,11 @@ fn launch<V: Vcpu + Clone>(
         let image = load_image(&args.target)?;
         if image::model::is_driver(&image.config.entrypoint) {
             return run_model(args, &image);
+        }
+        if args.state.is_some() {
+            bail!(
+                "--state is for model images: a program or VM image resumes the state it was frozen with"
+            );
         }
         let dir = tempfile::tempdir()?;
         if image.config.kernel.is_some() {
@@ -437,7 +453,24 @@ fn run_model(args: &RunArgs, image: &Image) -> anyhow::Result<u8> {
     } else {
         &args.args
     };
-    image::model::run_driver(&image.config.entrypoint, input, &root)
+    // A published session: fetched, checked against this model, and unpacked
+    let session = tempfile::tempdir()?;
+    if let Some(state) = &args.state {
+        let fetched = tempfile::tempdir()?;
+        let layout = if Path::new(state).join("oci-layout").is_file() {
+            PathBuf::from(state)
+        } else {
+            let host = image::registry_host(state).with_context(|| {
+                format!("{state}: no such session layout or registry reference")
+            })?;
+            image::copy_to_layout(state, fetched.path(), image::is_local(host))?;
+            fetched.path().to_path_buf()
+        };
+        let model = image::session::model_digest(&root, image)?;
+        image::session::load(&layout, &model, session.path())?;
+    }
+    let session = args.state.as_ref().map(|_| session.path());
+    image::model::run_driver(&image.config.entrypoint, input, &root, session)
 }
 
 /// A console on this process's stdin and stdout.
@@ -507,7 +540,15 @@ fn image_dir(target: &str) -> anyhow::Result<PathBuf> {
 
 fn push(args: PushArgs) -> anyhow::Result<u8> {
     let staged = tempfile::tempdir()?;
-    let dir = if args.modelpack {
+    let dir = if args.state {
+        let dir = image_dir(&args.image)?;
+        let image = Image::read_layout(&dir)?;
+        let root = Store::open()?.rootfs(&image, &Image::layout_digest(&dir)?)?;
+        let (_, tag) = image::parse_reference(&args.remote)?;
+        let out = staged.path().join("session");
+        image::session::publish(&image, &root, &out, tag)?;
+        out
+    } else if args.modelpack {
         let dir = image_dir(&args.image)?;
         let image = Image::read_layout(&dir)?;
         let root = Store::open()?.rootfs(&image, &Image::layout_digest(&dir)?)?;

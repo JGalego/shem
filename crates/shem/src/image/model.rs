@@ -198,16 +198,24 @@ pub fn is_driver(entrypoint: &[String]) -> bool {
 }
 
 /// Run the driver `entrypoint` for an image whose filesystem is at `root`,
-/// with `args` (the run's arguments, or the image's CMD). Returns its status.
-pub fn run_driver(entrypoint: &[String], args: &[String], root: &Path) -> anyhow::Result<u8> {
+/// with `args` (the run's arguments, or the image's CMD), continuing the
+/// session in `session`, or else the image's own, if it has one. Returns
+/// the driver's status.
+pub fn run_driver(
+    entrypoint: &[String],
+    args: &[String],
+    root: &Path,
+    session: Option<&Path>,
+) -> anyhow::Result<u8> {
     let (driver, options) = entrypoint.split_first().context("no entrypoint")?;
     let mut command = match driver.as_str() {
         "shem:generate" => python("shem_neural.model.generate"),
         other => bail!("unknown driver {other}: shem has shem:generate"),
     };
     command.args(options);
-    let session = root.join(SESSION_DIR);
-    if session.join("session.json").is_file() {
+    let own = root.join(SESSION_DIR);
+    let session = session.or(own.join("session.json").is_file().then_some(own.as_path()));
+    if let Some(session) = session {
         command.arg("--session").arg(session);
     }
     command.arg(root).arg("--").args(args);

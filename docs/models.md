@@ -47,6 +47,19 @@ Attention caches grow with the token count. Gated DeltaNet's convolution state a
 
 The session is saved as `session.safetensors`, every block's state by block number and name, and `session.json`, the tokens it has read. `shem run` unpacks them into `/.shem`, which is also where `shem save` puts them for `docker load`.
 
+### Sessions as artifacts
+
+A session can also travel apart from its model, as an artifact linked to it, which is what ModelPack's [issue #239](https://github.com/modelpack/model-spec/issues/239) proposes for model state:
+
+```sh
+shem push --state golem registry.example.com/team/golem:session
+shem run --state registry.example.com/team/golem:session qwen3.5 "Who are you?"
+```
+
+`--state` publishes a model image's session as an artifact of its own. The session is the image's state layer, the same blob. Its `subject` is the model image without that layer: the image as it was before `WARM`, byte for byte, which is pushed with it. A registry then lists a model's sessions among its referrers (`oras discover`), so one model can carry many primed system prompts and saved conversations.
+
+The artifact's config says what a runtime needs to decide whether it can load the session: its format (`shem.session/v1`), the tokens it has read, its precision, and the model's fingerprint. `shem.json` records that fingerprint at import: a digest of the blocks and their tensors' contents, which is the same however the files are laid out. `shem run --state` takes a registry reference or a layout directory, checks the fingerprint, and continues the session on any image of the same model, such as the model's ModelPack twin. A model of the same shape with other weights refuses the session rather than running it wrong. The media types are shem's own (`application/vnd.shem.session.v1+json`) while #239's are placeholders.
+
 ## The model as files
 
 The importer (`shem_neural.model.importers`) writes the model into `/model`:

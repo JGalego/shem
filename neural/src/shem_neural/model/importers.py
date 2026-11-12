@@ -24,6 +24,7 @@ layers are new.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
@@ -555,6 +556,22 @@ def eos_tokens(checkpoint: Checkpoint, cfg: dict) -> list[int]:
     return sorted(set(ids))
 
 
+def fingerprint(checkpoint: Checkpoint, specs: list[BlockSpec]) -> str:
+    """The model's identity, whatever files hold it: a digest of each block's
+    type, parameters and tensor names, and of each tensor's type, shape and
+    contents. Imports of one checkpoint have it however their files are laid
+    out (by block, or in the checkpoint's own shards), and a checkpoint with
+    other weights has another."""
+    digest = hashlib.sha256()
+    for spec in specs:
+        digest.update(json.dumps([spec.type, spec.params, spec.tensors], sort_keys=True).encode())
+        for name in sorted(set(spec.tensors.values())):
+            tensor = checkpoint.tensor(name).contiguous()
+            digest.update(f"{name}:{tensor.dtype}:{list(tensor.shape)}".encode())
+            digest.update(tensor.view(torch.uint8).numpy().tobytes() if tensor.numel() else b"")
+    return "sha256:" + digest.hexdigest()
+
+
 #: The special tokens transformers hands a chat template, as `bos_token` and so on
 SPECIAL_TOKENS = ["bos_token", "eos_token", "unk_token", "sep_token", "pad_token", "cls_token", "mask_token"]
 
@@ -635,6 +652,7 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
     used = {name for spec in [embed, *writer.blocks, head] for name in spec.tensors.values()}
     infos = [checkpoint.info(name) for name in sorted(used)]
     family = {"family": checkpoint.config["model_type"]} if checkpoint.config.get("model_type") else {}
+    specs = [embed, *writer.blocks, head]
     manifest = Manifest(
         hidden_size=cfg["hidden_size"],
         tokenizer={
@@ -649,6 +667,7 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
         source=(source or {}) | {"architecture": architecture} | family | model_license(directory),
         parameters=sum(count for count, _ in infos),
         precision=sorted({PRECISIONS.get(dtype, dtype.lower()) for _, dtype in infos}),
+        fingerprint=fingerprint(checkpoint, specs),
     )
     manifest.save(out)
     return manifest

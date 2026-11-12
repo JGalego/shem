@@ -1,6 +1,7 @@
-//! ModelPack artifacts through their image twins, end to end: a tiny random
-//! checkpoint, packed as modctl packs one, built on with `FROM`, run, primed
-//! with `WARM`, and pulled from and pushed to a registry.
+//! Artifacts, end to end, on a tiny random checkpoint: ModelPack artifacts
+//! packed as modctl packs them, built on with `FROM`, run, primed with
+//! `WARM`, and pulled from and pushed to a registry; model images published
+//! as ModelPack artifacts; and sessions published beside their models.
 //!
 //! These need uv and the neural package's development dependencies, which
 //! make the checkpoint with transformers: run them with `--ignored`. The
@@ -19,15 +20,19 @@ const PROMPT: [&str; 3] = ["t5", "t6", "t7"];
 /// A tiny random Llama with a word-level tokenizer, made once for every test.
 fn checkpoint() -> &'static Path {
     static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let script = r#"
+    DIR.get_or_init(|| make_checkpoint(0)).path()
+}
+
+/// A tiny random Llama, its weights from `seed`.
+fn make_checkpoint(seed: u32) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script = r#"
 import json, sys
 from pathlib import Path
 import torch, transformers
 from tokenizers import Tokenizer, models, pre_tokenizers
 out = Path(sys.argv[1])
-torch.manual_seed(0)
+torch.manual_seed(int(sys.argv[2]))
 config = transformers.LlamaConfig(vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
     num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128, bos_token_id=1, eos_token_id=2,
     pad_token_id=0)
@@ -45,11 +50,14 @@ template = "{{ bos_token }} {% for m in messages %}{{ m.content }} {% endfor %}"
 (out / "tokenizer_config.json").write_text(json.dumps({"chat_template": template, "bos_token": "t1", "eos_token": "t2"}))
 (out / "LICENSE").write_text("Apache-2.0, for a test\n")
 "#;
-        let made = python(&["-c", script, dir.path().to_str().unwrap()]);
-        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
-        dir
-    })
-    .path()
+    let seed = seed.to_string();
+    let made = python(&["-c", script, dir.path().to_str().unwrap(), &seed]);
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    dir
 }
 
 fn python(args: &[&str]) -> std::process::Output {
@@ -514,4 +522,167 @@ fn images_push_as_artifacts_that_run_as_twins() {
     // artifact carries the model, not the image's entrypoint
     let fresh = tempfile::tempdir().unwrap();
     assert_eq!(ok(shem(fresh.path(), &args)), reference(&[]));
+}
+
+/// Two images of the checkpoint with a system prompt, `cold` and `warm`,
+/// which differ only in `warm`'s session, primed with `WARM`.
+fn cold_and_warm(home: &Path) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let context = tempfile::tempdir().unwrap();
+    let ckpt = context.path().join("ckpt");
+    std::fs::create_dir(&ckpt).unwrap();
+    for entry in std::fs::read_dir(checkpoint()).unwrap() {
+        let path = entry.unwrap().path();
+        std::fs::copy(&path, ckpt.join(path.file_name().unwrap())).unwrap();
+    }
+    let entrypoint = "FROM ckpt\nENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"8\", \"--system\", \"t9 t10\"]\n";
+    let mut dirs = Vec::new();
+    for (name, shemfile) in [
+        ("cold", entrypoint.to_string()),
+        ("warm", format!("{entrypoint}WARM --until=prompt\n")),
+    ] {
+        std::fs::write(context.path().join("Shemfile"), shemfile).unwrap();
+        let out = home.join(name);
+        ok(shem(
+            home,
+            &[
+                "build",
+                "-o",
+                out.to_str().unwrap(),
+                context.path().to_str().unwrap(),
+            ],
+        ));
+        dirs.push(out);
+    }
+    let warm = dirs.pop().unwrap();
+    (context, dirs.pop().unwrap(), warm)
+}
+
+fn run_with_state(home: &Path, image: &Path, state: &str) -> std::process::Output {
+    let mut args = vec!["run", "--state", state, image.to_str().unwrap()];
+    args.extend(PROMPT);
+    shem(home, &args)
+}
+
+#[test]
+#[ignore = "needs uv and the neural package's dev dependencies"]
+fn sessions_publish_beside_their_models_and_resume_on_them() {
+    let home = tempfile::tempdir().unwrap();
+    let (_context, cold, warm) = cold_and_warm(home.path());
+    let image = shem::image::Image::read_layout(&warm).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    image.unpack_rootfs(root.path()).unwrap();
+    std::fs::create_dir_all(root.path().join(".shem")).unwrap();
+    let state = home.path().join("state");
+    shem::image::session::publish(&image, root.path(), &state, "latest").unwrap();
+
+    let (manifest, config) = read_image(&state);
+    assert_eq!(
+        manifest["artifactType"],
+        "application/vnd.shem.session.v1+json"
+    );
+    let cold_digest = shem::image::Image::layout_digest(&cold).unwrap();
+    assert_eq!(
+        manifest["subject"]["digest"],
+        cold_digest.as_str(),
+        "the image before WARM, byte for byte"
+    );
+    assert_eq!(config["format"], "shem.session/v1");
+    assert!(config["tokens"].as_u64().unwrap() > 0);
+
+    let reply = ok(run_with_state(home.path(), &cold, state.to_str().unwrap()));
+    assert_eq!(
+        reply,
+        reference(&["--max-tokens", "8", "--system", "t9 t10"])
+    );
+
+    // The same model in another layout, its ModelPack twin, continues it too
+    let shemfile =
+        "ENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"8\", \"--system\", \"t9 t10\"]\n";
+    let packed = tempfile::tempdir().unwrap();
+    pack(&packed.path().join("artifact"), "cncf", false);
+    std::fs::write(
+        packed.path().join("Shemfile"),
+        format!("FROM artifact\n{shemfile}"),
+    )
+    .unwrap();
+    let twin = home.path().join("twin");
+    let built = [
+        "build",
+        "-o",
+        twin.to_str().unwrap(),
+        packed.path().to_str().unwrap(),
+    ];
+    ok(shem(home.path(), &built));
+    let reply = ok(run_with_state(home.path(), &twin, state.to_str().unwrap()));
+    assert_eq!(
+        reply,
+        reference(&["--max-tokens", "8", "--system", "t9 t10"])
+    );
+
+    // A model of the same shape with other weights refuses it, rather than run wrong
+    let context = tempfile::tempdir().unwrap();
+    let other = make_checkpoint(1);
+    std::fs::rename(other.path(), context.path().join("ckpt")).unwrap();
+    std::fs::write(
+        context.path().join("Shemfile"),
+        format!("FROM ckpt\n{shemfile}"),
+    )
+    .unwrap();
+    let different = home.path().join("different");
+    let built = [
+        "build",
+        "-o",
+        different.to_str().unwrap(),
+        context.path().to_str().unwrap(),
+    ];
+    ok(shem(home.path(), &built));
+    let refused = run_with_state(home.path(), &different, state.to_str().unwrap());
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("another model"));
+}
+
+#[test]
+#[ignore = "needs uv, oras and a registry: set SHEM_TEST_REGISTRY"]
+fn sessions_push_with_their_models_and_resume_from_the_registry() {
+    let registry = std::env::var("SHEM_TEST_REGISTRY").unwrap_or_else(|_| "localhost:5000".into());
+    let home = tempfile::tempdir().unwrap();
+    let (_context, cold, warm) = cold_and_warm(home.path());
+    let remote = format!("{registry}/shem-tests/tiny-llama:session");
+    ok(shem(
+        home.path(),
+        &[
+            "push",
+            "--plain-http",
+            "--state",
+            warm.to_str().unwrap(),
+            &remote,
+        ],
+    ));
+
+    // The model the session names came with it
+    let oras = std::env::var("SHEM_ORAS").unwrap_or_else(|_| "oras".into());
+    let fetch = |reference: &str| -> Value {
+        let out = Command::new(&oras)
+            .args(["manifest", "fetch", "--plain-http", reference])
+            .output()
+            .expect("running oras");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let subject = fetch(&remote)["subject"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(subject, shem::image::Image::layout_digest(&cold).unwrap());
+    fetch(&format!("{registry}/shem-tests/tiny-llama@{subject}"));
+
+    let reply = ok(run_with_state(home.path(), &cold, &remote));
+    assert_eq!(
+        reply,
+        reference(&["--max-tokens", "8", "--system", "t9 t10"])
+    );
 }

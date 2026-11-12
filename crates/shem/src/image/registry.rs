@@ -58,6 +58,21 @@ pub fn is_local(host: &str) -> bool {
     host.starts_with("localhost") || host.starts_with("127.0.0.1")
 }
 
+/// Copy `remote`, whatever it is, into a new OCI layout at `dir`, tagged
+/// `latest`.
+pub fn copy_to_layout(remote: &str, dir: &Path, plain_http: bool) -> anyhow::Result<()> {
+    let mut command = oras();
+    command.arg("cp");
+    if plain_http {
+        command.arg("--from-plain-http");
+    }
+    command
+        .arg(remote)
+        .arg("--to-oci-layout")
+        .arg(format!("{}:latest", dir.display()));
+    run(command)
+}
+
 /// Pull `remote` into the layout directory `dir`, replacing what is there.
 /// A ModelPack artifact becomes its image twin, whose layers are the
 /// artifact's own blobs; anything else must be a shem image. Returns the
@@ -67,16 +82,7 @@ pub fn pull(remote: &str, dir: &Path, plain_http: bool) -> anyhow::Result<String
     std::fs::create_dir_all(parent)?;
     let staging = tempfile::tempdir_in(parent)?;
     let layout = staging.path().join("layout");
-    let mut command = oras();
-    command.arg("cp");
-    if plain_http {
-        command.arg("--from-plain-http");
-    }
-    command
-        .arg(remote)
-        .arg("--to-oci-layout")
-        .arg(format!("{}:latest", layout.display()));
-    run(command)?;
+    copy_to_layout(remote, &layout, plain_http)?;
     let layout = match Artifact::read(&layout)? {
         Some(artifact) => {
             let root = tempfile::tempdir()?;

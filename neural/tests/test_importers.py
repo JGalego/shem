@@ -307,6 +307,7 @@ def test_in_place_imports_run_the_checkpoint_as_it_is(imported, tmp_path):
     extra = tmp_path / "extra"
     import_checkpoint(checkpoint, extra, in_place=True)
     assert {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in checkpoint.iterdir()} == before
+    assert Manifest.load(extra).fingerprint == Manifest.load(out).fingerprint, "one model, however laid out"
     assert not set(p.name for p in extra.iterdir()) & set(before), "it writes nothing the checkpoint has"
 
     twin = tmp_path / "twin"

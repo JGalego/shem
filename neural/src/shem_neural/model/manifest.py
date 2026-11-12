@@ -8,6 +8,7 @@
       "weights": "model.safetensors.index.json",
       "parameters": 596049920,
       "precision": ["bfloat16"],
+      "fingerprint": "sha256:...",
       "embed": {"type": "embedding", "tensors": {"weight": "model.embed_tokens.weight"}},
       "blocks": [{"type": "attention", "params": {...},
                   "tensors": {"q": "model.layers.0.self_attn.q_proj.weight", ...}}, ...],
@@ -74,6 +75,9 @@ class Manifest:
     #: ModelPack's config names them, such as `bfloat16`
     parameters: int | None = None
     precision: list[str] = field(default_factory=list)
+    #: The model's identity, whatever files hold it: the digest of its blocks
+    #: and their tensors' contents, which a saved session is checked against
+    fingerprint: str | None = None
     format: str = FORMAT
 
     def save(self, directory: Path) -> None:
@@ -89,6 +93,8 @@ class Manifest:
             data["parameters"] = self.parameters
         if self.precision:
             data["precision"] = self.precision
+        if self.fingerprint:
+            data["fingerprint"] = self.fingerprint
         data |= {
             "embed": self.embed.to_json(),
             "blocks": [block.to_json() for block in self.blocks],
@@ -111,6 +117,7 @@ class Manifest:
             weights=data.get("weights"),
             parameters=data.get("parameters"),
             precision=data.get("precision", []),
+            fingerprint=data.get("fingerprint"),
             format=data["format"],
         )
 

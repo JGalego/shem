@@ -14,6 +14,7 @@ mod layer;
 pub mod model;
 pub mod modelpack;
 mod registry;
+pub mod session;
 pub mod shemfile;
 
 use std::collections::BTreeMap;
@@ -26,7 +27,7 @@ use sha2::{Digest, Sha256};
 pub use build::{BuildOptions, CONTAINER_MEM, VM_MEM, build};
 pub use docker::WARM_DIR;
 pub use layer::unpack;
-pub use registry::{is_local, pull, push, registry_host};
+pub use registry::{copy_to_layout, is_local, pull, push, registry_host};
 
 use crate::container::{Container, Frozen, FrozenHost};
 use crate::linux::{RootFs, Stdio};
