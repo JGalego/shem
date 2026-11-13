@@ -3,9 +3,11 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        # Fuzz seeds, as fuzz_seeds.rs writes them
+        exclude: ^fuzz/seeds/
       - id: end-of-file-fixer
-        # A saved session's model, as test_sessions.py writes it
-        exclude: ^neural/tests/sessions/
+        # A saved session's model, as test_sessions.py writes it, and fuzz seeds
+        exclude: ^(neural/tests/sessions|fuzz/seeds)/
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict

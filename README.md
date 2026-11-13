@@ -166,6 +166,7 @@ crates/shem/src/
   main.rs        the shem CLI
 crates/shem/tests/  unit, integration and guest-program tests
 crates/containerd-shim-shem/  the containerd shim
+fuzz/           fuzz targets for what shem reads from images, with their seeds
 frontend/       the BuildKit frontend, in Go, that lets docker build Shemfiles
 neural/         the neural vCPU: ISA table, weight compiler, network, executors, server
   src/shem_neural/model/  model images: manifest, block types, importers, tokenizer, the generate driver
@@ -218,6 +219,14 @@ With [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) installed, check 
 ```sh
 cargo deny check
 ```
+
+[`fuzz/`](fuzz/) fuzzes what shem reads from images, which anyone can make: archives for `shem load`, programs, frozen containers, layers and Shemfiles. With nightly Rust and [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz), run each target for a minute:
+
+```sh
+just fuzz 60
+```
+
+CI runs `just fuzz-ci`, which tries each target's seeds once, the same inputs on every run, so that it fails only for what a change broke. The [fuzz workflow](.github/workflows/fuzz.yml) fuzzes each target for five minutes every day, and keeps the inputs that fail; add them to `fuzz/seeds` with the fix.
 
 The slower suites are ignored tests that need inputs built first: guest programs, BusyBox, the riscv-tests, a Linux kernel, a neural vCPU server, a registry or containerd. CI builds the inputs and runs every suite on each push, and [`.github/workflows/ci.yml`](.github/workflows/ci.yml) shows how. Run one locally with `cargo test --release --test <suite> -- --ignored` once its inputs exist.
 

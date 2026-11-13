@@ -413,6 +413,33 @@ kubernetes-model-volume-test:
     grep -q "model.safetensors.index.json" $dir/out
     grep -q '"format": "shem.model/v2"' $dir/out
 
+# Fuzz what shem reads from images, each target for `seconds`, from the seeds in fuzz/seeds and the examples' Shemfiles; needs nightly Rust and cargo-fuzz
+fuzz seconds="60": (_fuzz ("-max_total_time=" + seconds))
+
+# Try each target's seeds once, as CI does: the same inputs on every run, so that a run fails only for what a change broke
+fuzz-ci: (_fuzz "-runs=0")
+
+_fuzz +limits:
+    #!/bin/sh
+    set -e
+    mkdir -p fuzz/corpus/shemfile
+    for example in examples/*/Shemfile; do
+        cp "$example" "fuzz/corpus/shemfile/$(basename "$(dirname "$example")")"
+    done
+    # For this host: a cargo-fuzz built for another target, such as musl, defaults to that one
+    host=$(rustc +nightly -vV | sed -n 's/^host: //p')
+    for target in $(cargo +nightly fuzz list); do
+        echo "--- $target"
+        mkdir -p fuzz/corpus/$target fuzz/seeds/$target
+        if ! cargo +nightly fuzz run --target "$host" $target fuzz/corpus/$target fuzz/seeds/$target -- \
+            {{limits}} -timeout=10 -print_final_stats=1 > fuzz/$target.log 2>&1; then
+            grep -v "^#[0-9]" fuzz/$target.log | tail -60
+            echo "the input that failed is in fuzz/artifacts/$target"
+            exit 1
+        fi
+        grep -E "^Done|new_units_added" fuzz/$target.log
+    done
+
 # Build the website (landing page, install script and docs) as the docs workflow does, and serve it at http://localhost:8000
 site:
     rm -rf _site

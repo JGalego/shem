@@ -1,0 +1,63 @@
+# Fuzz targets for what shem reads from images, which anyone can make: run
+# them with `just fuzz` (nightly Rust and cargo-fuzz).
+[package]
+name = "shem-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+shem = { path = "../crates/shem" }
+tempfile = "3"
+
+# A workspace of its own, built with nightly Rust and sanitizers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "archive"
+path = "fuzz_targets/archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf"
+path = "fuzz_targets/elf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frozen"
+path = "fuzz_targets/frozen.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "layer"
+path = "fuzz_targets/layer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "machine"
+path = "fuzz_targets/machine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shemfile"
+path = "fuzz_targets/shemfile.rs"
+test = false
+doc = false
+bench = false

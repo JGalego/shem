@@ -1,0 +1,43 @@
+name: Fuzz
+
+# Fuzzing finds new inputs at random, so it runs apart from CI, which tries
+# the seeds alone: every day, and by hand. An input that fails is kept as an
+# artifact; once fixed, it belongs in fuzz/seeds, which CI tries every time.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: How long to fuzz each target
+        default: "300"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz (archives, programs, frozen state, layers, Shemfiles)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: extractions/setup-just@v4
+      - name: Fuzz each target
+        run: just fuzz ${{ inputs.seconds || '300' }}
+      - name: Keep the inputs that failed
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

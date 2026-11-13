@@ -78,6 +78,28 @@ jobs:
       - name: Unit tests, then riscv-tests, random programs, VM mode and Linux on both vCPUs
         run: just neural-tests
 
+  fuzz:
+    name: Fuzz targets (archives, programs, frozen state, layers, Shemfiles)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: extractions/setup-just@v4
+      - name: Try each target's seeds, the same inputs on every run
+        run: just fuzz-ci
+      - name: Keep the inputs that failed
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
   vm:
     name: VM mode (boots Linux)
     runs-on: ubuntu-latest
