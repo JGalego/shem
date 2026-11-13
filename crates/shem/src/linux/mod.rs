@@ -824,7 +824,8 @@ impl Process {
     /// Rebuild a frozen process as init, with its standard streams on `stdio`.
     pub fn thaw(frozen: &FrozenProcess, stdio: Stdio) -> Self {
         let mut process = Self::new(1, stdio, 0, 0);
-        process.cwd = frozen.cwd.clone().into_bytes();
+        // An image's own: absolute, and with no `..` left to climb with
+        process.cwd = files::normalize(b"/", frozen.cwd.as_bytes());
         process.umask = frozen.umask;
         process.mm = frozen.mm.clone();
         process.signals = Signals::thaw(&frozen.signals);

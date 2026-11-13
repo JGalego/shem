@@ -118,6 +118,19 @@ struct Dir {
     next: usize,
 }
 
+impl Dir {
+    /// Where the directory is on the host now: its guest path resolved
+    /// through the root again, since the guest may have put a symlink where
+    /// it was. Without a root, where it was.
+    fn host_now(&self, root: Option<&RootFs>) -> Result<PathBuf, Errno> {
+        match (root, &self.host) {
+            (Some(root), _) => Ok(root.resolve(b"/", &self.guest, true)?.host),
+            (None, Some(host)) => Ok(host.clone()),
+            (None, None) => Err(Errno::ENOENT),
+        }
+    }
+}
+
 struct Dirent {
     ino: u64,
     kind: u8,
@@ -311,9 +324,9 @@ impl Description {
     fn stat(&self, root: Option<&RootFs>) -> Result<Stat, Errno> {
         match &self.kind {
             Kind::File(file) => Ok(guest_stat(root, &file.metadata()?)),
-            Kind::Dir(Dir {
-                host: Some(host), ..
-            }) => Ok(guest_stat(root, &std::fs::metadata(host)?)),
+            Kind::Dir(dir @ Dir { host: Some(_), .. }) => {
+                Ok(guest_stat(root, &std::fs::metadata(dir.host_now(root)?)?))
+            }
             Kind::Dir(dir) => Ok(proc::stat(&dir.guest, &Node::Dir(Vec::new()))),
             Kind::Proc { path, .. } => Ok(proc::stat(path, &Node::File(Vec::new()))),
             Kind::Input(_) | Kind::Output(_) => Ok(Stat::char_device()),
@@ -472,6 +485,10 @@ impl Process {
         let kind = match std::fs::symlink_metadata(&resolved.host) {
             Ok(meta) if meta.is_symlink() => return Err(Errno::ELOOP),
             Ok(_) if creating && flags & O_EXCL != 0 => return Err(Errno::EEXIST),
+            // Device nodes, FIFOs and sockets an image carries would be the
+            // host's own, opened by a host process that may be root: refused,
+            // as a container's device cgroup refuses devices it does not list
+            Ok(meta) if !meta.is_file() && !meta.is_dir() => return Err(Errno::EPERM),
             Ok(meta) if meta.is_dir() => {
                 if access != O_RDONLY || creating {
                     return Err(Errno::EISDIR);
@@ -497,6 +514,9 @@ impl Process {
                     options.create(true).write(true);
                 }
                 let file = options.open(&resolved.host)?;
+                if !file.metadata()?.is_file() {
+                    return Err(Errno::EPERM);
+                }
                 if !existed {
                     self.created(&resolved);
                 } else if flags & O_TRUNC != 0 && access != O_RDONLY {
@@ -1001,7 +1021,7 @@ impl Process {
     }
 
     /// Set access and modification times. `UTIME_NOW` means the virtual clock's
-    /// current time. Symlinks are always followed.
+    /// current time. With `AT_SYMLINK_NOFOLLOW`, a symlink gets its own.
     pub(super) fn utimensat(
         &mut self,
         vcpu: &mut dyn Vcpu,
@@ -1026,12 +1046,25 @@ impl Process {
                 };
             }
         }
-        let file = if path == 0 {
+        // The host's utimensat on the resolved path, which never follows its
+        // last component: a symlink there gets times of its own, as with
+        // AT_SYMLINK_NOFOLLOW, and the resolver has already followed it
+        // inside the root otherwise. Nothing is opened, devices included.
+        let host = if path == 0 {
             match &self.files.get(dirfd)?.lock().unwrap().kind {
-                Kind::File(file) => file.try_clone()?,
-                Kind::Dir(Dir {
-                    host: Some(host), ..
-                }) => File::open(host)?,
+                Kind::File(file) => {
+                    let at = |ns: u64| SystemTime::UNIX_EPOCH + Duration::from_nanos(ns);
+                    let mut file_times = std::fs::FileTimes::new();
+                    if let Some(ns) = stamps[0] {
+                        file_times = file_times.set_accessed(at(ns));
+                    }
+                    if let Some(ns) = stamps[1] {
+                        file_times = file_times.set_modified(at(ns));
+                    }
+                    file.set_times(file_times)?;
+                    return Ok(0);
+                }
+                Kind::Dir(dir @ Dir { host: Some(_), .. }) => dir.host_now(self.root.as_deref())?,
                 Kind::Dir(_)
                 | Kind::Proc { .. }
                 | Kind::Input(_)
@@ -1041,17 +1074,9 @@ impl Process {
             }
         } else {
             let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-            File::open(self.resolve_at(vcpu, dirfd, path, follow)?.host)?
+            self.resolve_at(vcpu, dirfd, path, follow)?.host
         };
-        let at = |ns: u64| SystemTime::UNIX_EPOCH + Duration::from_nanos(ns);
-        let mut file_times = std::fs::FileTimes::new();
-        if let Some(ns) = stamps[0] {
-            file_times = file_times.set_accessed(at(ns));
-        }
-        if let Some(ns) = stamps[1] {
-            file_times = file_times.set_modified(at(ns));
-        }
-        file.set_times(file_times)?;
+        set_times(&host, stamps[0], stamps[1])?;
         Ok(0)
     }
 
@@ -1263,7 +1288,7 @@ impl Process {
 
 /// Join `path` to the guest directory `base` and resolve `.` and `..` by text
 /// alone, the way device paths are matched.
-fn normalize(base: &[u8], path: &[u8]) -> Vec<u8> {
+pub(super) fn normalize(base: &[u8], path: &[u8]) -> Vec<u8> {
     let mut parts: Vec<&[u8]> = Vec::new();
     let start: &[u8] = if path.starts_with(b"/") { b"" } else { base };
     for part in start
@@ -1389,23 +1414,35 @@ fn stamp(path: &std::path::Path, access: Option<u64>, modify: Option<u64>) {
             tv_nsec: libc::UTIME_OMIT,
         },
     };
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return;
-    };
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
     let times = [timespec(access), timespec(modify)];
     // SAFETY: a NUL-terminated path and two timespecs, as utimensat expects.
-    unsafe {
+    let status = unsafe {
         libc::utimensat(
             libc::AT_FDCWD,
             path.as_ptr(),
             times.as_ptr(),
             libc::AT_SYMLINK_NOFOLLOW,
-        );
+        )
+    };
+    match status {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error().into()),
     }
 }
 
 const STATFS_SIZE: usize = 88;
 const SHEM_MAGIC: u32 = 0x5348_454d; // "SHEM"
+    let _ = set_times(path, access, modify);
+}
+
+/// Set the times of the file at the host `path`, or of the symlink there,
+/// which is not followed.
+fn set_times(
+    path: &std::path::Path,
+    access: Option<u64>,
+    modify: Option<u64>,
+) -> Result<(), Errno> {
 const PROC_SUPER_MAGIC: u32 = 0x9fa0;
 const PIPEFS_MAGIC: u32 = 0x5049_5045;
 /// The root filesystem's size in 4 KiB blocks, and its inode count: 4 GiB.

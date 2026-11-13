@@ -50,6 +50,7 @@ const GETRANDOM: u32 = 278;
 const STATX: u32 = 291;
 const CLOCK_GETTIME64: u32 = 403;
 const CLOCK_NANOSLEEP_TIME64: u32 = 407;
+const UTIMENSAT_TIME64: u32 = 412;
 
 const AT_FDCWD: u32 = -100i32 as u32;
 const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -78,6 +79,7 @@ const PROT_WRITE: u32 = 2;
 const MAP_SHARED: u32 = 1;
 const MAP_PRIVATE: u32 = 2;
 
+const EPERM: i32 = -1;
 const ENOENT: i32 = -2;
 const EBADF: i32 = -9;
 const EEXIST: i32 = -17;
@@ -549,6 +551,36 @@ fn a_directory_swapped_for_a_link_after_the_guest_got_there_stays_inside_the_roo
 
     assert_eq!(fs::read(outside.join("secret")).unwrap(), b"host data");
     assert!(!outside.join("planted").exists());
+}
+
+#[test]
+fn special_files_in_the_root_are_not_opened_on_the_host() {
+    let mut g = Guest::new();
+    let fifo = std::ffi::CString::new(g.host("fifo").to_str().unwrap()).unwrap();
+    // SAFETY: a NUL-terminated path
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o666) }, 0);
+    assert_eq!(g.open("/fifo", O_RDWR), EPERM);
+    assert_eq!(g.open("/fifo", O_RDONLY | O_NONBLOCK), EPERM);
+}
+
+#[test]
+fn file_times_set_without_following_go_to_the_link_itself() {
+    use std::os::unix::fs::MetadataExt;
+    let mut g = Guest::new();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    let before = fs::metadata(outside.path()).unwrap().mtime();
+    std::os::unix::fs::symlink(outside.path(), g.host("link")).unwrap();
+    let path = g.cstr("/link");
+    let mut times = Vec::new();
+    for _ in 0..2 {
+        times.extend(1i64.to_le_bytes());
+        times.extend(0i64.to_le_bytes());
+    }
+    let times = g.put(&times);
+    let flags = AT_SYMLINK_NOFOLLOW;
+    assert_eq!(g.call(UTIMENSAT_TIME64, &[AT_FDCWD, path, times, flags]), 0);
+    assert_eq!(fs::symlink_metadata(g.host("link")).unwrap().mtime(), 1);
+    assert_eq!(fs::metadata(outside.path()).unwrap().mtime(), before);
 }
 
 #[test]
