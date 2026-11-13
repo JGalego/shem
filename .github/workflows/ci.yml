@@ -282,11 +282,22 @@ jobs:
       - name: Package and verify the crates, as a release would
         run: cargo publish --workspace --dry-run --locked
       - name: Build the Python package
-        run: uv build --project neural
+        run: uv build --project neural --out-dir target/dist
       - name: Export the compiled CPU, as a release publishes it on Hugging Face
         run: |
           uv run --project neural python -m shem_neural.export target/weights
           test -s target/weights/model.safetensors && test -s target/weights/README.md
+      - name: Build and run a model image as a release does, with shem-neural from its wheel instead of this checkout
+        run: |
+          cargo build --release --locked -p shem
+          dir=target/release-path && mkdir -p $dir
+          printf 'FROM hf.co/trl-internal-testing/tiny-Qwen3ForCausalLM\n' > $dir/Shemfile
+          # With no neural/ next to its source, shem runs shem-neural==VERSION
+          # from the package index, as a release does, and the wheel stands in
+          mv neural target/neural-elsewhere
+          export UV_FIND_LINKS=$PWD/target/dist SHEM_HOME=$PWD/$dir/home
+          target/release/shem build -t tiny $dir
+          target/release/shem run tiny --max-tokens 4 Hello
 
   models:
     name: Model images (against transformers)

@@ -737,15 +737,20 @@ def import_model(repo: str, out: Path, revision: str | None = None) -> Manifest:
 
 
 def repo_files(repo: str) -> list[str]:
-    """The files of a Hugging Face repo, or offline, those the cache has."""
-    import requests
+    """The files of a Hugging Face repo, or, when the Hub cannot list them
+    (offline, or out of reach), those the cache has. Which errors a Hub that
+    is out of reach raises depends on the HTTP library huggingface_hub is
+    built on, so any failure turns to the cache, and without a copy there,
+    the failure stands."""
     from huggingface_hub import list_repo_files
-    from huggingface_hub.errors import OfflineModeIsEnabled
 
     try:
         return list_repo_files(repo)
-    except (OfflineModeIsEnabled, requests.ConnectionError, requests.Timeout):
-        cached = Path(snapshot_download(repo, allow_patterns=["*.gguf", "config.json"], local_files_only=True))
+    except Exception as error:
+        try:
+            cached = Path(snapshot_download(repo, allow_patterns=["*.gguf", "config.json"], local_files_only=True))
+        except Exception:
+            raise error from None
         return [path.name for path in cached.iterdir()]
 
 

@@ -9,6 +9,7 @@ real checkpoints.
 
 import json
 import math
+import sys
 from pathlib import Path
 
 import pytest
@@ -485,6 +486,34 @@ def test_gguf_files_are_picked_by_their_quantization():
         pick_gguf("Qwen/Qwen3-0.6B-GGUF", files, None)
     with pytest.raises(SystemExit, match="matches none"):
         pick_gguf("Qwen/Qwen3-0.6B-GGUF", files, "IQ2_XS")
+
+
+def test_repo_files_turn_to_the_cache_when_the_hub_is_out_of_reach(monkeypatch, tmp_path):
+    """Listing a repo needs no requests, which shem-neural does not depend
+    on, so a release's environment lacks it. With the Hub out of reach,
+    whatever error its HTTP library raises, the cache's files stand in, and
+    without a copy there, the Hub's error stands."""
+    import huggingface_hub
+
+    from shem_neural.model import importers
+
+    class Unreachable(Exception):
+        pass
+
+    def unreachable(repo):
+        raise Unreachable("[Errno 111] Connection refused")
+
+    def uncached(repo, **options):
+        raise FileNotFoundError(f"{repo} is not in the cache")
+
+    monkeypatch.setitem(sys.modules, "requests", None)
+    monkeypatch.setattr(huggingface_hub, "list_repo_files", unreachable)
+    (tmp_path / "config.json").write_text("{}")
+    monkeypatch.setattr(importers, "snapshot_download", lambda repo, **options: str(tmp_path))
+    assert importers.repo_files("org/model") == ["config.json"]
+    monkeypatch.setattr(importers, "snapshot_download", uncached)
+    with pytest.raises(Unreachable):
+        importers.repo_files("org/model")
 
 
 def test_templates_with_generation_blocks_render_their_text(tmp_path):
