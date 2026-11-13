@@ -1,11 +1,20 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/client/llb/sourceresolver"
+	"github.com/moby/buildkit/frontend/dockerfile/dockerfile2llb"
+	digest "github.com/opencontainers/go-digest"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 const neural = "shem-neural:test"
@@ -80,10 +89,17 @@ func TestModelDockerfileExamples(t *testing.T) {
 	for _, example := range []struct {
 		directory string
 		model     string
+		revision  string
 	}{
-		{"qwen3", "Qwen/Qwen3-0.6B"},
-		{"qwen3.5", "Qwen/Qwen3.5-0.8B"},
-		{"golem", "Qwen/Qwen3.5-0.8B"},
+		{"qwen3", "Qwen/Qwen3-0.6B", ""},
+		{"qwen3.5", "Qwen/Qwen3.5-0.8B", ""},
+		{"golem", "Qwen/Qwen3.5-0.8B", ""},
+		{"smollm2", "HuggingFaceTB/SmolLM2-360M-Instruct", ""},
+		{"granite-moe", "ibm-granite/granite-3.1-1b-a400m-instruct", ""},
+		{"mamba", "state-spaces/mamba-130m-hf", ""},
+		{"llama-gguf", "bartowski/Llama-3.2-1B-Instruct-GGUF", "Q4_K_M"},
+		{"gemma3", "google/gemma-3-1b-it", ""},
+		{"handbook", "allenai/OLMo-2-0425-1B-Instruct", ""},
 	} {
 		t.Run(example.directory, func(t *testing.T) {
 			directory := filepath.Join("..", "examples", example.directory)
@@ -98,20 +114,79 @@ func TestModelDockerfileExamples(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(imports) != 1 || imports[0] != (Import{"shem-import-0", example.model, ""}) {
+			if len(imports) != 1 || imports[0] != (Import{"shem-import-0", example.model, example.revision}) {
 				t.Fatalf("imports %+v", imports)
 			}
 			shemfile, err := os.ReadFile(filepath.Join(directory, "Shemfile"))
 			if err != nil {
 				t.Fatal(err)
 			}
-			imported := map[string]Imported{"shem-import-0": {Files: []string{"shem.json"}}}
+			imported := map[string]Imported{"shem-import-0": {Files: []string{
+				"shem.json", "tokenizer.json", "embed.safetensors", "blocks/000-attention.safetensors",
+			}}}
 			got := transpile(t, string(src), imported)
 			want := transpile(t, string(shemfile), imported)
 			if got != want {
 				t.Errorf("Dockerfile and Shemfile differ:\nDockerfile:\n%s\nShemfile:\n%s", got, want)
 			}
+			lintClean(t, got)
 		})
+	}
+}
+
+// lintClean runs BuildKit's checks on a transpiled Dockerfile, as docker
+// build does: a warning would point at a line of a file the user never sees.
+func lintClean(t *testing.T, dockerfile string) {
+	t.Helper()
+	var err error
+	ctx := context.Background()
+	source := llb.Scratch().File(llb.Mkfile("Dockerfile", 0o644, []byte(dockerfile)))
+	sourceMap := llb.NewSourceMap(&source, "Dockerfile", "Dockerfile", []byte(dockerfile))
+	if sourceMap.Definition, err = source.Marshal(ctx); err != nil {
+		t.Fatal(err)
+	}
+	results, err := dockerfile2llb.DockerfileLint(ctx, []byte(dockerfile), dockerfile2llb.ConvertOpt{
+		SourceMap:    sourceMap,
+		MetaResolver: offline{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results.Error != nil {
+		t.Errorf("BuildKit can't read the Dockerfile: %s\n%s", results.Error.Message, dockerfile)
+	}
+	for _, warning := range results.Warnings {
+		t.Errorf("BuildKit warns %s: %s\n%s", warning.RuleName, warning.Detail, dockerfile)
+	}
+}
+
+// offline resolves every image to an empty one for the platform asked for,
+// with no registry: in a real build the imports are named contexts.
+type offline struct{}
+
+func (offline) ResolveImageConfig(_ context.Context, ref string, opt sourceresolver.Opt) (string, digest.Digest, []byte, error) {
+	platform := ocispecs.Platform{OS: "linux", Architecture: runtime.GOARCH}
+	if opt.ImageOpt != nil && opt.ImageOpt.Platform != nil {
+		platform = *opt.ImageOpt.Platform
+	}
+	config, err := json.Marshal(ocispecs.Image{Platform: platform})
+	return ref, digest.FromBytes(config), config, err
+}
+
+func TestModelStagesTakeTheirOwnEntrypoint(t *testing.T) {
+	for _, src := range []string{
+		"FROM hf.co/HuggingFaceTB/SmolLM2-360M-Instruct\nENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"96\"]\n",
+		"FROM hf.co/HuggingFaceTB/SmolLM2-360M-Instruct\nWARM --until=prompt\nENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"96\"]\n",
+	} {
+		out := transpile(t, src, map[string]Imported{"shem-import-0": {Files: []string{"shem.json"}}})
+		if strings.Count(out, "ENTRYPOINT") != 1 || !strings.Contains(out, `ENTRYPOINT ["shem:generate", "--max-tokens", "96"]`) {
+			t.Errorf("want the stage's own ENTRYPOINT alone in\n%s", out)
+		}
+		lintClean(t, out)
+	}
+	out := transpile(t, "FROM hf.co/HuggingFaceTB/SmolLM2-360M-Instruct\n", map[string]Imported{"shem-import-0": {Files: []string{"shem.json"}}})
+	if !strings.Contains(out, `ENTRYPOINT ["shem:generate"]`) {
+		t.Errorf("want the default ENTRYPOINT in\n%s", out)
 	}
 }
 

@@ -195,7 +195,9 @@ func Transpile(src []byte, imported map[string]Imported, artifacts map[string]st
 			if model.License != "" {
 				write(`LABEL org.opencontainers.image.licenses=%s`, jsonString(model.License))
 			}
-			write(`ENTRYPOINT ["shem:generate"]`)
+			if !sets(st, "entrypoint") {
+				write(`ENTRYPOINT ["shem:generate"]`)
+			}
 			entrypoint = []string{"shem:generate"}
 		case isArtifact:
 			// The artifact's files at the root, as in the twin shem makes of it
@@ -209,7 +211,9 @@ func Transpile(src []byte, imported map[string]Imported, artifacts map[string]st
 			}
 			write(`LABEL dev.shem.machine="rv32im" dev.shem.model=%s`, jsonString(model.Model))
 			write(`LABEL org.opencontainers.image.base.name=%s`, jsonString(st.base))
-			write(`ENTRYPOINT ["shem:generate"]`)
+			if !sets(st, "entrypoint") {
+				write(`ENTRYPOINT ["shem:generate"]`)
+			}
 			entrypoint = []string{"shem:generate"}
 		case !shem && !strings.Contains(flags, "--platform"):
 			write("FROM --platform=$BUILDPLATFORM %s%s%s", flags, st.base, as(st.name))
@@ -273,6 +277,18 @@ func Transpile(src []byte, imported map[string]Imported, artifacts map[string]st
 		}
 	}
 	return out.String(), nil
+}
+
+// sets tells whether a stage has an instruction of its own, such as an
+// ENTRYPOINT that would replace the model's default one: BuildKit warns
+// about a stage that sets it twice.
+func sets(st stage, instruction string) bool {
+	for _, node := range st.nodes {
+		if strings.EqualFold(node.Value, instruction) {
+			return true
+		}
+	}
+	return false
 }
 
 // modelCopies copies an import's files, from `from` in its context to `to`:
