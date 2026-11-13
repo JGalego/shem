@@ -23,6 +23,10 @@ RUN uv sync --frozen --no-dev --extra gguf \
     && uv pip install --python .venv/bin/python "gradio[oauth]>=5,<7" \
     && chown -R user /opt/shem
 USER user
+# Gradio logs users in with Hugging Face's OAuth when SYSTEM is spaces and
+# SPACE_ID names the Space, which Docker Spaces set but not SYSTEM; run
+# elsewhere, without SPACE_ID, it mocks the login as before
+ENV SYSTEM=spaces
 WORKDIR /home/user/app
 COPY --chown=user app.py convert.py ./
 EXPOSE 7860
