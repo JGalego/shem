@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/JGalego/shem/actions/workflows/ci.yml/badge.svg)](https://github.com/JGalego/shem/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](Cargo.toml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Status](https://img.shields.io/badge/status-experimental-orange)](docs/architecture.md#roadmap)
 
 shem treats the host as a hypervisor and a model as the machine. The model supplies a CPU, compiled into its weights, and RAM, which is its recurrent state, as in [Qwenputer](https://divagr.com/blog/qwenputer). The host supplies everything else: system calls, devices, scheduling and storage. [Shemfiles](docs/shemfile.md) build OCI images that can include a frozen process, a booted kernel or a language-model session.
@@ -262,8 +262,8 @@ Install a release's binaries without compiling, with [cargo-binstall](https://gi
 
 ### Contribute
 
-Fork the repository, make your change on a branch with its tests and docs, and open a pull request once CI is green. For a change to the design, open an issue first. Contributions are under the [MIT license](LICENSE).
+Fork the repository, make your change on a branch with its tests and docs, and open a pull request once CI is green. For a change to the design, open an issue first. Sign off your commits (`git commit -s`), as [CONTRIBUTING.md](CONTRIBUTING.md) explains. Contributions are under the [Apache 2.0 license](LICENSE).
 
 ## License
 
-[MIT](LICENSE)
+[Apache 2.0](LICENSE)

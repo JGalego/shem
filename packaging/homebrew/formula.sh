@@ -11,7 +11,7 @@ class Shem < Formula
   desc "Run containers and VMs inside a model's weights"
   homepage "https://github.com/JGalego/shem"
   version "$version"
-  license "MIT"
+  license "Apache-2.0"
 
   on_macos do
     on_arm do

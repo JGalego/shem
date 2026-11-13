@@ -4,7 +4,7 @@
   "description": "Dockerfile highlighting and a file icon for Shemfiles, with WARM and KERNEL",
   "publisher": "shem",
   "version": "0.0.1",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": "https://github.com/JGalego/shem",
   "engines": { "vscode": "^1.88.0" },
   "extensionKind": ["workspace"],
