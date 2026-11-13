@@ -263,6 +263,35 @@ fn read_blob(dir: &Path, descriptor: &Descriptor) -> anyhow::Result<Vec<u8>> {
     Ok(data)
 }
 
+/// What an image runs, as `shem images` lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Program,
+    Vm,
+    Model,
+    /// An artifact shem does not run
+    Other,
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            Kind::Program => "program",
+            Kind::Vm => "vm",
+            Kind::Model => "model",
+            Kind::Other => "other",
+        })
+    }
+}
+
+/// An image in the store at a glance: what it runs, and the bytes its
+/// compressed blobs take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Summary {
+    pub kind: Kind,
+    pub size: u64,
+}
+
 /// The image manifest that `entry` of the layout in `dir` leads to. An
 /// index, such as the manifest list BuildKit writes beside its attestations,
 /// holds the image for linux/riscv32 among others.
@@ -538,6 +567,30 @@ impl Image {
             layers,
             subject: manifest.subject,
         })
+    }
+
+    /// What the layout in `dir` holds and the bytes its blobs take, read from
+    /// its manifest and config alone: layers can be gigabytes of weights.
+    pub fn layout_summary(dir: &Path) -> anyhow::Result<Summary> {
+        let index: Index = serde_json::from_slice(&std::fs::read(dir.join("index.json"))?)?;
+        let entry = index.manifests.first().context("no manifest")?;
+        let manifest = layout_manifest(dir, entry)?;
+        let size = manifest.config.size + manifest.layers.iter().map(|l| l.size).sum::<u64>();
+        let config = match manifest.config.media_type.as_str() {
+            OCI_CONFIG_TYPE | DOCKER_CONFIG_TYPE => Some(Config::from_oci(
+                &serde_json::from_slice(&read_blob(dir, &manifest.config)?)?,
+            )?),
+            CONFIG_TYPE => Some(serde_json::from_slice(&read_blob(dir, &manifest.config)?)?),
+            _ => None,
+        };
+        let kind = match config {
+            Some(config) if config.model.is_some() => Kind::Model,
+            Some(config) if config.kernel.is_some() => Kind::Vm,
+            Some(_) => Kind::Program,
+            None if modelpack::Artifact::read(dir)?.is_some() => Kind::Model,
+            None => Kind::Other,
+        };
+        Ok(Summary { kind, size })
     }
 
     /// The manifest digest of the image's layout in `dir`.

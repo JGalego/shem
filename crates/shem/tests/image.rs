@@ -401,6 +401,43 @@ fn a_model_image_session_cannot_write_outside_it() {
 }
 
 #[test]
+fn layouts_summarize_what_they_run_and_the_bytes_they_take() {
+    let dir = tempfile::tempdir().unwrap();
+    let summarize = |config: image::Config| {
+        let layout = tempfile::tempdir_in(dir.path()).unwrap();
+        let image = Image {
+            config,
+            layers: vec![image::Layer::new(
+                image::ROOTFS_TYPE,
+                tar_of(&[("a", b"a")]),
+            )],
+            subject: None,
+        };
+        image.write_layout(layout.path(), "latest").unwrap();
+        let blobs: u64 = fs::read_dir(layout.path().join("blobs/sha256"))
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        let summary = Image::layout_summary(layout.path()).unwrap();
+        // Every blob but the manifest's own
+        let manifest = Image::layout_descriptor(layout.path()).unwrap().size;
+        assert_eq!(summary.size, blobs - manifest);
+        summary.kind
+    };
+    let model = image::Config {
+        model: Some("/model".into()),
+        ..Default::default()
+    };
+    let vm = image::Config {
+        kernel: Some("/boot/Image".into()),
+        ..Default::default()
+    };
+    assert_eq!(summarize(Default::default()), image::Kind::Program);
+    assert_eq!(summarize(vm), image::Kind::Vm);
+    assert_eq!(summarize(model), image::Kind::Model);
+}
+
+#[test]
 fn images_can_be_listed_under_other_platforms_too() {
     let ctx = context(
         "FROM scratch\nCOPY hello /bin/hello\nENTRYPOINT [\"/bin/hello\"]\n",

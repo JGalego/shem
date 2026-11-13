@@ -681,11 +681,65 @@ fn pull(args: PullArgs) -> anyhow::Result<u8> {
     Ok(0)
 }
 
+/// List the store as `docker images` does: a column each for the reference,
+/// the short manifest digest, what the image runs and its stored size. On a
+/// terminal, and unless NO_COLOR is set, the header is bold and the tag and
+/// ID dim.
 fn images() -> anyhow::Result<u8> {
-    for (reference, digest) in Store::open()?.list()? {
-        println!("{reference:<40} {}", &digest[..19]);
+    use std::io::IsTerminal;
+    let store = Store::open()?;
+    let mut rows = Vec::new();
+    for (reference, digest) in store.list()? {
+        let summary = Image::layout_summary(&store.path(&reference)?)?;
+        let id = digest.trim_start_matches("sha256:");
+        rows.push((reference, id[..12.min(id.len())].to_string(), summary));
+    }
+    let style = std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    let paint = |code: &str, text: &str| match style {
+        true => format!("\x1b[{code}m{text}\x1b[0m"),
+        false => text.to_string(),
+    };
+    let width = rows
+        .iter()
+        .map(|(reference, ..)| reference.chars().count())
+        .chain(["IMAGE".len()])
+        .max()
+        .unwrap_or_default();
+    let header = format!(
+        "{:<width$}   {:<12}   {:<7}   {:>8}",
+        "IMAGE", "ID", "KIND", "SIZE"
+    );
+    println!("{}", paint("1", &header));
+    for (reference, id, summary) in rows {
+        let pad = " ".repeat(width - reference.chars().count());
+        let (name, tag) = image::parse_reference(&reference)?;
+        let reference = format!("{name}{}", paint("2", &format!(":{tag}")));
+        println!(
+            "{reference}{pad}   {}   {:<7}   {:>8}",
+            paint("2", &id),
+            summary.kind,
+            human_size(summary.size),
+        );
     }
     Ok(0)
+}
+
+/// `bytes` in decimal units, as `docker images` shows sizes: 435kB, 1.81MB.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1000.0 && unit < UNITS.len() - 1 {
+        size /= 1000.0;
+        unit += 1;
+    }
+    match unit {
+        0 => format!("{bytes}B"),
+        _ if size < 10.0 => format!("{size:.2}{}", UNITS[unit]),
+        _ if size < 100.0 => format!("{size:.1}{}", UNITS[unit]),
+        _ => format!("{size:.0}{}", UNITS[unit]),
+    }
 }
 
 fn parse_size(text: &str) -> anyhow::Result<u32> {
