@@ -359,10 +359,11 @@ impl<V: Vcpu> Machine<V> {
                 budget = budget.min(max - self.steps);
             }
             if let Some(Pause::Steps(at)) = self.pause {
-                budget = budget.min(at - self.steps);
+                budget = budget.min(at.saturating_sub(self.steps));
             }
             let exit = self.vcpu.run(budget);
-            self.steps += exit.steps;
+            // A frozen machine's count may be near its limit: it stops there
+            self.steps = self.steps.saturating_add(exit.steps);
             let pc = exit.pc;
             match exit.reason {
                 ExitReason::Budget => {}
@@ -400,7 +401,7 @@ impl<V: Vcpu> Machine<V> {
     }
 
     fn mtime(&self) -> u64 {
-        self.steps / INSTRUCTIONS_PER_TICK + self.idle_ticks
+        (self.steps / INSTRUCTIONS_PER_TICK).saturating_add(self.idle_ticks)
     }
 
     fn timer_enabled(&self) -> bool {
@@ -464,7 +465,7 @@ impl<V: Vcpu> Machine<V> {
                     && self.mtimecmp != u64::MAX
                 {
                     let skipped = self.mtimecmp - self.mtime();
-                    self.idle_ticks += skipped;
+                    self.idle_ticks = self.idle_ticks.saturating_add(skipped);
                     self.console
                         .wait(Duration::from_micros(skipped.min(10_000)));
                 }

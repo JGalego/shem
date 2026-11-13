@@ -385,8 +385,11 @@ impl<V: Vcpu + Clone> Container<V> {
             budget = budget.min(at - self.steps);
         }
         let exit = cpu(&task.core, tid).run(budget);
-        self.steps += exit.steps;
-        task.process.borrow_mut().cpu_ns += exit.steps;
+        // Counts a frozen container brings may be near their limits: they stop there
+        self.steps = self.steps.saturating_add(exit.steps);
+        let mut process = task.process.borrow_mut();
+        process.cpu_ns = process.cpu_ns.saturating_add(exit.steps);
+        drop(process);
         let init = tid == INIT;
         match exit.reason {
             ExitReason::Budget => {}

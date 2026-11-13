@@ -159,6 +159,28 @@ fn warm_images_resume_at_the_frozen_system_call() {
 }
 
 #[test]
+fn frozen_counts_near_their_limits_go_on_without_overflowing() {
+    let shemfile = "FROM scratch\nCOPY echo /bin/echo\nENTRYPOINT [\"/bin/echo\"]\nWARM --until=syscall:read\n";
+    let ctx = context(shemfile, &[("echo", echo())]);
+    let image = build(ctx.path()).unwrap();
+    // As a state from an image's own files may set them
+    let mut frozen = image.warm_state().unwrap().unwrap();
+    frozen.machine.instret = u64::MAX - 1;
+    frozen.host.steps = u64::MAX - 1;
+    frozen.host.process.cpu_ns = u64::MAX - 1;
+    frozen.host.linux.slept_ns = u64::MAX - 1;
+    let stdout = SharedBuf::default();
+    let stdio = Stdio {
+        stdin: Box::new(std::io::Cursor::new(b"ping\n".to_vec())),
+        stdout: Box::new(stdout.clone()),
+        stderr: Box::new(std::io::sink()),
+    };
+    let mut container = Container::thaw(ReferenceVcpu::new(MEM), &frozen, stdio).unwrap();
+    assert_eq!(container.run(None).unwrap(), 0);
+    assert_eq!(stdout.contents(), b"ping\n");
+}
+
+#[test]
 fn images_save_as_docker_archives_with_their_state_as_files() {
     use std::collections::BTreeMap;
     use std::io::Read;

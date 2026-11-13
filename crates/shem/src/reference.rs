@@ -220,7 +220,8 @@ impl Vcpu for ReferenceVcpu {
             }
             steps += 1;
         };
-        self.instret += steps;
+        // The architectural counter wraps, whatever a restored state set it to
+        self.instret = self.instret.wrapping_add(steps);
         Exit {
             reason,
             pc: self.pc,

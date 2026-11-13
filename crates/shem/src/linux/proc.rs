@@ -183,7 +183,7 @@ fn top_file(name: &str, s: &Snapshot) -> Vec<u8> {
     let last_pid = s.processes.iter().map(|p| p.pid).max().unwrap_or(0);
     let used: u64 = s.processes.iter().map(|p| p.vsize).sum();
     let free = s.mem_total.saturating_sub(used);
-    let busy: u64 = s.processes.iter().map(|p| p.cpu_ns).sum();
+    let busy = (s.processes.iter()).fold(0u64, |busy, p| busy.saturating_add(p.cpu_ns));
     match name {
         "uptime" => format!("{} {}\n", centis(s.uptime_ns), centis(s.idle_ns)),
         "loadavg" => format!(

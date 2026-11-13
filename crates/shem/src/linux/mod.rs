@@ -301,12 +301,13 @@ impl Linux {
         let nr = vcpu.reg(A7);
         let a: [u32; 6] = std::array::from_fn(|i| vcpu.reg(A0 + i));
         let p = process;
-        p.now = EPOCH_NS + retired + self.slept_ns;
+        let elapsed = retired.saturating_add(self.slept_ns);
+        p.now = EPOCH_NS.saturating_add(elapsed);
         let processes = std::mem::take(&mut self.processes);
         let s = &proc::Snapshot {
             processes: &processes,
             me: p.pid,
-            uptime_ns: retired + self.slept_ns,
+            uptime_ns: elapsed,
             idle_ns: self.slept_ns,
             mem_total: vcpu.mem_size() as u64,
         };
@@ -682,9 +683,11 @@ impl Linux {
     }
 
     fn now_ns(&self, clock: u32, retired: u64) -> Result<u64, Errno> {
-        let elapsed = retired + self.slept_ns;
+        let elapsed = retired.saturating_add(self.slept_ns);
         match clock {
-            CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_TAI => Ok(EPOCH_NS + elapsed),
+            CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_TAI => {
+                Ok(EPOCH_NS.saturating_add(elapsed))
+            }
             0..=11 => Ok(elapsed), // monotonic, boot-time and CPU-time clocks
             _ => Err(Errno::EINVAL),
         }
