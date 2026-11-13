@@ -19,9 +19,12 @@ ENV HOME=/home/user \
 COPY --from=shem /src/target/release/shem /usr/local/bin/shem
 COPY --from=shem /src/neural /opt/shem/neural
 WORKDIR /opt/shem/neural
-RUN uv sync --frozen --no-dev --extra gguf \
-    && uv pip install --python .venv/bin/python "gradio[oauth]>=5,<7" \
-    && chown -R user /opt/shem
+# Without uv's cache, which as root would leave the user's home unwritable.
+# Gradio's reloader in a Space needs the spaces package, which Gradio Spaces
+# come with and Docker Spaces don't
+RUN uv sync --frozen --no-dev --extra gguf --no-cache \
+    && uv pip install --no-cache --python .venv/bin/python "gradio[oauth]>=5,<7" "spaces>=0.43" \
+    && chown -R user /opt/shem /home/user
 USER user
 # Gradio logs users in with Hugging Face's OAuth when SYSTEM is spaces and
 # SPACE_ID names the Space, which Docker Spaces set but not SYSTEM; run
