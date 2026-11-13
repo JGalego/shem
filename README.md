@@ -29,7 +29,14 @@ See the [roadmap](docs/architecture.md#roadmap) for what is next.
 
 ## Getting started
 
-You need [🦀 Rust](https://www.rust-lang.org) 1.88 or later and [⚡ uv](https://docs.astral.sh/uv/). This example downloads [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B).
+Install the latest release, with the containerd shim on Linux ([what the script does](install.sh)):
+
+```sh
+curl -fsSL https://jgalego.github.io/shem/install.sh | sh
+shem run ghcr.io/jgalego/shem/hello:latest
+```
+
+To build from source and run a model, you need [🦀 Rust](https://www.rust-lang.org) 1.88 or later and [⚡ uv](https://docs.astral.sh/uv/). This example downloads [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B).
 
 ```sh
 cargo install --path crates/shem

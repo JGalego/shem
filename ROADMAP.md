@@ -1,6 +1,6 @@
 # Roadmap
 
-shem is experimental, and this list is what the maintainers plan to work on next, in no fixed order. Open an issue to propose or discuss an item. The design behind it is in [docs/architecture.md](docs/architecture.md).
+Planned work, in no fixed order. See [architecture](docs/architecture.md) for the design; open an issue to discuss changes.
 
 - **Neural execution.** Narrower types for bits, fewer tensor operations per step, and GPU execution in the vCPU server.
 - **Builds and filesystems.** A layer-digest build cache, overlayfs instead of copied filesystems, and coherence between processes sharing writable file mappings.

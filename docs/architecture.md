@@ -1,8 +1,8 @@
 # Architecture
 
-shem treats the host as a hypervisor and a model as the machine it runs. The model supplies a CPU, compiled into its weights, and RAM, which is its recurrent state. The host supplies everything else: system calls, devices, scheduling, paging and storage.
+shem's host supplies system calls, devices, scheduling and storage. Programs run on either a reference RV32IM interpreter or a neural vCPU whose weights implement the CPU and whose state holds guest memory.
 
-The starting point is [Qwenputer](https://divagr.com/blog/qwenputer), which compiles an RV32IM CPU into Qwen3.5-4B and uses the model's Gated DeltaNet state as addressable memory. shem's neural vCPU is a standalone compiled network, not part of a pretrained language model. Language-model images can call programs on it as tools ([models.md](models.md#compiled-layers-and-tools)). The host uses the same [vCPU interface](#the-vcpu-interface) for the neural executor and the reference interpreter.
+The neural vCPU is inspired by [Qwenputer](https://divagr.com/blog/qwenputer), but is a standalone compiled network, not part of a pretrained language model. Language-model sessions run separately and can [call RV32 programs as tools](models.md#compiled-layers-and-tools).
 
 ![OCI registries store the images. Docker reaches the host through the containerd shim; the shem CLI drives it directly. The host provides container syscalls or VM devices and drives either the neural or reference vCPU.](assets/architecture.svg)
 
@@ -34,24 +34,24 @@ The starting point is [Qwenputer](https://divagr.com/blog/qwenputer), which comp
 [`vcpu.rs`](../crates/shem/src/vcpu.rs) defines the `Vcpu` trait that both the reference interpreter and a neural vCPU implement:
 
 - `run(budget)` executes at most `budget` instructions and returns an `Exit`.
-- `reg`, `set_reg`, `pc`, `set_pc`, `read_mem`, `write_mem` give the host direct access to the machine, the way a hypervisor reads guest registers and memory.
+- `reg`, `set_reg`, `pc`, `set_pc`, `read_mem`, `write_mem` access registers and memory.
 - `snapshot` and `restore` use `MachineState`, a canonical, vCPU-independent format holding the pc, registers, instruction count and memory.
 
 Exit semantics: except for `Budget`, the exit's `pc` points at the instruction that caused it, and that instruction has not retired. For a system call the host writes the result to `a0` and resumes at `pc + 4`.
 
-Two requirements follow for a neural vCPU:
+Both vCPUs must satisfy:
 
-1. **Trace equivalence.** It must produce the same registers, memory and exits as [`ReferenceVcpu`](../crates/shem/src/reference.rs), step for step. That is how it gets tested: run the same program on both and compare.
-2. **Restorable from canonical state.** At any instruction boundary, its whole internal state must be rebuildable from a `MachineState`. A snapshot taken on one vCPU can then resume on another. In particular, slow work such as booting a kernel can run on the fast reference vCPU, and the result can be loaded onto the model.
+1. **Trace equivalence.** Registers, memory and exits match [`ReferenceVcpu`](../crates/shem/src/reference.rs) instruction for instruction.
+2. **Canonical snapshots.** All state can be restored from `MachineState` at any instruction boundary. A guest can boot on the reference vCPU and resume on the neural one.
 
 ## Design rules that come from running on a model
 
 1. **The host handles unsupported operations.** The vCPU exits for system calls, atomics and, in VM mode, privileged instructions and device accesses. [`emulate.rs`](../crates/shem/src/emulate.rs) handles the A extension because musl's riscv32 port needs LR/SC.
-2. **Batching supports unrelated guests.** The network routes each guest's decoded instruction through tensor operations rather than a separate host instruction handler. Guests can run different programs in one batch. Throughput and per-guest latency still depend on batch size, workload and device ([benchmarks](neural.md#speed)).
+2. **Batching supports unrelated guests.** Tensor routing lets one batch run different programs. Throughput and per-guest latency depend on batch size, workload and device ([benchmarks](neural.md#speed)).
 3. **Instruction budgets provide preemption.** The host drives execution and stops the vCPU after a bounded number of retired instructions.
 4. **`fork()` clones vCPU state.** The reference interpreter copies memory; the neural server shares pages until a write. Threads share their process's vCPU memory and save their registers between turns ([`container.rs`](../crates/shem/src/container.rs)).
 5. **The host manages memory backing.** The fused CPU executor uses copy-on-write pages; the dense executor uses delta-rule state, and the GPU harness uses flat byte arrays. This is not a guest MMU.
-6. **Build-time execution is reproducible with fixed inputs.** The clock is virtual, `getrandom` uses a seeded PRNG, and directory listings are sorted. Builds use empty stdin and normalize layer metadata ([shemfile.md](shemfile.md#reproducibility)). Replaying an interactive run would also require its external inputs, not just its exits.
+6. **Builds are reproducible with fixed inputs.** Time is virtual, randomness is seeded, directory listings are sorted, and layer metadata is normalized ([reproducibility](shemfile.md#reproducibility)). Interactive replay also needs the external inputs.
 
 ## Isolation
 
@@ -75,7 +75,4 @@ Two requirements follow for a neural vCPU:
 
 ## Roadmap
 
-- **Neural execution.** Narrower types for bits, fewer tensor operations per step, and GPU execution in the vCPU server.
-- **Builds and filesystems.** A layer-digest build cache, overlayfs instead of copied filesystems, and coherence between processes sharing writable file mappings.
-- **Guest coverage.** Terminals under `docker run -t` for program containers, `/proc/PID/fd`, sockets, and VM block and network devices.
-- **ISA validation.** Cross-check the reference interpreter against Spike.
+See [ROADMAP.md](../ROADMAP.md) for planned work.

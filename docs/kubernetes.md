@@ -4,7 +4,7 @@ Kubernetes runs shem containers through a RuntimeClass, the way it runs WebAssem
 
 ## On each node
 
-Install the shim where containerd finds it.
+Install the shim on containerd's `PATH`:
 
 ```sh
 sudo install containerd-shim-shem-v1 /usr/local/bin/
@@ -28,47 +28,53 @@ sudo systemctl restart containerd
 
 ### Images for the node's platform
 
-Released containerd (through 2.4) picks a pod's image for the node's platform, `linux/amd64` or `linux/arm64`, whatever its runtime class, so an image listed only for `linux/riscv32` is not found (`ErrImageNeverPull`, or a failed pull). List shem images under the node's platforms too; the guest is RV32 whichever entry containerd picks, and the shem runtime runs it:
+containerd through 2.4 selects images by the node's platform, even for a different runtime class. An image listed only for `linux/riscv32` can fail to pull. Also list it for the node's platform:
 
-- `shem push --platform linux/amd64,linux/arm64 IMAGE REMOTE` (and `shem save --platform ...`) list the same image under those platforms as well;
-- `docker build --platform linux/riscv32,linux/amd64,linux/arm64` builds it for each, which for an image of RV32 programs gives the same files each time.
+```sh
+shem push --platform linux/amd64,linux/arm64 hello ghcr.io/your-user/hello:latest
+```
 
-containerd's development branch picks images per runtime class instead (`runtime_platforms` above, with the kubelet's `RuntimeClassInImageCriApi` feature gate), which makes this unnecessary once released.
+`shem save --platform ...` works for local imports. With Docker, use `docker build --platform linux/riscv32,linux/amd64,linux/arm64`; the guest remains RV32.
+
+containerd's development branch supports selection by runtime class using `runtime_platforms` above and the kubelet's `RuntimeClassInImageCriApi` feature gate.
 
 ## In the cluster
 
-Create the RuntimeClass.
+From the repository checkout:
 
 ```sh
 kubectl apply -f examples/kubernetes/runtimeclass.yaml
-```
-
-Run a Pod on it.
-
-```sh
 kubectl apply -f examples/kubernetes/hello.yaml
-```
-
-Read its output.
-
-```sh
 kubectl logs shem-hello
 ```
 
-Any shem image works, model images included, with the model server running on the node for them (see [containerd.md](containerd.md)). A test builds a kind cluster, configures its node this way, and runs an RV32 program in a Pod; CI runs it on every push.
+Model Pods also require a [model server](models.md#sessions-under-docker) on the node. `just kubernetes-test` configures a kind node and runs the hello Pod.
 
 ## Model images as image volumes
 
-A model image's `/model` is a Hugging Face checkpoint, so a Pod can also mount it as an [image volume](https://kubernetes.io/docs/concepts/storage/volumes/#image) and give it to a model server, without running shem at all. Image volumes are pulled for the node's platform, so push the image listed for it too (`shem push --platform linux/amd64`), and turn on the `ImageVolume` feature gate where it is still off:
+A model image's `/model` is a Hugging Face checkpoint. Mount it as an [image volume](https://kubernetes.io/docs/concepts/storage/volumes/#image) to use another inference server without running shem.
+
+Publish for the node's platform and enable the `ImageVolume` feature gate where required:
+
+```sh
+shem build -t smollm2 examples/smollm2
+shem push --platform linux/amd64 smollm2 ghcr.io/your-user/smollm2:shem
+```
+
+Pod spec fragment:
 
 ```yaml
 volumes:
 - name: model
-  image: {reference: registry.example.com/team/qwen3:0.6b}
+  image:
+    reference: ghcr.io/your-user/smollm2:shem
 containers:
 - name: server
-  volumeMounts: [{name: model, mountPath: /models}]
-  # the checkpoint is /models/model
+  # Set the server image and point it at /models/model.
+  volumeMounts:
+  - name: model
+    mountPath: /models
+    readOnly: true
 ```
 
-`just kubernetes-model-volume-test` builds a model image, mounts it in a Pod on a kind cluster, and checks that the Pod reads the checkpoint's files. A ModelPack artifact that `shem push --modelpack` publishes holds the same blobs, for runtimes that mount artifacts.
+The [complete Pod example](../examples/kubernetes/model-volume.yaml) loads the checkpoint with transformers. Replace `your-user` in the manifest before applying it. `just kubernetes-model-volume-test` checks volume mounting in kind.

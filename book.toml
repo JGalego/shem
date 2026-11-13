@@ -1,4 +1,4 @@
-# The docs site, built from docs/ with mdBook and published on GitHub Pages
+# The docs, built from docs/ with mdBook and published under /docs/ of the GitHub Pages site
 [book]
 title = "shem"
 description = "Run containers and VMs inside a model's weights"
@@ -9,4 +9,4 @@ src = "docs"
 [output.html]
 git-repository-url = "https://github.com/JGalego/shem"
 edit-url-template = "https://github.com/JGalego/shem/edit/main/{path}"
-site-url = "/shem/"
+site-url = "/shem/docs/"

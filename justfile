@@ -344,3 +344,10 @@ kubernetes-model-volume-test:
     kubectl logs shem-model-volume | tee $dir/out
     grep -q "model.safetensors.index.json" $dir/out
     grep -q '"format": "shem.model/v2"' $dir/out
+
+# Build the website (landing page, install script and docs) as the docs workflow does, and serve it at http://localhost:8000
+site:
+    rm -rf _site
+    mdbook build -d _site/docs
+    cp -r site/. install.sh _site/
+    python3 -m http.server -d _site 8000

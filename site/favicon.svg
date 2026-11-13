@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>shem</title>
+  <!-- The shem: a slip of paper with words on it, rolled at both ends -->
+  <g transform="rotate(-14 16 16)" stroke="#29343a" stroke-width="1.6" stroke-linejoin="round">
+    <rect x="5" y="8.5" width="22" height="15" fill="#fbf8f2"/>
+    <rect x="2" y="7" width="4.5" height="18" rx="2.25" fill="#e8dcc6"/>
+    <rect x="25.5" y="7" width="4.5" height="18" rx="2.25" fill="#e8dcc6"/>
+    <path d="M9.5 13h4.5M16 13h6.5M9.5 16.5h7M18.5 16.5h4M9.5 20h3.5M15 20h5" stroke="#b5532f" stroke-width="1.8" stroke-linecap="round"/>
+  </g>
+</svg>

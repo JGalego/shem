@@ -1,6 +1,6 @@
 # VM mode
 
-`shem boot` runs a whole guest operating system: a no-MMU Linux kernel, with its console on stdio. A VM image can ship a kernel that has already booted, so `shem run` starts at its shell prompt.
+`shem boot` boots a no-MMU Linux kernel with its console on stdio. `WARM` saves a booted VM so `shem run` can resume at the shell prompt.
 
 ```sh
 just linux-image                 # a prebuilt Linux 6.8 for RV32 without an MMU, with a BusyBox initramfs
@@ -22,7 +22,7 @@ Linux riscv32
 
 ## The host is the machine
 
-In container mode the host implements the guest's system calls. In VM mode it emulates the hardware around the guest's kernel ([`vm.rs`](../crates/shem/src/vm.rs)). Both modes use an RV32IM vCPU:
+In VM mode the host emulates hardware, not system calls ([`vm.rs`](../crates/shem/src/vm.rs)). Both modes use an RV32IM vCPU:
 
 | The guest does | The vCPU | The host |
 |---|---|---|
@@ -32,11 +32,11 @@ In container mode the host implements the guest's system calls. In VM mode it em
 | A load or store outside RAM | Exits: memory fault | Decodes the instruction and emulates the device, as KVM leaves MMIO to userspace |
 | Waits for its timer | | Raises the timer interrupt between slices, and on `wfi` skips straight to it |
 
-Time is virtual: the timer ticks at 1 MHz, one tick per 100 instructions, as if the CPU ran at 100 MHz. Runs are therefore repeatable, and idle time costs nothing. The host stops the vCPU exactly where `mtime` reaches `mtimecmp`, so the interrupt arrives at the same instruction however a run is split into slices, or frozen and thawed.
+The virtual timer ticks at 1 MHz, once per 100 instructions. Execution stops exactly when `mtime` reaches `mtimecmp`, independent of slice boundaries or snapshots. `wfi` skips idle time.
 
 ## The machine
 
-It is the machine [mini-rv32ima](https://github.com/cnlohr/mini-rv32ima) defines, so its Linux images boot unchanged:
+The machine is compatible with [mini-rv32ima](https://github.com/cnlohr/mini-rv32ima):
 
 | Address | Device |
 |---|---|
@@ -49,9 +49,9 @@ The host generates the device tree ([`fdt.rs`](../crates/shem/src/fdt.rs)) for t
 
 ## Booted snapshots
 
-A machine freezes between instructions into the vCPU's canonical machine state, the same format containers use, and `vm.json`, the host's half of the hardware: the CSRs, the privilege level, `mtimecmp`, the time skipped while idle, the LR/SC reservation and the instruction count. Thawing it onto a fresh vCPU continues exactly where it stopped: a test freezes a program mid-run with its timer armed, thaws it, and checks that the output, the instruction count and the final state are those of an uninterrupted run.
+A snapshot contains canonical vCPU state and `vm.json`: CSRs, privilege level, timer state, skipped idle time, LR/SC reservation and instruction count. It can resume on either vCPU.
 
-A **VM image** names a kernel in its filesystem with `KERNEL`, and `WARM` boots it at build time ([shemfile.md](shemfile.md#vm-images)):
+A VM image selects its kernel with `KERNEL` and optionally boots it at build time with `WARM`:
 
 ```dockerfile
 FROM scratch
@@ -60,22 +60,32 @@ KERNEL /boot/Image
 WARM --until=output:"~ # "
 ```
 
-`--until=output:TEXT` stops once the console's output ends with `TEXT`, here BusyBox's prompt; `--until=steps:N` also works. The image then holds the booted machine, 64 MiB of RAM included, and building it twice gives the same digest. `shem run` resumes it with the console on stdio; with no `WARM`, it boots the kernel. [`examples/linux`](../examples/linux/Shemfile) fetches the kernel in a Docker stage, pinned by checksum.
+`--until=output:TEXT` stops when console output ends with `TEXT`; `--until=steps:N` stops after N instructions. The image includes RAM (64 MiB by default). Without `WARM`, `shem run` boots from scratch. The [Linux example](../examples/linux/Shemfile) downloads a checksum-pinned kernel.
 
 ## Tests
 
-- [`tests/vm.rs`](../crates/shem/tests/vm.rs) runs small machine-mode programs that read and write CSRs, take `ecall`, illegal-instruction and access-fault traps, return with `mret`, take timer interrupts, skip idle time with `wfi`, print through the UART and power off.
-- They also freeze and thaw a machine mid-run, pause on console output, and build a VM image from a small kernel, cold and warm.
-- `just vm-tests` downloads the Linux image, pinned by commit and checksum, boots it, waits for the shell prompt, types `uname -sm` and `echo $((6 * 7))`, checks the answers, and types `poweroff`. It also freezes Linux at its prompt and resumes it on a fresh vCPU, and builds a booted Linux image twice, checking that the digests match and that the image answers at its prompt. CI runs it on every push.
+- [`tests/vm.rs`](../crates/shem/tests/vm.rs): CSRs, traps, timer interrupts, UART, poweroff, snapshots and VM image builds.
+- `just vm-tests`: Linux boot, shell commands, snapshot resume and reproducible image digests.
 
 ## On the neural vCPU
 
-`--vcpu neural` works for `shem boot` and for VM images, as it does for containers. The kernel expects RAM at `0x80000000`, so the neural vCPU takes a base address, and the network computes every fetch, load and store as an offset from it ([neural.md](neural.md#one-forward-pass)). Booting takes about 350 million instructions, which is days at a thousand instructions per second, so the practical way is a booted image: `WARM` boots the kernel on the reference vCPU, and the neural vCPU resumes at the prompt. A test does exactly that and runs a shell command on both vCPUs, about 180,000 instructions, which end in identical states.
+Boot on the reference vCPU, then resume on the neural one. A cold boot takes about 350 million instructions: days at roughly 1,000 instructions/s. A shell command after resume takes about 180,000 instructions, or several minutes.
+
+Start the server in a separate terminal:
 
 ```sh
-just neural-server &
-echo 'echo $((6 * 7))' | shem run --vcpu neural --neural-socket /tmp/shem-neural.sock linux   # minutes, not seconds
+just neural-server
 ```
 
+Then resume the `linux` image built above:
+
+```sh
+printf 'echo $((6 * 7))\npoweroff\n' | \
+  shem run --vcpu neural --neural-socket /tmp/shem-neural.sock linux
+```
+
+VM RAM starts at `0x80000000`; the network uses this base for [fetches, loads and stores](neural.md#one-forward-pass). `shem boot --vcpu neural` also works, but does not skip the cold boot.
+
 ## Not yet
-- **Interrupt-driven devices.** The UART is polled; there is no interrupt controller, and no block device or network.
+
+- Interrupt controller, block devices and networking. The UART is polled.

@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>shem</title>
+  <meta name="description" content="Run containers and VMs inside a model's weights.">
+  <meta property="og:title" content="shem">
+  <meta property="og:description" content="Run containers and VMs inside a model's weights.">
+  <meta property="og:image" content="https://jgalego.github.io/shem/docs/assets/execution.svg">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="bar">
+    <a class="mark" href="./"><img src="favicon.svg" width="28" height="28" alt="">shem</a>
+    <nav>
+      <a href="docs/"><svg viewBox="0 0 24 24" aria-hidden="true" class="stroke"><path d="M2 4h6a4 4 0 0 1 4 4v12a3 3 0 0 0-3-3H2z"/><path d="M22 4h-6a4 4 0 0 0-4 4v12a3 3 0 0 1 3-3h7z"/></svg>Docs</a>
+      <a href="https://huggingface.co/blog/jgalego/llm-as-container"><svg viewBox="0 0 24 24" aria-hidden="true" class="stroke"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>Blog</a>
+      <a href="https://github.com/JGalego/shem"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="pitch">
+        <p class="eyebrow">Experimental</p>
+        <h1>Your model is a container now.</h1>
+        <p class="lede">Run containers and VMs inside a model's weights: a CPU compiled into its layers, memory in its state. The host does the rest.</p>
+        <div class="actions">
+          <a class="button primary" href="docs/">Get started</a>
+          <a class="button" href="https://github.com/JGalego/shem">GitHub</a>
+        </div>
+      </div>
+
+      <div class="console" role="img" aria-label="A terminal: a Dockerfile builds Qwen3.5-0.8B from Hugging Face into a golem with a system prompt and a session primed at build time, and docker run with the shem runtime answers in character.">
+        <div class="console-bar" aria-hidden="true"><span></span><span></span><span></span></div>
+<pre aria-hidden="true"><span class="p">$</span> cat Dockerfile
+<span class="c"># syntax=ghcr.io/jgalego/shem/dockerfile:latest</span>
+FROM hf.co/Qwen/Qwen3.5-0.8B
+ENTRYPOINT ["shem:generate", \
+  "--max-tokens", "96", \
+  "--system", "You are Shem, a clay golem."]
+CMD ["Who are you?"]
+WARM --until=prompt
+
+<span class="p">$</span> docker build --platform linux/riscv32 -t golem .
+<span class="o">[+] Building (64/64) FINISHED
+ =&gt; [shem] importing Qwen/Qwen3.5-0.8B
+ =&gt; =&gt; Qwen/Qwen3.5-0.8B: 48 blocks
+ =&gt; [shem-0-before-warm-0 51/51] COPY --link …
+ =&gt; [shem-0-warm-0 3/3] RUN ["shem-neural-ge…
+ =&gt; =&gt; shem: primed a session with 38 tokens
+ =&gt; exporting to image
+ =&gt; =&gt; naming to docker.io/library/golem:latest</span>
+
+<span class="p">$</span> docker run --rm --platform linux/riscv32 \
+    --runtime io.containerd.shem.v1 golem
+<span class="a">I am Shem, shaped from clay and woken
+by a word on my tongue.</span>
+<span class="p">$</span> <span class="cursor"></span></pre>
+      </div>
+    </section>
+
+    <section class="install" aria-labelledby="install-title">
+      <h2 id="install-title">Install</h2>
+      <div class="command">
+        <code id="install-command">curl -fsSL https://jgalego.github.io/shem/install.sh | sh</code>
+        <button type="button" data-copy="install-command" aria-label="Copy the install command">Copy</button>
+      </div>
+      <p class="note">For Linux and Apple Silicon Macs. <a href="https://github.com/JGalego/shem/blob/main/install.sh">Read the script</a>, or use <code>brew install jgalego/shem/shem</code>.</p>
+    </section>
+
+    <section class="pillars" aria-label="Features">
+      <div>
+        <h3>FROM hf.co</h3>
+        <p>A Hugging Face checkpoint becomes an OCI image, and a live session commits into a new one.</p>
+      </div>
+      <div>
+        <h3>Linux in the weights</h3>
+        <p>RV32 programs, BusyBox and a booted kernel run one instruction per forward pass.</p>
+      </div>
+      <div>
+        <h3>Speaks containerd</h3>
+        <p>Docker, containerd and Kubernetes start shem images through its shim.</p>
+      </div>
+      <div>
+        <h3>Every bit checked</h3>
+        <p>Tests hold the neural vCPU to a reference interpreter that passes the <span class="nowrap">riscv-tests</span>.</p>
+      </div>
+    </section>
+
+    <figure class="diagram">
+      <picture>
+        <source srcset="docs/assets/execution.svg" media="(prefers-reduced-motion: reduce)">
+        <img src="docs/assets/execution.gif" width="960" height="411" alt="An RV32 program runs on the compiled vCPU, one instruction per forward pass. On ecall, the host handles the system call and resumes the guest.">
+      </picture>
+    </figure>
+  </main>
+
+  <footer class="bar">
+    <span>Apache 2.0 · <a href="https://github.com/JGalego/shem/blob/main/CHANGELOG.md">Changelog</a> · <a href="https://github.com/JGalego/shem/blob/main/SECURITY.md">Security</a></span>
+    <span><a href="https://github.com/JGalego/shem/blob/main/CONTRIBUTING.md">Contribute</a></span>
+  </footer>
+
+  <script>
+    for (const button of document.querySelectorAll("[data-copy]")) {
+      button.addEventListener("click", async () => {
+        const text = document.getElementById(button.dataset.copy).textContent;
+        try {
+          await navigator.clipboard.writeText(text);
+          button.textContent = "Copied";
+        } catch {
+          button.textContent = "Select it";
+        }
+        setTimeout(() => (button.textContent = "Copy"), 1500);
+      });
+    }
+  </script>
+</body>
+</html>

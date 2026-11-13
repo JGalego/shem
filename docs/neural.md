@@ -1,12 +1,29 @@
 # The neural vCPU
 
-The neural vCPU ([`neural/`](../neural/)) is an RV32IM CPU compiled into the weights of a network. One forward pass executes one instruction, for every guest in a batch at once. It implements the same [`Vcpu` interface](../crates/shem/src/vcpu.rs) as the reference interpreter, and the host drives it over a Unix socket, so containers run on it unchanged: `shem run --vcpu neural`.
+The neural vCPU is an RV32IM CPU compiled into network weights. One forward pass executes one instruction per guest in a batch. It implements the same [`Vcpu` interface](../crates/shem/src/vcpu.rs) as the reference interpreter, accessed over a Unix socket.
 
-It follows the idea behind [Qwenputer](https://divagr.com/blog/qwenputer), compiled layers for the CPU and DeltaNet-style state for memory, but it is a standalone network rather than a CPU grafted into a pretrained language model.
+Like [Qwenputer](https://divagr.com/blog/qwenputer), it uses compiled CPU layers and delta-rule memory. Unlike Qwenputer, it is a standalone network, not part of a pretrained language model.
+
+## Running it
+
+From a repository checkout, with uv installed, start the server:
+
+```sh
+just neural-server
+```
+
+In another terminal, compile and run a guest (compilation needs Docker):
+
+```sh
+just cc -O2 -o hello guests/hello.c
+shem run --vcpu neural --neural-socket /tmp/shem-neural.sock hello
+```
+
+The server uses the CPU. GPU execution is currently available only through the [benchmark harness](#on-gpus).
 
 ## Compiled, not trained
 
-[`isa.py`](../neural/src/shem_neural/isa.py) describes the instruction set as data: for each of the 48 RV32IM instructions, a bit pattern (mask and match) and what it does, in terms of which unit's result goes to `rd`, where its immediate comes from, how the next pc is chosen, and whether it loads, stores or exits. [`compile.py`](../neural/src/shem_neural/compile.py) turns that table into the network's tensors:
+[`isa.py`](../neural/src/shem_neural/isa.py) defines 48 RV32IM instructions: decode patterns, operand formats, result routing, next pc and exits. [`compile.py`](../neural/src/shem_neural/compile.py) turns that table into tensors:
 
 | Tensor | Shape | Role |
 |---|---|---|
@@ -19,7 +36,7 @@ It follows the idea behind [Qwenputer](https://divagr.com/blog/qwenputer), compi
 | `sra_fill` | 32 × 32 | Sign-bit fill for each arithmetic-right-shift amount |
 | `byte_bits`, `powers` | 256 × 8, 32 | Byte-to-bits lookup table, and the weights that turn bits into a value |
 
-The weights can be saved as safetensors, the format a machine image carries them in (see [shemfile.md](shemfile.md)).
+Weights are saved as safetensors for inclusion in [images](shemfile.md).
 
 ## State
 
@@ -45,17 +62,17 @@ Both the register file and memory are written with the delta rule, `S ← S + β
 6. **Routing.** The instruction one-hot times the routing tables picks the result for `rd`, the comparison that decides a branch, and the next pc.
 7. **Writeback.** Delta-rule writes to the register file and memory, and the pc update, all gated by `commit`, which is 0 when the instruction exits. An exiting instruction therefore changes nothing, as on the reference vCPU.
 
-Decoded instructions route results independently for each guest, so a batch can run unrelated programs without a separate host instruction handler for each. A test runs three different programs in one batch and checks that each ends in the same state as a separate run.
+Routing is per guest, so one batch can run unrelated programs.
 
 ## The operations it uses
 
 The dense executor uses products with compiled weights (linear layers and one-hot attention), element-wise sums and products (gating), and clamps, which are piecewise-linear like ReLU. State changes only through gated delta-rule writes.
 
-Values are integers held exactly in float64. Qwenputer runs in bf16, which forces arithmetic on small values; float64 lets a 32-bit word be one exact value, which keeps the network simple. A bf16 version would work on bytes instead of words.
+Integer intermediates are held exactly in float64. Lower-precision execution would need smaller arithmetic units, such as bytes rather than words.
 
 ## Two executors
 
-The network as described, the **dense** executor, is the definition. The **fused** executor computes the same function faster, the way Qwenputer uses a custom executor for long runs:
+The **dense** executor defines the network. The **fused** executor computes the same function with cheaper operations:
 
 | Unit | Dense | Fused |
 |---|---|---|
@@ -66,36 +83,27 @@ The network as described, the **dense** executor, is the definition. The **fused
 | Byte to bits, 5-bit index | One-hot times a table | Index into the table |
 | Division | 32 unrolled layers | Integer division, with RISC-V's rules for zero |
 
-Tests check that the two agree unit by unit on random values, edge cases included, and over whole programs. Either way, the multiplier and divider only run when some guest in the batch needs them; otherwise their results would be routed nowhere, so skipping them changes nothing.
+Both skip multiplication and division when no guest needs them. Tests compare unit results, edge cases and whole programs.
 
-For GPUs the fused executor has a **static** mode, which always runs every unit, and **flat** memory, a row of bytes per guest on the device, with gated-off writes sent to a scratch byte past the end. A step then has no control flow that depends on data, so it can be compiled and captured whole (see [On GPUs](#on-gpus)). A test checks that static mode with flat memory matches the paged executor over a batch of programs.
+For GPUs, **static** mode runs every unit and uses **flat** memory: one byte array per guest, with disabled writes sent to a scratch byte. This removes data-dependent control flow for compilation and CUDA graphs ([On GPUs](#on-gpus)).
 
 ## Verification
 
-- **Unit tests** ([`neural/tests`](../neural/tests/)): instruction semantics including every M-extension edge case, exits and their details, faults that change nothing, snapshots, dense against fused, and batching.
-- **Differential tests** ([`crates/shem/tests/neural.rs`](../crates/shem/tests/neural.rs)), the neural vCPU against the reference:
-  - all 60 official riscv-tests (rv32ui, rv32um, rv32ua) run through containers on both, with the same exit status, the same instruction count, and the same final pc, registers and memory;
-  - random straight-line programs over every register and immediate ALU instruction;
-  - a snapshot taken midway on the reference vCPU, resumed on the neural one;
-  - a container that forks, pipes a byte from child to parent and reaps the child, which exercises cloning the neural vCPU;
-  - VM mode, with RAM at `0x80000000`: machine-mode programs that take traps and timer interrupts and idle in `wfi`, with the same console output, the same CSRs and timer, and the same final state;
-  - **Linux**: a no-MMU Linux 6.8, booted to its prompt on the reference vCPU, then thawed on both vCPUs, where it reads `echo $((6 * 7))` from the console, runs it and prints the next prompt. That is about 180,000 instructions of kernel and BusyBox, through timer interrupts, CSR emulation, device accesses and atomics, and every byte of the 64 MiB of RAM ends the same. It takes the neural vCPU about four minutes.
+- [Unit tests](../neural/tests/): instruction semantics, M-extension edge cases, exits, non-mutating faults, snapshots, executor equivalence and batching.
+- [Differential tests](../crates/shem/tests/neural.rs): all 60 official riscv-tests, random ALU programs, cross-vCPU snapshot resume, fork/pipe/wait, VM traps and timers.
+- Linux resume: boot no-MMU Linux 6.8 on the reference vCPU, resume on both, and run `echo $((6 * 7))`. About 180,000 instructions; final registers, host device state and all 64 MiB of RAM must agree. Neural execution takes about four minutes.
 
-`just neural-tests` runs them all, and CI runs them on every push.
+Run with `just neural-tests`.
 
 ## Density
 
-Two things let one executor hold and run many guests.
-
-**Paged memory with copy-on-write** ([`memory.py`](../neural/src/shem_neural/memory.py)). The fused executor keeps memory as bytes in 4 KiB pages from a pool shared by every vCPU of the same memory size, with a page table per vCPU. A gated write with β = 1 is a store and β = 0 is nothing, exactly as in the delta rule, and tests check paged and delta-rule memory against each other on random traffic. Pages make guests cheap:
+**Paged memory with copy-on-write** ([`memory.py`](../neural/src/shem_neural/memory.py)). The fused executor shares a pool of 4 KiB byte pages across vCPUs of the same memory size:
 
 - A fresh guest maps the zero page everywhere, so memory it never touches costs nothing.
-- `CLONE`, which is how `fork` reaches the model, copies the page table; a shared page is copied only when one of its holders first writes to it.
-- Whole pages the host writes, as `RESTORE` does with a snapshot, are interned by content. Containers resumed from the same warm image therefore share every page they have not written, as Linux's KSM would arrange.
+- `CLONE` copies the page table; writes copy shared pages on demand.
+- `RESTORE` interns whole pages by content, so guests from the same warm image share unchanged pages.
 
-A test clones a vCPU 20 times and restores its snapshot into 20 more, and the pool holds no extra pages.
-
-**Continuous batching** ([`server.py`](../neural/src/shem_neural/server.py)). One executor thread groups vCPUs with a `RUN` in flight by CPU weights and memory size, then steps each group in one forward pass. Registers and page tables are stacked; memory pages stay in the pool. A guest that exits or runs out of budget stops committing and gets its result. New runs join between steps. A test runs six clients concurrently and checks their results and that they shared a batch.
+**Continuous batching** ([`server.py`](../neural/src/shem_neural/server.py)). One executor thread groups pending `RUN` requests by CPU weights and memory size. It stacks registers and page tables, steps each group together, and returns guests that exit or exhaust their budget. New runs join between steps.
 
 ## Speed
 
@@ -137,10 +145,13 @@ Exit reasons are 0 budget, 1 ecall, 2 ebreak, 3 illegal instruction (detail: the
 
 The network runs on whatever device its weights are on. [`gpu.py`](../neural/src/shem_neural/gpu.py) steps a batch of guests in place with the static executor and flat memory, in four modes: eager, compiled with `torch.compile` (which generates Triton kernels), eager in a CUDA graph that captures 64 steps so they launch as one, and both.
 
-[`jobs/gpu.py`](../neural/jobs/gpu.py) is a uv script that runs on [Hugging Face Jobs](https://huggingface.co/docs/huggingface_hub/guides/jobs) (`just gpu-job l4x1`). It downloads shem at a given commit and does two things:
+[`jobs/gpu.py`](../neural/jobs/gpu.py) runs on [Hugging Face Jobs](https://huggingface.co/docs/huggingface_hub/guides/jobs):
 
-1. **A differential test.** 1,024 guests run random RV32IM programs from random register files for 512 steps (about 100,000 instructions, ending in every kind of exit) on the CPU's paged executor, and then in each GPU mode. Every register, byte of memory, pc, instruction count, exit and exit detail must match. They do, in all four modes, on an L4 and an A100: GPU execution is bit-exact. Nothing relies on how the GPU rounds, because every intermediate value is an integer below 2^53, which float64 holds exactly, fused multiply-adds included.
-2. **Throughput.** Every guest runs a loop of multiplies, divides, loads, stores, shifts and branches, at batch sizes from 1 to 32,768, with 64 KiB of memory each.
+```sh
+just gpu-job l4x1
+```
+
+It compares 1,024 random-program guests against the CPU executor for 512 steps in each GPU mode, then benchmarks batches of 1–32,768 guests with 64 KiB each. Registers, memory, pc, instruction count and exits match bit-for-bit on L4 and A100. Integer intermediates stay below 2^53 and are exactly representable in float64.
 
 Instructions per second, with torch 2.15 and CUDA 13.2 (the CPU row is the paged executor on one core, from [Speed](#speed)):
 
@@ -153,15 +164,6 @@ Instructions per second, with torch 2.15 and CUDA 13.2 (the CPU row is the paged
 | 16,384 | | 945,402 | 3,026,696 | 3,986,316 | **6,556,971** |
 | 32,768 | | 968,596 | 6,118,754 | 3,166,873 | **7,434,596** |
 
-What the numbers say:
-
-- **Small batches are bound by launches.** Eager mode runs about 190 steps per second whatever the batch: each step is a few hundred kernel launches. Compiling fuses them into a few kernels and the graph launches 64 steps at once, which together make one guest 67 times faster than eager, and 15 times faster than one CPU core.
-- **Large batches are bound by float64.** The A100 reaches 7.4 million instructions per second with 32,768 guests, 250 times a CPU core's best. The L4 levels off near a million, because it runs float64 at 1/64 of its float32 rate. At large batches the eager path in a graph beats the compiled one: cuBLAS does the batched matrix products better than the kernels Inductor generates for them.
-- **The state is mostly bits.** Registers are 32 bits of float64 each, 8 KiB per guest, read and rewritten every step. Bits are exact in any float type, so keeping them in float32 or bfloat16, and only values in float64, would cut both the traffic and the float64 work.
-
-## Running it
-
-```sh
-just neural-server                  # serves on /tmp/shem-neural.sock
-shem run --vcpu neural --neural-socket /tmp/shem-neural.sock --mem 1M program
-```
+- Small batches are launch-bound; compilation and graphs reduce launches.
+- Large batches are float64-bound. The A100 reaches 7.4 million instructions/s; the L4 levels off near one million.
+- Register bits currently occupy 8 KiB per guest in float64. Lower-precision storage for bits could reduce memory traffic while retaining float64 arithmetic values.

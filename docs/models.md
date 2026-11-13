@@ -9,7 +9,8 @@ shem push qwen3 ghcr.io/your-user/qwen3:0.6b   # to a registry
 shem run ghcr.io/your-user/qwen3:0.6b "Olá"    # elsewhere: pulled on first use, then run
 ```
 
-`docker build` builds model images too, through shem's BuildKit frontend: add `# syntax=ghcr.io/jgalego/shem/dockerfile:latest` as the first line ([shemfile.md](shemfile.md#with-docker-build)). The [Qwen3](../examples/qwen3/Dockerfile), [Qwen3.5](../examples/qwen3.5/Dockerfile) and [golem](../examples/golem/Dockerfile) examples include Dockerfiles.
+
+Model imports and execution need [uv](https://docs.astral.sh/uv/); registry transfers need [ORAS](https://oras.land) and a registry login. For `docker build`, use shem's [BuildKit frontend](shemfile.md#with-docker-build), as in the [Qwen3 Dockerfile](../examples/qwen3/Dockerfile).
 
 ## Shemfile
 
@@ -19,16 +20,35 @@ ENTRYPOINT ["shem:generate", "--max-tokens", "128"]
 CMD ["Introduce yourself in one sentence."]
 ```
 
-`FROM hf.co/ORG/NAME[:REVISION]` imports a Hugging Face checkpoint, and `FROM DIR` imports one from a directory in the build context, such as one `huggingface-cli download --local-dir` writes. A repo of GGUF files takes a quantization in place of the revision, as Ollama and Docker do (`FROM hf.co/Qwen/Qwen3-0.6B-GGUF:Q8_0`), and `FROM FILE.gguf` imports a GGUF file from the build context. transformers dequantizes GGUF into float32, which holds any quantization's values exactly, so it needs the `gguf` extra (`shem-neural[gguf]`), which the `shem-neural` image has. The base sets `ENTRYPOINT ["shem:generate"]`, the way `FROM python` brings `python3`, and an image can override it with options.
+| Source | `FROM` example |
+|---|---|
+| Hugging Face checkpoint | `FROM hf.co/Qwen/Qwen3.5-0.8B` |
+| Pinned revision | `FROM hf.co/ORG/NAME:REVISION` |
+| Checkpoint directory in the build context | `FROM checkpoint/` |
+| GGUF repository and quantization | `FROM hf.co/Qwen/Qwen3-0.6B-GGUF:Q8_0` |
+| GGUF file in the build context | `FROM model.gguf` |
 
-ENTRYPOINT and CMD keep their Docker meanings: the entrypoint is what runs, and CMD is its default input, which `shem run` arguments replace.
+GGUF import uses transformers to dequantize into float32. It requires `shem-neural[gguf]`, included in the `shem-neural` image.
+
+Model bases set `ENTRYPOINT ["shem:generate"]`. `ENTRYPOINT` and `CMD` keep their Docker meanings:
 
 | Image | ENTRYPOINT | CMD | `shem run image …` |
 |---|---|---|---|
 | A program (`FROM scratch`) | A program in the image, run on the vCPU | Its default arguments | Replace the arguments |
 | A model | A driver: `["shem:generate", "--max-tokens", "128"]` | The default prompt | Your prompt |
 
-A `shem:` entrypoint names a host-side driver rather than a guest executable. `shem:generate` options include `--max-tokens N` (default 256), `--system TEXT`, `--system-file PATH`, a file of the image whose text the system prompt ends with, such as a document to answer from, and `--stop TEXT`, which ends a reply where it reaches the text, as a base model with no end of turn of its own needs ([`examples/mamba`](../examples/mamba/Shemfile)). Decoding is greedy; results are repeatable for the same model, session, prompt and device.
+A `shem:` entrypoint selects a host-side driver, not a guest executable.
+
+| `shem:generate` option | Meaning |
+|---|---|
+| `--max-tokens N` | Maximum reply length; default 256 |
+| `--system TEXT` | System prompt |
+| `--system-file PATH` | Append a file from the image to the system prompt |
+| `--stop TEXT` | End the reply at this text; useful for [base models](../examples/mamba/Shemfile) |
+| `--tools DIR` | Offer programs in this directory as [tools](#compiled-layers-and-tools) |
+| `--keep` | Keep a [Docker session](#sessions-under-docker) open after replying |
+
+Decoding is greedy and repeatable for the same model, session, prompt and device.
 
 ## Sessions as layers
 
@@ -41,9 +61,9 @@ CMD ["Who are you?"]
 WARM --until=prompt
 ```
 
-The builder runs the model over the conversation up to where the user's prompt goes, here the system prompt, and saves every block's state in the image's state layer: the attention layers' key and value caches, and the Gated DeltaNet layers' convolution inputs and memory matrices. `shem run` continues that session, so the system prompt is never read again, and the reply is exactly what an unprimed session would give; a test checks this for both models.
+The builder processes the conversation prefix before the user's prompt and saves each block's state: attention KV caches, convolution inputs and recurrent memory. `shem run` resumes there without processing the system prompt again.
 
-A system prompt can be a whole document. [`examples/handbook`](../examples/handbook/Shemfile) copies a handbook into the image and primes OLMo 2 with it, 658 tokens read once at build time:
+To prime a model with a document, use `--system-file` ([handbook example](../examples/handbook/Shemfile)):
 
 ```dockerfile
 FROM hf.co/allenai/OLMo-2-0425-1B-Instruct
@@ -54,50 +74,61 @@ WARM --until=prompt
 
 Attention caches grow with the token count. Gated DeltaNet's convolution state and memory matrices are fixed-size. Qwen3.5 combines both block types, so its total session state still grows with its attention caches.
 
-The session is saved as `session.safetensors`, every block's state by block number and name, and `session.json`, the tokens it has read, the precision it ran in and the version of each type of block that wrote it. `shem run` unpacks them into `/.shem`, which is also where `shem save` puts them for `docker load`.
+Sessions live under `/.shem`:
 
-The weights and the tokens don't say how a runtime reads the state: a later shem whose attention cached its keys otherwise would continue an old session wrong. So a block type's version changes whenever a session saved before would resume otherwise than a cold start, and a runtime whose versions or precision differ from the session's reads its tokens again rather than trust its state, which costs the time `WARM` saved and nothing else. `neural/tests/test_sessions.py` resumes a session saved by an earlier shem, on a tiny model with every type of block, to catch a change that needed a new version.
+- `session.safetensors`: block state, keyed by block number and name.
+- `session.json`: consumed tokens, precision and block-type versions.
+
+A change to a block's saved-state semantics requires a version bump. If versions or precision differ, the runtime rebuilds state by replaying the saved tokens. [Compatibility tests](../neural/tests/test_sessions.py) load sessions saved by earlier releases.
 
 ### Sessions as artifacts
 
-A session can also travel apart from its model, as an artifact linked to it, which is what ModelPack's [issue #239](https://github.com/modelpack/model-spec/issues/239) proposes for model state:
+A session can be published separately from its model:
 
 ```sh
+shem build -t golem examples/golem
+shem build -t qwen3.5 examples/qwen3.5
 shem push --state golem registry.example.com/team/golem:session
 shem run --state registry.example.com/team/golem:session qwen3.5 "Who are you?"
 ```
 
-`--state` publishes a model image's session as an artifact of its own. The session is the image's state layer, the same blob. Its `subject` is the model image without that layer: the image as it was before `WARM`, byte for byte, which is pushed with it. A registry then lists a model's sessions among its referrers (`oras discover`), so one model can carry many primed system prompts and saved conversations.
+`--state` reuses the image's state-layer blob. The artifact's `subject` is the model image without that layer, which is pushed alongside it. Use `oras discover` to list sessions referring to a model.
 
-The artifact's config says what a runtime needs to decide whether it can load the session: its format (`shem.session/v1`), the tokens it has read, its precision, the versions of its blocks, and the model's fingerprint. `shem.json` records that fingerprint at import: a digest of the blocks and their tensors' contents, which is the same however the files are laid out. `shem run --state` takes a registry reference or a layout directory, checks the fingerprint, and continues the session on any image of the same model, such as the model's ModelPack twin. A model of the same shape with other weights refuses the session rather than running it wrong. The media types are shem's own (`application/vnd.shem.session.v1+json`) while #239's are placeholders.
+The config records the format (`shem.session/v1`), consumed tokens, precision, block versions and model fingerprint. The fingerprint hashes block definitions and tensor contents, independent of file layout. `shem run --state` accepts a registry reference or OCI layout directory and rejects mismatched weights, even if the model has the same shape.
+
+The media type is `application/vnd.shem.session.v1+json`. Model state artifacts are also proposed in [modelpack/model-spec#239](https://github.com/modelpack/model-spec/issues/239); shem uses its own format.
 
 ## The model as files
 
-The importer (`shem_neural.model.importers`) writes the model into `/model`:
+The importer writes these files into `/model`:
 
-- `shem.json`, the manifest: the embedding, the blocks in order, and the head, each with its type, its parameters and its tensors, plus the tokenizer;
-- `block-NNN-TYPE.safetensors`: one weights file per block, holding that block's tensors with the checkpoint's own names and types, at the top of the directory, where loaders such as vLLM look for weights;
-- `embed.safetensors` and `head.safetensors`;
-- `model.safetensors.index.json`, the index that says which file holds each tensor;
-- the checkpoint's `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json` and `chat_template.jinja`, and its licence and notices.
+| File | Contents |
+|---|---|
+| `shem.json` | Embedding, ordered blocks, head and tokenizer; block types, parameters and tensor names |
+| `block-NNN-TYPE.safetensors` | One block's weights, with original tensor names and dtypes |
+| `embed.safetensors`, `head.safetensors` | Embedding and output weights |
+| `model.safetensors.index.json` | Tensor-to-file index |
+| Checkpoint metadata | Configs, tokenizer, chat template, licence and notices |
 
-Each weights file is its own image layer, so images built on the same model share those blobs in stores and registries. A model with more than 95 weights files shares layers between neighbouring blocks, since overlay filesystems stack about 128 layers at most.
+Each weights file normally gets its own layer. Above 95 weights files, neighbouring blocks share layers to stay below overlay filesystem limits. Images based on the same model share weight blobs.
 
-The directory is also a Hugging Face checkpoint, sharded by block: the index and the tensor names are the ones transformers expects, so `AutoModelForCausalLM.from_pretrained("/model")` loads it and gives the original's logits, which a test checks. A block in `shem.json` names its tensors as the checkpoint does, and the index finds their files, so whether the files follow the blocks or the checkpoint's own shards is a choice of layout rather than of format. That manifest format is `shem.model/v2`; `shem.model/v1` models, whose blocks each name one file holding their tensors under the block type's names, still run.
+The directory remains a Hugging Face checkpoint: `AutoModelForCausalLM.from_pretrained("/model")` loads it. Manifest format `shem.model/v2` resolves tensor names through the index, so files can follow blocks or the checkpoint's original shards. The older `shem.model/v1` format is still supported.
 
-The format knows nothing about any one family. A model is a residual stream: an embedding, then blocks that each read the stream and add to it, then a head. A decoder layer is two blocks, a token mixer and an MLP.
+Models consist of an embedding, ordered blocks and a head. A decoder layer is split into a token mixer and an MLP:
 
 | Block type | What it does | Its state in a session |
 |---|---|---|
-| `attention` | Grouped-query attention, with rotary positions on all, part or none of each head (scaled linearly, as Llama 3 does, with YaRN or with longrope), optional biases, fused projections, RMSNorm on queries and keys, a sliding window, softcapped scores and an output gate | The key and value cache, which grows with the session |
-| `gated_deltanet` | Gated DeltaNet: a causal depthwise convolution, then a matrix memory per head, written with the gated delta rule | The convolution's last inputs and the memory matrices, a fixed size however long the session |
-| `mamba` | Mamba: a causal depthwise convolution, then a selective scan, whose step sizes, inputs and outputs depend on the token | The convolution's last inputs and the scan's state, a fixed size however long the session |
-| `mlp` | A gated feed-forward block, SwiGLU or GeGLU, with optional biases and fused projections | None |
-| `moe` | A mixture of gated feed-forward experts: a router picks a few for each token and weighs them, softmax first and then top-k or the other way round, with an optional shared expert | None |
+| `attention` | Grouped-query attention; optional rotary scaling, biases, fused projections, QK norms, sliding windows, softcapping and output gates | Growing KV cache |
+| `gated_deltanet` | Causal convolution and gated delta-rule matrix memory | Fixed-size convolution and memory state |
+| `mamba` | Causal convolution and selective scan | Fixed-size convolution and scan state |
+| `mlp` | SwiGLU or GeGLU; optional biases and fused projections | None |
+| `moe` | Routed gated experts; optional shared expert | None |
 
-An attention or MLP block has a norm before it, after it, or both. Most families share Llama's layout, with a norm before each block, and the importer reads them all: Llama, Mistral, Qwen2, Qwen3 and Qwen3.5, Gemma 2 and 3, whose norms surround each block, Phi-3 and Phi-4-mini, OLMo 2 and 3, whose norms follow each block, SmolLM3, Granite, and the mixtures of experts Mixtral, Qwen2-MoE, Qwen3-MoE, OLMoE and GraniteMoe. They differ in what their checkpoints hold and their configs turn on, and the importer reads both: where the norms are, fused projections, biases, norms on queries and keys, sliding windows, softcapping, Gemma's scaled embeddings, Granite's multipliers, rotary scaling, layers without rotary positions, and experts, each a tensor of its own or all stacked, with a shared one or not. Mamba, whose layout is its own, has a reader of its own. A family's `config` function fills in what transformers derives rather than stores, such as which layers slide. The importer refuses what the blocks can't run yet, such as dynamic NTK scaling or an activation other than SiLU and GELU, rather than run it wrong. A family with another layout needs a reader of its own that maps its tensors onto these types. A new kind of layer is a new block type in [`blocks.py`](../neural/src/shem_neural/model/blocks.py), registered by name. Neither changes the image format.
+Importers map each family's tensor layout, norms, rotary settings and scaling onto these block types. Supported families include Llama, Mistral, Qwen2 through Qwen3.5, Gemma 2 and 3, Phi-3 and Phi-4-mini, OLMo 2 and 3, SmolLM3, Granite, Mamba, Mixtral, Qwen-MoE, OLMoE and GraniteMoe.
 
-[`tests/test_importers.py`](../neural/tests/test_importers.py) builds a tiny random checkpoint of each family with transformers, imports it, and compares logits, in one pass and token by token, with no downloads. [`tests/test_model.py`](../neural/tests/test_model.py) also reads the configs of real checkpoints too large to compare on a laptop, such as Gemma-3-4B, Phi-4-mini and OLMo-3-7B, and checks each layer's kind, window and rotary frequencies against transformers' reading of the same config.
+Unsupported settings, such as dynamic NTK scaling or activations other than SiLU and GELU, fail at import. A new family needs a tensor reader; a new layer kind needs a registered type in [`blocks.py`](../neural/src/shem_neural/model/blocks.py). Neither requires an image-format change.
+
+[`test_importers.py`](../neural/tests/test_importers.py) compares tiny random checkpoints with transformers without downloads. [`test_model.py`](../neural/tests/test_model.py) also checks real model configs, logits, templates and session resumes.
 
 ## Imported models
 
@@ -113,7 +144,7 @@ An attention or MLP block has a norm before it, after it, or both. Most families
 | [state-spaces/mamba-130m-hf](https://huggingface.co/state-spaces/mamba-130m-hf) | 24 Mamba | 27 layers | The same, against transformers' Mamba, with a template that runs a base model's text together |
 | [Qwen/Qwen3-0.6B-GGUF](https://huggingface.co/Qwen/Qwen3-0.6B-GGUF) `:Q8_0` | As Qwen3-0.6B, dequantized | 59 layers | Logits within 1e-3 of transformers' own dequantization, and the same chat template |
 
-Larger checkpoints are compared the same way on a [Hugging Face Job](https://huggingface.co/docs/huggingface_hub/guides/jobs) with 256 GB of memory (`just models-job`, about an hour on `cpu-performance`), a model at a time, in float32, which Qwen3-30B-A3B needs 122 GB for:
+Larger float32 comparisons use a [Hugging Face Job](https://huggingface.co/docs/huggingface_hub/guides/jobs) with 256 GB of memory (`just models-job`). Qwen3-30B-A3B alone needs 122 GB:
 
 | Model | Blocks | Verified |
 |---|---|---|
@@ -127,14 +158,29 @@ Larger checkpoints are compared the same way on a [Hugging Face Job](https://hug
 | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) | 48 attention, 48 mixtures of 128 experts, 8 per token | The same, against transformers' Qwen3-MoE |
 | [mistralai/Mixtral-8x7B-Instruct-v0.1](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1) | 32 attention, 32 mixtures of 8 experts, 2 per token | In bfloat16, as below: its 47 billion parameters take 188 GB in float32 |
 
-Qwen3.5's and Gemma 3 4B's vision encoders, and Qwen3.5's multi-token prediction layer, are left out, so their imports are text models. The others' imports load in transformers with the original's logits, up to the order of floating-point sums. Every chat template renders as transformers renders it, special tokens such as Gemma's `<bos>` included, and every model's saved sessions and conversations continue as if they had never stopped. [`tests/test_model.py`](../neural/tests/test_model.py) does these comparisons; it downloads the checkpoints, so it runs with `SHEM_MODEL_TESTS=1`, and the larger ones with `SHEM_HUGE_MODEL_TESTS=1`. Gated checkpoints, such as Gemma's, are skipped without access to them, so CI, which has no token, skips them, and the Hugging Face Job runs them with yours. Gemma-2-2B, Phi-4-mini, SmolLM3-3B and Granite-3.3-2B, too large to compare in float32 in 16 GB, are compared in bfloat16 (`SHEM_LARGE_MODEL_TESTS=1`), and so is Mixtral: the next token each predicts agrees with transformers' at 90% or more of a prompt's positions, and their last logits point the same way. Every family's other options are checked on tiny random checkpoints too, and on their real configs.
+Qwen3.5 and Gemma 3 4B imports are text-only: vision encoders are omitted, as is Qwen3.5's multi-token prediction layer.
+
+Download-based tests in [`test_model.py`](../neural/tests/test_model.py) require `SHEM_MODEL_TESTS=1`. Add the larger-model flags as needed:
+
+| Flag | Comparisons |
+|---|---|
+| `SHEM_MODEL_TESTS=1` | Small checkpoints: float32 logits, greedy tokens, templates and session resumes |
+| `SHEM_LARGE_MODEL_TESTS=1` | Gemma-2-2B, Phi-4-mini, SmolLM3-3B and Granite-3.3-2B in bfloat16 |
+| `SHEM_HUGE_MODEL_TESTS=1` | Larger checkpoints above, including Mixtral in bfloat16 |
+
+```sh
+SHEM_MODEL_TESTS=1 SHEM_LARGE_MODEL_TESTS=1 \
+  uv run --project neural pytest neural/tests/test_model.py
+```
+
+Bfloat16 checks require next-token agreement at 90% or more of prompt positions and final-logit cosine similarity above 0.99. Gated models require access and a Hugging Face token; CI skips them, while `just models-job` forwards your token.
 
 ## ModelPack artifacts
 
-[ModelPack](https://github.com/modelpack/model-spec) packages a model as an OCI artifact, for an inference server to load. shem runs one through its image twin: an image whose layers are the artifact's own, plus one layer with `shem.json` (and an index or a chat template, if the checkpoint has none), and whose `subject` is the artifact.
+[ModelPack](https://github.com/modelpack/model-spec) packages checkpoints as OCI artifacts. shem creates an *image twin* over the artifact's layers, adds `shem.json` and any missing index or chat template, and sets the artifact as its `subject`.
 
 ```sh
-shem run registry.example.com/team/llama:modelpack "What is a golem?"   # pulled once, kept as its twin
+shem run registry.example.com/team/llama:modelpack "What is a golem?"
 shem push registry.example.com/team/llama:modelpack registry.example.com/team/llama:shem
 ```
 
@@ -144,15 +190,17 @@ ENTRYPOINT ["shem:generate", "--system", "You are a golem."]
 WARM --until=prompt
 ```
 
-`FROM`, `shem run` and `shem push` also take an artifact's OCI layout directory, such as the one `oras cp --to-oci-layout` writes; shem keeps its twin in the store, by the artifact's digest.
+`FROM`, `shem run` and `shem push` also accept artifact OCI layout directories. Twins are cached by artifact digest.
 
-- **Tar layers stay shared.** A tar layer goes into the twin as the very same blob, so a registry keeps the weights once for the artifact and its twin, and pushing the twin beside the artifact uploads only shem's layer. modctl writes tar layers with `modctl build --raw=false`.
-- **Raw layers are copied.** A raw layer, modctl's default, is a file with no tar around it, which no image can use as a layer, so the twin wraps each one in a tar of its own.
-- **The model is at `/`.** ModelPack tars hold each file at its path in the model's directory, so the files land at the root, and the twin's `dev.shem.model` label is `/`. The driver finds a model at `/model` or at `/`.
-- **The weights are the checkpoint's own shards.** Nothing is re-split, so the twin's layers follow the checkpoint's files rather than its blocks. The checkpoint must be safetensors, of a family shem imports.
-- **Labels from the model config.** The config's descriptor becomes the standard OCI labels (title, licences, version, source and so on), and `org.opencontainers.image.base.digest` names the artifact.
-- **Both namespaces.** shem reads the spec's media types and annotations (`vnd.cncf.model`, `org.cncf.model`) and the older ones modctl 0.2 still writes (`vnd.cnai.model`, `org.cnai.model`).
-- **`docker build` builds on an artifact** through shem's frontend, which fetches it and lays its files out as its twin has them, in layers of BuildKit's own. To keep the shared blobs, build on a twin, pushed with `shem push`, as on any image.
+| Detail | Behavior |
+|---|---|
+| Tar layers | Shared unchanged with the artifact. Use `modctl build --raw=false` to produce them. |
+| Raw layers | modctl's default; each file must be wrapped in a new tar blob. |
+| Model path | Files land at `/`; `dev.shem.model=/`. The driver accepts `/model` or `/`. |
+| Weights | Original checkpoint shards, not re-split by block. Requires safetensors and a supported family. |
+| Labels | Model metadata becomes OCI labels; `org.opencontainers.image.base.digest` identifies the artifact. |
+| Namespaces | Reads `vnd.cncf.model` / `org.cncf.model` and legacy `vnd.cnai.model` / `org.cnai.model`. |
+| Docker builds | The frontend can use artifacts as bases, but BuildKit creates new layers. Build on a pushed twin to retain shared blobs. |
 
 ### Publishing an image as an artifact
 
@@ -161,38 +209,50 @@ shem push --modelpack qwen3 registry.example.com/team/qwen3:modelpack
 shem push --modelpack --uncompressed qwen3 registry.example.com/team/qwen3:modelpack-tar
 ```
 
-`--modelpack` publishes a model image's model as a ModelPack artifact: the image's layers that hold the model's files, and a model config filled in from `shem.json` (name, family, vendor, revision, licences, source, parameter count and precision). The image is the artifact's `subject` and is pushed with it, so a registry lists the artifact among the image's referrers (`oras discover`).
+`--modelpack` publishes model-only layers with metadata from `shem.json`. The source image is pushed alongside it as the artifact's `subject`; `oras discover` lists the relationship.
 
-- **The layers are the image's own blobs**, so the artifact takes no room of its own in a registry. Their files keep their paths in the image, under `model/` for an imported model. They're compressed with zstd, which ModelPack allows but modctl 0.2 can't extract, and the spec recommends uncompressed weights for runtimes that mount them.
-- **`--uncompressed` writes plain tars instead**, as new blobs, with the files at the root, as modctl packs them. modctl pulls and extracts them into a Hugging Face checkpoint sharded by block, which transformers loads, with its weights files where vLLM looks for them.
-- **Only the model goes in.** A layer goes into the artifact if it holds nothing but the model's files: the image's tools, compiled layers and session state stay out.
+- Default: shares the image's zstd blobs and preserves paths (`model/` for imported models). modctl 0.2 cannot extract these.
+- `--uncompressed`: creates plain tar blobs with files at the root, for modctl extraction and runtimes that mount weights. ModelPack recommends uncompressed weights.
+- Only layers containing model files alone are included. Tools, compiled layers and session state are excluded.
 
-[`tests/modelpack.rs`](../crates/shem/tests/modelpack.rs) packs a tiny checkpoint as modctl does, in tar and raw layers. It checks that the twin keeps the artifact's blobs, replies as the checkpoint does, primes a session with `WARM`, and round-trips through a registry. The other way, it checks that an image publishes as an artifact over its own blobs, that the artifact's files load in transformers with the checkpoint's logits, and that the artifact runs again as a twin. Artifacts that modctl 0.2.2 builds, in both formats, run the same way. modctl 0.2.2 also pulls and extracts an `--uncompressed` artifact that shem publishes, and transformers loads what it extracts with the checkpoint's logits.
+See the [round-trip example](../examples/modelpack/run.sh) and [compatibility tests](../crates/shem/tests/modelpack.rs).
 
 ## Sessions under Docker
 
-Model containers are live sessions, held by the model server (`shem-neural-server`) under the container's ID, so Docker's commands mean something for them:
+Model sessions run in `shem-neural-server`, keyed by container ID. [Install the shim](containerd.md#with-docker), then start the server as root so it can read containerd-mounted root filesystems. From the repository checkout, with shem on your `PATH`:
+
+```sh
+uv sync --project neural
+sudo env SHEM_BIN="$(command -v shem)" \
+  neural/.venv/bin/shem-neural-server --socket /tmp/shem-neural.sock
+```
+
+The socket is accessible only to its owner and root. In another terminal:
+
+```sh
+shem save golem | docker load
+docker run -d --name clay --runtime io.containerd.shem.v1 \
+  --platform linux/riscv32 golem --keep "Who are you?"
+docker exec clay shem:generate "What are you made of?"
+docker commit clay golem:remembers
+docker stop clay
+docker rm clay
+```
 
 | Command | What it does |
 |---|---|
-| `docker run IMAGE "prompt"` | Answers the prompt, then exits |
-| `docker run -i IMAGE` | Takes each line of stdin as a turn of one conversation; with `-t`, the shim echoes typing and handles backspace, since there is no terminal inside |
-| `docker run -d --name c IMAGE --keep "prompt"` | Answers, then keeps the session open |
-| `docker exec c shem:generate "follow-up"` | Another turn of that session, which remembers the conversation |
-| `docker commit c IMAGE2` | Docker pauses the container first, and the shim saves the session (the conversation and every block's state) into `/.shem`, so `IMAGE2` resumes the conversation |
-| `docker logs`, `stop`, `rm`, `ps` | As for any container |
+| `docker run IMAGE "prompt"` | Answer once, then exit |
+| `docker run -i IMAGE` | One conversation turn per input line; `-t` adds shim-side echo and backspace handling |
+| `docker run -d --name c IMAGE --keep "prompt"` | Answer and keep the session open |
+| `docker exec c shem:generate "follow-up"` | Continue the conversation |
+| `docker commit c IMAGE2` | Pause, save tokens and block state into `/.shem`; `IMAGE2` resumes the conversation |
+| `docker logs`, `stop`, `rm`, `ps` | Standard container operations |
 
-The server must be able to read containers' root filesystems, which containerd mounts as root, so for Docker run it as root:
-
-```sh
-sudo shem-neural-server --socket /tmp/shem-neural.sock
-```
-
-Its socket is open only to its user (and root). A CI job runs a prompt, piped turns, a live session with `docker exec`, and a `docker commit` whose image remembers the conversation.
+The `docker run` rows omit the required `--runtime io.containerd.shem.v1 --platform linux/riscv32` flags for brevity.
 
 ## Compiled layers and tools
 
-A model image can carry compiled layers: blocks whose weights are compiled from a specification rather than trained. The RV32IM CPU of the [neural vCPU](neural.md) is one, and a Shemfile adds it like any other layer ([`examples/tools`](../examples/tools/Shemfile)):
+A model image can include the [compiled RV32IM CPU](neural.md) and call programs on it ([tools example](../examples/tools/Shemfile)):
 
 ```dockerfile
 FROM --platform=$BUILDPLATFORM alpine:3.22 AS tools
@@ -214,20 +274,29 @@ shem: ran mul 123456789 987654321 on the compiled RV32IM layer, 2,881 instructio
 121932631112635269.
 ```
 
-- `COPY --from=shem:rv32im` copies a layer shem compiles from the instruction set at build time, with `shem build` and `docker build` alike: the weights, a `config.json` that describes the machine, and a model card. Compiling is deterministic, so every build carries the same weights, and the release publishes them ([jgalego/shem-rv32im](https://huggingface.co/jgalego/shem-rv32im)).
-- `--tools DIR` offers the image's programs in `DIR` to the model, through the chat template's own tool format. A program's interface is `NAME.json` beside it (a function's `description` and `parameters`, which become its arguments in order), or by default a list of `args` and `stdin`.
-- Tool calls run the program with `shem run --vcpu neural`, using the image's compiled weights and root filesystem. The host returns the program's output as the tool reply. The CPU runs separately from the language model; it does not read or write the model's residual stream.
-- The model must be one that calls tools: Qwen3-0.6B does, where Qwen3.5-0.8B answers the multiplication itself, and gets it wrong. Tool calls are read in either format templates ask for, JSON or `<function=...>` tags.
-
-A test builds the example and checks the exact products of 9- and 11-digit numbers, through `shem run` and `docker run`. A 23-digit product takes the neural vCPU 9,794 instructions, about 10 seconds; the reply is the 45-digit answer, exact.
+- `COPY --from=shem:rv32im` deterministically compiles CPU weights, machine config and model card. Both builders support it; releases publish the same [weights](https://huggingface.co/jgalego/shem-rv32im).
+- `--tools DIR` exposes programs using the chat template's tool format (JSON or `<function=...>` tags). A sibling `NAME.json` defines the description and parameters, mapped to arguments in order; without it, the interface accepts `args` and `stdin`. See [`mul.json`](../examples/tools/mul.json).
+- Calls run through `shem run --vcpu neural` with the image's weights and filesystem. Output returns as a tool reply; the CPU does not share the language model's residual stream.
+- Use a model that calls tools. Qwen3-0.6B does in this example; Qwen3.5-0.8B attempts the multiplication itself and answers incorrectly.
 
 ## Running
 
-Run the model server on a GPU when there is one: `--device auto` (the default) picks one, and `--device cpu` or `--device cuda` choose. [`jobs/models_gpu.py`](../neural/jobs/models_gpu.py) checks both models on a GPU against the CPU (logits, greedy replies, and a session saved on the GPU that continues identically) and times them, on Hugging Face Jobs. On an L4, Qwen3-0.6B decodes at 27.8 tokens a second (7.1 on the CPU) and Qwen3.5-0.8B at 31.2 (5.6), with logits within 7e-5 of the CPU's and the same replies.
+The server defaults to `--device auto`; use `--device cpu` or `--device cuda` to select explicitly:
 
-`shem run` unpacks a model image once, into `$SHEM_HOME/rootfs/<digest>`, and the driver loads the weights from there. The runtime computes in float32, so sessions are repeatable on the same device.
+```sh
+uv run --project neural shem-neural-server --socket /tmp/shem-neural.sock --device cuda
+```
+
+Recorded results from [`jobs/models_gpu.py`](../neural/jobs/models_gpu.py):
+
+| Model | CPU tokens/s | L4 tokens/s |
+|---|---|---|
+| Qwen3-0.6B | 7.1 | 27.8 |
+| Qwen3.5-0.8B | 5.6 | 31.2 |
+
+`shem run` caches unpacked images at `$SHEM_HOME/rootfs/<digest>`. Computation uses float32; results are repeatable on the same device, not guaranteed bit-identical across devices.
 
 ## Next
 
-- **More compiled layers.** Other specifications compiled into blocks, and compiled layers that read and write the residual stream directly instead of through a tool call.
-- **Speed.** Batching sessions of the same model in one forward pass, as the neural vCPU batches guests.
+- Compiled layers that read and write the residual stream directly.
+- Batching sessions of the same model.

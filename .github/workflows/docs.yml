@@ -1,12 +1,12 @@
 name: Docs
 
-# The docs site: docs/ built with mdBook and published on GitHub Pages. Every
-# run builds the book; it deploys once Pages is on and the repository
-# variable DOCS_SITE is true.
+# The website on GitHub Pages: the landing page in site/ and install.sh at the
+# root, and docs/ built with mdBook under /docs/. Every run builds the site;
+# it deploys once Pages is on and the repository variable DOCS_SITE is true.
 on:
   push:
     branches: [main]
-    paths: ["docs/**", "book.toml", ".github/workflows/docs.yml"]
+    paths: ["docs/**", "site/**", "install.sh", "book.toml", ".github/workflows/docs.yml"]
   workflow_dispatch:
 
 permissions:
@@ -30,10 +30,11 @@ jobs:
         run: |
           # Links that leave docs/ (../crates/..., ../examples/...) work on GitHub, not on the site
           sed -i -E 's#\]\(\.\./([^)]*)\)#](https://github.com/JGalego/shem/blob/main/\1)#g' docs/*.md
-          mdbook build
+          mdbook build -d _site/docs
+          cp -r site/. install.sh _site/
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: book
+          path: _site
 
   deploy:
     needs: build
