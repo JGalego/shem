@@ -6,11 +6,13 @@ Like [Qwenputer](https://divagr.com/blog/qwenputer), it uses compiled CPU layers
 
 ## Running it
 
-From a repository checkout, with uv installed, start the server:
+With uv installed, start the server from the `shem-neural` release that matches shem:
 
 ```sh
-just neural-server
+uvx --from "shem-neural==$(shem --version | cut -d' ' -f2)" shem-neural-server --socket /tmp/shem-neural.sock
 ```
+
+From a repository checkout, `just neural-server` runs the checkout's own.
 
 In another terminal, compile and run a guest (compilation needs Docker):
 

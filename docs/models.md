@@ -221,7 +221,21 @@ See the [round-trip example](../examples/modelpack/run.sh) and [compatibility te
 
 ## Sessions under Docker
 
-Model sessions run in `shem-neural-server`, keyed by container ID. [Install the shim](containerd.md#with-docker), then start the server as root so it can read containerd-mounted root filesystems. From the repository checkout, with shem on your `PATH`:
+Model sessions run in `shem-neural-server`, keyed by container ID. [Install the shim](containerd.md#with-docker), then start the server as root so it can read containerd-mounted root filesystems. The install script can run it as a systemd service, from the `shem-neural` release that matches shem:
+
+```sh
+curl -fsSL https://jgalego.github.io/shem/install.sh | SHEM_NEURAL_SERVICE=1 sh
+```
+
+To start it yourself, give `sudo` the full path of each program, since its `PATH` leaves out `~/.local/bin`, where uv installs itself and its tools:
+
+```sh
+sudo env SHEM_BIN="$(command -v shem)" "$(command -v uv)" tool run \
+  --from "shem-neural==$(shem --version | cut -d' ' -f2)" \
+  shem-neural-server --socket /tmp/shem-neural.sock
+```
+
+From a repository checkout, run the checkout's own:
 
 ```sh
 uv sync --project neural
