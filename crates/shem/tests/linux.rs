@@ -520,6 +520,38 @@ fn guest_paths_never_reach_host_files_outside_the_root() {
 }
 
 #[test]
+fn a_directory_swapped_for_a_link_after_the_guest_got_there_stays_inside_the_root() {
+    let mut g = Guest::new();
+    let outside = tempfile::tempdir().unwrap();
+    let outside = fs::canonicalize(outside.path()).unwrap();
+    fs::write(outside.join("secret"), b"host data").unwrap();
+    let target = g.cstr(outside.to_str().unwrap());
+
+    // The working directory: entered, removed, and replaced by a link that leads out
+    let a = g.cstr("/a");
+    assert_eq!(g.call(MKDIRAT, &[AT_FDCWD, a, 0o755]), 0);
+    assert_eq!(g.call(CHDIR, &[a]), 0);
+    assert_eq!(g.call(UNLINKAT, &[AT_FDCWD, a, AT_REMOVEDIR]), 0);
+    assert_eq!(g.call(SYMLINKAT, &[target, AT_FDCWD, a]), 0);
+    assert_eq!(g.open("secret", O_RDONLY), ENOENT);
+    assert_eq!(g.open("planted", O_WRONLY | O_CREAT), ENOENT);
+    let secret = g.cstr("secret");
+    assert_eq!(g.call(UNLINKAT, &[AT_FDCWD, secret, 0]), ENOENT);
+
+    // A directory held open, renamed away, and replaced the same way
+    let d = g.cstr("/d");
+    assert_eq!(g.call(MKDIRAT, &[AT_FDCWD, d, 0o755]), 0);
+    let dirfd = g.open("/d", O_RDONLY | O_DIRECTORY) as u32;
+    let moved = g.cstr("/d.old");
+    assert_eq!(g.call(RENAMEAT2, &[AT_FDCWD, d, AT_FDCWD, moved, 0]), 0);
+    assert_eq!(g.call(SYMLINKAT, &[target, AT_FDCWD, d]), 0);
+    assert_eq!(g.call(OPENAT, &[dirfd, secret, O_RDONLY, 0]), ENOENT);
+
+    assert_eq!(fs::read(outside.join("secret")).unwrap(), b"host data");
+    assert!(!outside.join("planted").exists());
+}
+
+#[test]
 fn files_map_as_private_copies() {
     let mut g = Guest::new();
     let data: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();

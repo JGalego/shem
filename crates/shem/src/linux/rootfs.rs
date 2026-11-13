@@ -77,12 +77,16 @@ impl RootFs {
         let must_be_dir = path.ends_with(b"/");
         let follow = follow || must_be_dir;
 
-        let mut resolved: Vec<Vec<u8>> = if path.starts_with(b"/") {
-            Vec::new()
-        } else {
-            components(base).map(<[u8]>::to_vec).collect()
-        };
-        let mut pending: VecDeque<Vec<u8>> = components(path).map(<[u8]>::to_vec).collect();
+        // A relative path walks its base from the root like the rest: the
+        // guest may have swapped its working directory, or a directory it
+        // holds open, for a symlink since it got there, and the host must
+        // never follow one.
+        let mut resolved: Vec<Vec<u8>> = Vec::new();
+        let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+        if !path.starts_with(b"/") {
+            pending.extend(components(base).map(<[u8]>::to_vec));
+        }
+        pending.extend(components(path).map(<[u8]>::to_vec));
         let mut links = 0;
 
         while let Some(name) = pending.pop_front() {

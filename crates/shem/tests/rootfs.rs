@@ -53,6 +53,28 @@ fn dotdot_stops_at_the_root() {
 }
 
 #[test]
+fn a_base_that_became_a_symlink_resolves_inside_the_root() {
+    // The guest's working directory, or a directory it holds open, removed
+    // and replaced by a link since it got there: the base is walked again
+    let root = root();
+    symlink("/", root.host.join("was-a-dir")).unwrap();
+    symlink("../../../../../..", root.host.join("was-another")).unwrap();
+    assert_eq!(root.guest("/was-a-dir", "etc", true), Ok("/etc".into()));
+    assert_eq!(
+        root.guest("/was-another", "bin/busybox", true),
+        Ok("/bin/busybox".into())
+    );
+    assert_eq!(
+        root.guest("/was-a-dir/bin", "../file", true),
+        Ok("/file".into())
+    );
+    // A base that climbs out, as a forged one could
+    assert_eq!(root.guest("/../../..", "file", true), Ok("/file".into()));
+    // A base that is gone
+    assert_eq!(root.guest("/gone", "file", true), Err(Errno::ENOENT));
+}
+
+#[test]
 fn absolute_symlinks_resolve_inside_the_root() {
     let root = root();
     assert_eq!(root.guest("/", "/bin/ls", true), Ok("/bin/busybox".into()));
