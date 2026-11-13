@@ -534,3 +534,32 @@ def test_templates_with_generation_blocks_render_their_text(tmp_path):
     tokenizer = Tokenizer(tmp_path, {"file": "tokenizer.json", "chat_template": "chat_template.jinja", "eos": []})
     messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
     assert tokenizer.render(messages, reply=False) == "hi hello "
+
+
+def test_verify_compares_an_import_with_its_checkpoint(tmp_path):
+    """shem-neural-verify, as the Space runs it: an import passes, and the
+    same import with one weight changed doesn't."""
+    from shem_neural.model.verify import verify
+
+    torch.manual_seed(0)
+    reference = transformers.AutoModelForCausalLM.from_config(CONFIGS["llama3"]()).eval()
+    with torch.no_grad():
+        for parameter in reference.parameters():
+            parameter.add_(torch.randn_like(parameter) * 0.1)
+    checkpoint = tmp_path / "checkpoint"
+    reference.save_pretrained(checkpoint)
+    tokenizer_files(checkpoint, SMALL["vocab_size"])
+    out = tmp_path / "imported"
+    import_checkpoint(checkpoint, out)
+
+    comparison = verify(str(checkpoint), out, length=8)
+    assert comparison.passed, comparison
+    assert comparison.length == 8
+
+    # The final norm's weights, wherever the index says they are
+    name = Manifest.load(out).head.tensors["norm"]
+    file = out / json.loads((out / "model.safetensors.index.json").read_text())["weight_map"][name]
+    tensors = load_file(str(file))
+    tensors[name] = tensors[name] + 0.5
+    save_file(tensors, str(file), metadata={"format": "pt"})
+    assert not verify(str(checkpoint), out, length=8).passed

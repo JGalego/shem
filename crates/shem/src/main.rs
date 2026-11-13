@@ -34,9 +34,11 @@ enum Command {
     Build(BuildArgs),
     /// List the images in the local store
     Images,
-    /// Push an image to an OCI registry (uses oras)
+    /// Push an image to an OCI registry (uses oras), or to a Hugging Face
+    /// repo as hf.co/ORG/NAME[:BRANCH]
     Push(PushArgs),
-    /// Pull an image from an OCI registry into the store (uses oras)
+    /// Pull an image from an OCI registry into the store (uses oras), or
+    /// from a Hugging Face repo as hf.co/ORG/NAME[:REVISION]
     Pull(PullArgs),
     /// Write an image as an OCI archive for `docker load`, to run with
     /// `docker run --runtime io.containerd.shem.v1`
@@ -48,6 +50,9 @@ enum Command {
     /// Serve a model image as OpenAI's chat completions API, at
     /// http://HOST:PORT/v1, until interrupted
     Serve(ServeArgs),
+    /// Serve the images in Hugging Face repos as a read-only OCI registry,
+    /// at HOST:PORT/ORG/NAME:TAG, until interrupted
+    Registry(RegistryArgs),
     /// Boot an operating system kernel in VM mode, with its console on stdio
     Boot(BootArgs),
 }
@@ -172,7 +177,8 @@ struct PushArgs {
     state: bool,
     /// The image: name[:tag] in the store, or an OCI layout directory
     image: String,
-    /// Where to push it, such as ghcr.io/me/app:1.0
+    /// Where to push it, such as ghcr.io/me/app:1.0, or hf.co/me/app to push
+    /// it to the main branch of a Hugging Face repo
     remote: String,
 }
 
@@ -216,6 +222,18 @@ struct ServeArgs {
 }
 
 #[derive(Args)]
+struct RegistryArgs {
+    /// The port to serve at
+    #[arg(short, long, default_value_t = 5000)]
+    port: u16,
+    /// The address to listen at: this host's own by default. Repos are read
+    /// with this host's Hugging Face token, so whoever reaches the registry
+    /// can pull the private ones it can read
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+}
+
+#[derive(Args)]
 struct PullArgs {
     /// Talk to the registry over plain HTTP, as to a local test registry
     #[arg(long)]
@@ -223,7 +241,8 @@ struct PullArgs {
     /// The name to store it under, if not the remote reference
     #[arg(short, long)]
     tag: Option<String>,
-    /// The image to pull, such as ghcr.io/me/app:1.0
+    /// The image to pull, such as ghcr.io/me/app:1.0, or hf.co/me/app, which
+    /// imports the model if the repo holds a checkpoint and no image
     remote: String,
 }
 
@@ -257,6 +276,7 @@ fn main() -> ExitCode {
         Command::Save(args) => save(args),
         Command::Load(args) => load(args),
         Command::Serve(args) => serve(args),
+        Command::Registry(args) => image::model::serve_registry(&args.host, args.port),
         Command::Boot(args) => boot(args),
     };
     match result {

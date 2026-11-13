@@ -35,6 +35,7 @@ shem-neural-generate = "shem_neural.model.generate:main"
 shem-neural-import = "shem_neural.model.importers:main"
 shem-neural-export = "shem_neural.export:main"
 shem-neural-modelpack = "shem_neural.modelpack:main"
+shem-neural-verify = "shem_neural.model.verify:main"
 
 [project.optional-dependencies]
 gguf = [
@@ -76,3 +77,5 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.ruff.lint.per-file-ignores]
 # The model card is Markdown, one line per paragraph
 "src/shem_neural/export.py" = ["E501"]
+# The registry's pages are HTML and CSS, a line per paragraph and rule
+"src/shem_neural/registry_pages.py" = ["E501"]

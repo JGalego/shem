@@ -219,6 +219,49 @@ shem push --modelpack --uncompressed qwen3 registry.example.com/team/qwen3:model
 
 See the [round-trip example](../examples/modelpack/run.sh) and [compatibility tests](../crates/shem/tests/modelpack.rs).
 
+## Images on Hugging Face
+
+A Hugging Face repo can hold an image: its OCI image layout's files, `oci-layout`, `index.json` and `blobs/sha256/*`, at the repo's root. Each revision of the repo holds one image, so its branches, tags and commits are the image's tags, and `latest` is `main`.
+
+```sh
+shem push qwen3 hf.co/your-user/qwen3-shem                    # to main, creating the repo
+shem push --modelpack qwen3 hf.co/your-user/qwen3-shem:modelpack
+shem run hf.co/your-user/qwen3-shem "What is a golem?"        # pulled on first use
+shem run hf.co/Qwen/Qwen3-0.6B "What is a golem?"             # no image there: imported
+```
+
+`shem pull` and `shem run` download the layout a repo holds at the revision given. A repo that holds none, but a checkpoint, is imported as a Shemfile of `FROM hf.co/ORG/NAME[:REVISION]` alone would build it, and kept in the store like a pulled image. A push uploads the blobs first, then the index, removing the blobs only earlier pushes had, so every commit's index finds its blobs. Pushes and private repos use your Hugging Face token (`HF_TOKEN`, or `hf auth login`).
+
+### A registry over the Hub
+
+`shem registry` serves these repos as a read-only OCI registry, for clients other than shem:
+
+```sh
+shem registry --port 5000 &
+oras pull localhost:5000/your-user/qwen3-shem:latest
+docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 localhost:5000/your-user/qwen3-shem "What is a golem?"
+```
+
+| Request | Answer |
+|---|---|
+| `GET /v2/ORG/NAME/manifests/TAG` | The first manifest the revision's `index.json` lists |
+| `GET /v2/ORG/NAME/manifests/sha256:…` | That blob, from `main` or a revision already served |
+| `GET /v2/ORG/NAME/blobs/sha256:…` | Up to 1 MB, the blob; larger, a redirect to where Hugging Face keeps it, so weights never pass through the registry |
+| `GET /v2/ORG/NAME/tags/list` | `latest`, the other branches, and the tags |
+| `PUT`, `POST`, `PATCH`, `DELETE` | `405`: push with `shem push IMAGE hf.co/ORG/NAME` |
+
+Requests to Hugging Face use this host's token, so whoever reaches the registry can pull the private repos it can read; it listens on `127.0.0.1` unless given `--host`. Hugging Face resolves repo names in any case, so a client that needs lowercase names, as Docker does, can pull `qwen/qwen3-0.6b-shem` for `Qwen/Qwen3-0.6B-shem`.
+
+Outside `/v2/`, the registry serves pages for people. `/` says how to pull from it and lists the repos it has served since it started. `/ORG/NAME?tag=TAG` shows an image: its tags, how to run and pull it, its entrypoint and system prompt, whether a session is primed, the model from its `shem.json`, the comparison with transformers in the repo's `comparison.json`, and its layers.
+
+### Comparing an import with transformers
+
+`shem-neural-verify` runs the check [`test_model.py`](../neural/tests/test_model.py) makes of each supported model on any import: the prompt's logits within 1e-3 of transformers' in float32, and the same greedy reply, one token at a time from the session's state. It needs transformers, which the `gguf` extra installs.
+
+```sh
+uv run --project neural shem-neural-verify Qwen/Qwen3-0.6B ./model --report comparison.json
+```
+
 ## Sessions under Docker
 
 Model sessions run in `shem-neural-server`, keyed by container ID. [Install the shim](containerd.md#with-docker), then start the server as root so it can read containerd-mounted root filesystems. The install script can run it as a systemd service, from the `shem-neural` release that matches shem:

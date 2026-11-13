@@ -4,14 +4,20 @@
 //! client, copies it as is, whatever its media types; shem runs `oras cp`. The
 //! push goes by manifest digest, so nothing depends on how tags are written in
 //! the layout. Set `SHEM_ORAS` to use an `oras` that is not on `PATH`.
+//!
+//! `hf.co/ORG/NAME[:REVISION]` names a Hugging Face repo instead, which
+//! keeps an image as its layout's files, at a branch, tag or commit
+//! (`latest` is `main`). Pulling one that holds no layout, but a checkpoint,
+//! imports the model, as `FROM hf.co/ORG/NAME` does.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, bail};
 
-use super::Image;
 use super::modelpack::Artifact;
+use super::{BuildOptions, Image, build, model, parse_reference};
 
 fn oras() -> Command {
     Command::new(std::env::var_os("SHEM_ORAS").unwrap_or_else(|| "oras".into()))
@@ -35,6 +41,10 @@ fn run(mut command: Command) -> anyhow::Result<()> {
 /// keeps. `plain_http` talks to a registry without TLS, such as a local one.
 pub fn push(dir: &Path, remote: &str, plain_http: bool) -> anyhow::Result<String> {
     let digest = Image::layout_digest(dir)?;
+    if let Some((repo, revision)) = model::hf_reference(remote) {
+        model::push_layout(dir, repo, revision)?;
+        return Ok(digest);
+    }
     let mut command = oras();
     command
         .args(["cp", "--from-oci-layout"])
@@ -82,7 +92,14 @@ pub fn pull(remote: &str, dir: &Path, plain_http: bool) -> anyhow::Result<String
     std::fs::create_dir_all(parent)?;
     let staging = tempfile::tempdir_in(parent)?;
     let layout = staging.path().join("layout");
-    copy_to_layout(remote, &layout, plain_http)?;
+    match model::hf_reference(remote) {
+        Some((repo, revision)) => {
+            if !model::fetch_layout(repo, revision, &layout)? {
+                import(remote, &staging.path().join("context"), &layout)?;
+            }
+        }
+        None => copy_to_layout(remote, &layout, plain_http)?,
+    }
     let layout = match Artifact::read(&layout)? {
         Some(artifact) => {
             let root = tempfile::tempdir()?;
@@ -102,4 +119,24 @@ pub fn pull(remote: &str, dir: &Path, plain_http: bool) -> anyhow::Result<String
     }
     std::fs::rename(&layout, dir)?;
     Image::layout_digest(dir)
+}
+
+/// Import the model of the Hugging Face repo `remote` names, as a Shemfile
+/// of `FROM remote` alone builds it, into a layout at `out`. `context` is an
+/// empty directory to build in.
+fn import(remote: &str, context: &Path, out: &Path) -> anyhow::Result<()> {
+    let (name, tag) = parse_reference(remote)?;
+    // `latest`, which a reference without a tag means, is no revision to import
+    let from = if tag == "latest" { name } else { remote };
+    std::fs::create_dir_all(context)?;
+    let shemfile = context.join("Shemfile");
+    std::fs::write(&shemfile, format!("FROM {from}\n"))?;
+    let image = build(&BuildOptions {
+        shemfile,
+        context: context.to_path_buf(),
+        build_args: BTreeMap::new(),
+        mem: None,
+    })?;
+    image.write_layout(out, tag)?;
+    Ok(())
 }

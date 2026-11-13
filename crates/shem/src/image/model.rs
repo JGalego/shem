@@ -225,6 +225,54 @@ pub fn serve(entrypoint: &[String], root: &Path, address: &str) -> anyhow::Resul
     Ok(status.code().unwrap_or(1) as u8)
 }
 
+/// The module of the neural package that keeps images in Hugging Face repos.
+const HUB: &str = "shem_neural.hub";
+
+/// Download the OCI image layout the Hugging Face repo `repo` holds at
+/// `revision` into `out`. Returns false, leaving `out` alone, if the repo
+/// holds no layout there, as a repo of a checkpoint doesn't.
+pub fn fetch_layout(repo: &str, revision: Option<&str>, out: &Path) -> anyhow::Result<bool> {
+    let mut command = python(HUB);
+    command.arg("fetch").arg(repo).arg(out);
+    if let Some(revision) = revision {
+        command.args(["--revision", revision]);
+    }
+    let status = command
+        .status()
+        .context("fetching from Hugging Face, which needs uv")?;
+    if !status.success() {
+        bail!("fetching hf.co/{repo} failed ({status})");
+    }
+    Ok(out.join("oci-layout").is_file())
+}
+
+/// Upload the OCI image layout in `dir` to the Hugging Face repo `repo`, at
+/// the branch `revision` names, creating the repo and the branch if need be.
+pub fn push_layout(dir: &Path, repo: &str, revision: Option<&str>) -> anyhow::Result<()> {
+    let mut command = python(HUB);
+    command.arg("push").arg(dir).arg(repo);
+    if let Some(revision) = revision {
+        command.args(["--revision", revision]);
+    }
+    let status = command
+        .status()
+        .context("pushing to Hugging Face, which needs uv")?;
+    if !status.success() {
+        bail!("pushing to hf.co/{repo} failed ({status})");
+    }
+    Ok(())
+}
+
+/// Serve the images kept in Hugging Face repos as a read-only OCI registry
+/// at `host`:`port`, until interrupted. Returns the server's status.
+pub fn serve_registry(host: &str, port: u16) -> anyhow::Result<u8> {
+    let status = python("shem_neural.registry")
+        .args(["--host", host, "--port", &port.to_string()])
+        .status()
+        .context("serving the registry, which needs uv")?;
+    Ok(status.code().unwrap_or(1) as u8)
+}
+
 /// Whether `entrypoint` names a driver rather than a guest program.
 pub fn is_driver(entrypoint: &[String]) -> bool {
     entrypoint

@@ -29,6 +29,7 @@ from shem_neural.model.importers import (
 )
 from shem_neural.model.manifest import Manifest
 from shem_neural.model.tokenizer import Tokenizer
+from shem_neural.model.verify import verify
 
 pytestmark = pytest.mark.skipif(not os.environ.get("SHEM_MODEL_TESTS"), reason="set SHEM_MODEL_TESTS=1")
 
@@ -126,39 +127,11 @@ def free(*models) -> None:
 
 @pytest.mark.parametrize("repo", REPOS)
 def test_imported_models_match_transformers(repo, imports):
-    import transformers
-
-    directory = imports(repo)
-    tokenizer = Tokenizer(directory, Manifest.load(directory).tokenizer)
-    prompt = tokenizer.chat(MESSAGES)
-    tokens = torch.tensor([prompt])
-
-    # transformers' logits for the prompt, and its greedy reply. The
-    # checkpoint's generation defaults are replaced, not overridden, since
-    # generate merges them into a config it is given: Qwen2.5's repetition
-    # penalty would apply even without sampling
-    ref = reference(repo)
-    with torch.no_grad():
-        expected = ref(input_ids=tokens).logits
-    ref.generation_config = transformers.GenerationConfig()
-    want = ref.generate(input_ids=tokens, do_sample=False, max_new_tokens=24)[0, len(prompt) :].tolist()
-    free(ref)
-    ref = None
-
-    # The prompt's logits, in one pass
-    model = Model(directory)
-    got = model.forward(tokens, model.init_state(), 0)
-    assert torch.allclose(got, expected, atol=1e-3, rtol=1e-3), (got - expected).abs().max()
-
-    # Greedy decoding, one token at a time from the session's state
-    state = model.init_state()
-    logits = model.forward(tokens, state, 0)
-    reply = []
-    for position in range(len(prompt), len(prompt) + len(want)):
-        token = int(logits[0, -1].argmax())
-        reply.append(token)
-        logits = model.forward(torch.tensor([[token]]), state, position)
-    assert reply == want, (tokenizer.decode(reply), tokenizer.decode(want))
+    """The prompt's logits within 1e-3 of transformers', and the same greedy
+    reply, one token at a time from the session's state."""
+    comparison = gated(lambda: verify(repo, imports(repo)))
+    assert comparison.logits, comparison.difference
+    assert comparison.tokens, (comparison.reply, comparison.expected)
 
 
 @pytest.mark.parametrize("repo", TEXT_REPOS)
