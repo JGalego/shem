@@ -994,29 +994,49 @@ impl Process {
         offset: u32,
         count: u32,
     ) -> Result<u32, Errno> {
-        let mut data = vec![0; count.min(MAX_IO) as usize];
+        // Read where the input is, and move it on only by what the output
+        // takes: a pipe takes no more than its free space, and the rest must
+        // stay unread. As on Linux, the input is a file; BusyBox falls back
+        // to read and write for anything else.
         let input = self.files.get(in_fd)?;
-        let n = if offset == 0 {
-            input.lock().unwrap().read(&mut data)?
-        } else {
-            let mut position = [0u8; 8];
-            vcpu.read_mem(offset, &mut position)?;
-            let position = u64::from_le_bytes(position);
+        let (data, position) = {
             let input = input.lock().unwrap();
             let Kind::File(file) = &input.kind else {
-                return Err(Errno::ESPIPE);
+                return Err(Errno::EINVAL);
             };
             if input.flags & O_ACCMODE == O_WRONLY {
                 return Err(Errno::EBADF);
             }
+            let position = if offset == 0 {
+                (&*file).stream_position()?
+            } else {
+                let mut position = [0u8; 8];
+                vcpu.read_mem(offset, &mut position)?;
+                u64::from_le_bytes(position)
+            };
+            let mut data = vec![0; count.min(MAX_IO) as usize];
             let n = file.read_at(&mut data, position)?;
-            vcpu.write_mem(offset, &(position + n as u64).to_le_bytes())?;
+            data.truncate(n);
+            (data, position)
+        };
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let n = {
+            let output = self.files.get(out_fd)?;
+            let mut output = output.lock().unwrap();
+            let n = output.write(&data)?;
+            output.modified(self.now);
             n
         };
-        let output = self.files.get(out_fd)?;
-        let mut output = output.lock().unwrap();
-        let n = output.write(&data[..n])?;
-        output.modified(self.now);
+        let end = position + n as u64;
+        if offset == 0 {
+            if let Kind::File(file) = &input.lock().unwrap().kind {
+                (&*file).seek(std::io::SeekFrom::Start(end))?;
+            }
+        } else {
+            vcpu.write_mem(offset, &end.to_le_bytes())?;
+        }
         Ok(n as u32)
     }
 
@@ -1411,6 +1431,16 @@ fn stamp(path: &std::path::Path, access: Option<u64>, modify: Option<u64>) {
         },
         None => libc::timespec {
             tv_sec: 0,
+    let _ = set_times(path, access, modify);
+}
+
+/// Set the times of the file at the host `path`, or of the symlink there,
+/// which is not followed.
+fn set_times(
+    path: &std::path::Path,
+    access: Option<u64>,
+    modify: Option<u64>,
+) -> Result<(), Errno> {
             tv_nsec: libc::UTIME_OMIT,
         },
     };
@@ -1433,16 +1463,6 @@ fn stamp(path: &std::path::Path, access: Option<u64>, modify: Option<u64>) {
 
 const STATFS_SIZE: usize = 88;
 const SHEM_MAGIC: u32 = 0x5348_454d; // "SHEM"
-    let _ = set_times(path, access, modify);
-}
-
-/// Set the times of the file at the host `path`, or of the symlink there,
-/// which is not followed.
-fn set_times(
-    path: &std::path::Path,
-    access: Option<u64>,
-    modify: Option<u64>,
-) -> Result<(), Errno> {
 const PROC_SUPER_MAGIC: u32 = 0x9fa0;
 const PIPEFS_MAGIC: u32 = 0x5049_5045;
 /// The root filesystem's size in 4 KiB blocks, and its inode count: 4 GiB.

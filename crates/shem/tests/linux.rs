@@ -51,6 +51,7 @@ const STATX: u32 = 291;
 const CLOCK_GETTIME64: u32 = 403;
 const CLOCK_NANOSLEEP_TIME64: u32 = 407;
 const UTIMENSAT_TIME64: u32 = 412;
+const SENDFILE64: u32 = 71;
 
 const AT_FDCWD: u32 = -100i32 as u32;
 const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -581,6 +582,26 @@ fn file_times_set_without_following_go_to_the_link_itself() {
     assert_eq!(g.call(UTIMENSAT_TIME64, &[AT_FDCWD, path, times, flags]), 0);
     assert_eq!(fs::symlink_metadata(g.host("link")).unwrap().mtime(), 1);
     assert_eq!(fs::metadata(outside.path()).unwrap().mtime(), before);
+}
+
+#[test]
+fn sendfile_into_a_pipe_loses_nothing_the_pipe_had_no_room_for() {
+    let mut g = Guest::new();
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    fs::write(g.host("big"), &data).unwrap();
+    let fd = g.open("/big", O_RDONLY) as u32;
+    let (r, w) = g.pipe(O_NONBLOCK);
+    let mut got = Vec::new();
+    loop {
+        let n = g.call(SENDFILE64, &[w, fd, 0, 1 << 20]);
+        assert!(n >= 0, "sendfile failed: {n}");
+        if n == 0 {
+            break;
+        }
+        got.extend(g.read(r as i32, n as u32));
+    }
+    assert_eq!(got.len(), data.len());
+    assert!(got == data, "the bytes differ");
 }
 
 #[test]
