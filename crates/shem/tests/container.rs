@@ -180,6 +180,17 @@ fn rejects_executables_it_cannot_run() {
     let hard_float = elf_with_flags(&[ECALL], &[], 0x4);
     assert_eq!(start_err(&hard_float), Some(ElfError::FloatAbi.to_string()));
     assert_eq!(start_err(b"#!/bin/sh"), Some(ElfError::NotElf.to_string()));
+
+    // Program headers Linux refuses: more than a page of them, each of which
+    // could fill memory, and headers of another size
+    let mut many = elf(&[ECALL], &[]);
+    let header = many[52..84].to_vec();
+    many.splice(84..84, header.repeat(4095));
+    many[44..46].copy_from_slice(&4096u16.to_le_bytes()); // e_phnum
+    assert_eq!(start_err(&many), Some(ElfError::Malformed.to_string()));
+    let mut odd = elf(&[ECALL], &[]);
+    odd[42..44].copy_from_slice(&0u16.to_le_bytes()); // e_phentsize
+    assert_eq!(start_err(&odd), Some(ElfError::Malformed.to_string()));
 }
 
 #[test]

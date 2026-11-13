@@ -86,6 +86,11 @@ pub fn parse(data: &[u8], mem_size: u32) -> Result<Image, ElfError> {
     let phoff = u32_at(data, 28)?;
     let phentsize = u16_at(data, 42)? as u32;
     let phnum = u16_at(data, 44)? as u32;
+    // As Linux does, take only 32-bit program headers, a page of them at
+    // most: each can fill guest memory, so thousands would take ages to load
+    if phentsize != PHDR_SIZE || phnum * phentsize > PAGE_SIZE {
+        return Err(ElfError::Malformed);
+    }
     let mut top = 0u32;
     let mut phdr = None;
     let mut segments = Vec::new();
