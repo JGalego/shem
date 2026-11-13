@@ -109,12 +109,15 @@ containerd-test: toolchain
     just cc -O2 -o target/oci-hello/hello guests/hello.c
     printf 'FROM scratch\nCOPY hello /hello\nENTRYPOINT ["/hello"]\n' | docker build -q -t shem-hello:latest -f - target/oci-hello
     docker save shem-hello:latest | sudo ctr images import -
+    # The shim traces every request here, and what it wrote to each stream
+    sudo mkdir -p /run/shem
     status=0
     timeout 120 sudo ctr run --rm --runtime io.containerd.shem.v1 docker.io/library/shem-hello:latest shem-test /hello one two > target/oci-hello/out.txt || status=$?
     cat target/oci-hello/out.txt
     echo "ctr run exited with status $status (the program exits with its argument count, 3)"
     if ! grep -q "sum of squares below 100000" target/oci-hello/out.txt; then
-        sudo journalctl -u containerd --no-pager | grep -iE 'shem|error|warn' | tail -30 || true
+        echo "--- the shim's trace"; sudo cat /run/shem/shim.log || true
+        echo "--- containerd"; sudo journalctl -u containerd --no-pager | grep -iE 'shem|error|warn' | tail -30 || true
         exit 1
     fi
 

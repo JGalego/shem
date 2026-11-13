@@ -229,18 +229,53 @@ fn stdio(stdin: &str, stdout: &str, stderr: &str) -> std::io::Result<Stdio> {
     } else {
         Box::new(open_fifo_for_reading(stdin)?)
     };
-    let output = |path: &str| -> std::io::Result<Box<dyn std::io::Write + Send>> {
+    let output = |name: &'static str, path: &str| -> std::io::Result<Box<dyn Write + Send>> {
         if path.is_empty() {
             Ok(Box::new(std::io::sink()))
         } else {
-            Ok(Box::new(OpenOptions::new().write(true).open(path)?))
+            let file = OpenOptions::new().write(true).open(path)?;
+            trace(format!("{name}: opened"));
+            Ok(Box::new(Traced {
+                name,
+                inner: file,
+                written: 0,
+            }))
         }
     };
     Ok(Stdio {
         stdin: input,
-        stdout: output(stdout)?,
-        stderr: output(stderr)?,
+        stdout: output("stdout", stdout)?,
+        stderr: output("stderr", stderr)?,
     })
+}
+
+/// A container's output stream that traces, as it closes, how much went to
+/// it: a reader that saw less lost it after the shim.
+struct Traced {
+    name: &'static str,
+    inner: File,
+    written: usize,
+}
+
+impl Write for Traced {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(data)?;
+        self.written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Drop for Traced {
+    fn drop(&mut self) {
+        trace(format!(
+            "{}: closing after {} bytes",
+            self.name, self.written
+        ));
+    }
 }
 
 /// Open a FIFO to read from without waiting for a writer, as runc does: with
