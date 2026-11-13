@@ -287,7 +287,8 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
     """The driver's arguments: its options, the model, and the prompt. With
     `model`, `argv` holds only options and the prompt, in any order, as a
     container's command line does."""
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    # No abbreviations: an image's options are checked by their full names
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], allow_abbrev=False)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument(
         "--stop", action="append", default=[], help="end the reply where it reaches this text; may be given again"

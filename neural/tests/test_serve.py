@@ -235,3 +235,15 @@ def test_the_model_server_serves_a_container_api_until_it_ends():
     models.close({"session_id": "c1"})
     with pytest.raises(urllib.error.URLError):
         urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5)
+
+
+def test_the_model_server_takes_no_session_paths_from_a_container(tmp_path):
+    """The server may be root; a container's command line is its image's."""
+    from shem_neural.server import Models
+
+    models = Models(device="cpu")
+    for argv in (["--warm", str(tmp_path / "w")], [f"--warm={tmp_path / 'w'}"], ["--session", str(tmp_path)]):
+        with pytest.raises(ValueError, match="--warm or --session"):
+            models.generate({"model": str(TINY), "argv": [*argv, "--system", "x", "hi"]}, lambda _: None)
+    assert not (tmp_path / "w").exists()
+    assert not models.loaded

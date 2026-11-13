@@ -96,6 +96,10 @@ class Models:
         from .model import generate
 
         args = generate.resolve(generate.options(request.get("argv", []), model=request["model"]))
+        # This server may be root, and a container's command line is the
+        # image's: it names no host paths to write or read sessions at
+        if args.warm or args.session:
+            raise ValueError("a container's command line cannot give --warm or --session")
         if request.get("session"):
             args.session = Path(request["session"])
         model, tokenizer = self.get(args.model, args.dtype)
