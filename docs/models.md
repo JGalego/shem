@@ -244,15 +244,17 @@ docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 localho
 
 | Request | Answer |
 |---|---|
-| `GET /v2/ORG/NAME/manifests/TAG` | The first manifest the revision's `index.json` lists |
+| `GET /v2/ORG/NAME/manifests/TAG` | The first manifest the revision's `index.json` lists, or, in a repo without one, a ModelPack artifact of its files |
 | `GET /v2/ORG/NAME/manifests/sha256:…` | That blob, from `main` or a revision already served |
 | `GET /v2/ORG/NAME/blobs/sha256:…` | Up to 1 MB, the blob; larger, a redirect to where Hugging Face keeps it, so weights never pass through the registry |
 | `GET /v2/ORG/NAME/tags/list` | `latest`, the other branches, and the tags |
 | `PUT`, `POST`, `PATCH`, `DELETE` | `405`: push with `shem push IMAGE hf.co/ORG/NAME` |
 
+A repo that holds a checkpoint rather than an image is served as a ModelPack artifact made on request: a raw layer for each file but `.gitattributes`, at its path, typed as weights, documents, code or configs, and a model config from what the Hub says of the repo. A large file's layer is the file itself, named by the sha256 the Hub keeps for it, so it redirects to the Hub like any large blob; small files are downloaded once to learn their digests. The same commit makes the same artifact. `oras pull localhost:5000/huggingfacetb/smollm2-135m-instruct` downloads the repo's files, and `shem run localhost:5000/huggingfacetb/smollm2-135m-instruct` runs its image twin, which wraps each file in a tar of its own. The artifact is the whole repo, ONNX exports and all, where `shem run hf.co/…` downloads only what the import needs.
+
 Requests to Hugging Face use this host's token, so whoever reaches the registry can pull the private repos it can read; it listens on `127.0.0.1` unless given `--host`. Hugging Face resolves repo names in any case, so a client that needs lowercase names, as Docker does, can pull `qwen/qwen3-0.6b-shem` for `Qwen/Qwen3-0.6B-shem`.
 
-Outside `/v2/`, the registry serves pages for people, with a search box to open any repo. `/` shows the repos it has served since it started as cards. `/ORG/NAME?tag=TAG` shows an image as a model page: badges for its comparison with transformers (from the repo's `comparison.json`), size, precision, licence and primed session; its system prompt, the model from its `shem.json`, its entrypoint and its layers; and beside them, the commands to use it with shem, oras or Docker, its digest, its source checkpoint and its tags.
+Outside `/v2/`, the registry serves pages for people. `/` has a search box, counts of the repos served, the pulls, and the bytes sent from the Hub and from the registry, and the repos pulled since it started, last pulled first. `/ORG/NAME?tag=TAG` shows an image as a model page: badges for its comparison with transformers (from the repo's `comparison.json`), size, precision, licence and primed session; its system prompt, the model from its `shem.json`, its entrypoint and its layers; and beside them, the commands to use it with shem, oras or Docker, its digest, its source checkpoint and its tags. Open pages stay current: they ask `/live` whether what they show has changed, every 3 seconds for the home page and every 15 for a repo's, which asks the Hub for the revision's commit, and show the new version without reloading.
 
 ### Comparing an import with transformers
 

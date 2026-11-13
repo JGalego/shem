@@ -81,10 +81,12 @@ class FakeApi:
 
     def __init__(self, root: Path):
         self.root = root
+        #: The branch each commit model_info gave is on
+        self.commits: dict[str, str] = {}
 
     def dir(self, repo: str, rev: str | None) -> Path:
         self.repo(repo)
-        path = self.root / repo / (rev or "main")
+        path = self.root / repo / self.commits.get(rev, rev or "main")
         if not path.is_dir():
             raise RevisionNotFoundError(f"{repo} has no revision {rev}", response=NOT_FOUND)
         return path
@@ -107,6 +109,23 @@ class FakeApi:
     def snapshot_download(self, repo, revision=None, local_dir=None, allow_patterns=None):
         shutil.copytree(self.dir(repo, revision), local_dir, dirs_exist_ok=True)
         (Path(local_dir) / ".cache" / "huggingface").mkdir(parents=True)
+
+    def model_info(self, repo, revision=None, files_metadata=False):
+        """A revision's files, and a commit that changes with them; a file
+        above 1 KB is in large-file storage, with its sha256."""
+        base = self.dir(repo, revision)
+        files = sorted(p for p in base.rglob("*") if p.is_file())
+        digest = hashlib.sha256()
+        for file in files:
+            digest.update(file.relative_to(base).as_posix().encode() + file.read_bytes())
+        commit = digest.hexdigest()[:40]
+        self.commits[commit] = base.name
+        siblings = []
+        for file in files:
+            data = file.read_bytes()
+            lfs = SimpleNamespace(sha256=hashlib.sha256(data).hexdigest(), size=len(data)) if len(data) > 1024 else None
+            siblings.append(SimpleNamespace(rfilename=file.relative_to(base).as_posix(), size=len(data), lfs=lfs))
+        return SimpleNamespace(id=repo, sha=commit, siblings=siblings, card_data=None, safetensors=None)
 
     def list_repo_refs(self, repo):
         names = [p.name for p in self.repo(repo).iterdir()]
@@ -199,17 +218,19 @@ def test_layouts_unpack_into_their_filesystem(tmp_path):
 def served(api, pushed, monkeypatch):
     """The registry over the fake Hub, with large blobs where a CDN keeps
     them: a server of their own, as Hugging Face's are elsewhere."""
-    blobs = api.root / "org/clay/main/blobs/sha256"
     cdn = http.server.ThreadingHTTPServer(
-        ("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=blobs)
+        ("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=api.root)
     )
 
     def metadata(url, token=None):
-        path = Path(url.split("/resolve/")[1].split("/", 1)[1])
-        file = blobs / path.name
-        if "/resolve/main/" not in url or not file.is_file():
+        # https://hub.example/ORG/NAME/resolve/REVISION/PATH
+        repo, _, rest = url.removeprefix(f"{api.endpoint}/").partition("/resolve/")
+        rev, _, path = rest.partition("/")
+        file = api.dir(repo, None if rev == "main" else rev) / path
+        if not file.is_file():
             raise EntryNotFoundError(url)
-        return SimpleNamespace(size=file.stat().st_size, location=f"http://127.0.0.1:{cdn.server_port}/{path.name}")
+        where = file.relative_to(api.root).as_posix()
+        return SimpleNamespace(size=file.stat().st_size, location=f"http://127.0.0.1:{cdn.server_port}/{where}")
 
     monkeypatch.setattr(registry, "get_hf_file_metadata", metadata)
     # Between a tar of a small file, a 10 KiB record, and the weights
@@ -260,14 +281,13 @@ def test_registry_answers_in_the_distribution_specs_errors(served):
     assert json.loads(get(served, "/v2/org/clay/tags/list")[2]) == {"name": "org/clay", "tags": ["latest"]}
 
 
-def test_repos_without_an_image_say_what_to_do(served, api):
-    (api.root / "org/checkpoint/main").mkdir(parents=True)
-    (api.root / "org/checkpoint/main/config.json").write_text("{}")
-    status, _, body = get(served, "/v2/org/checkpoint/manifests/latest")
+def test_repos_without_files_are_no_artifacts(served, api):
+    (api.root / "org/empty/main").mkdir(parents=True)
+    (api.root / "org/empty/main/.gitattributes").write_text("")
+    status, _, body = get(served, "/v2/org/empty/manifests/latest")
     error = json.loads(body)["errors"][0]
     assert (status, error["code"]) == (404, "MANIFEST_UNKNOWN")
-    assert "shem run hf.co/org/checkpoint" in error["message"]
-    assert "shem push IMAGE hf.co/org/checkpoint" in error["message"]
+    assert error["message"] == "org/empty holds no files"
 
 
 def test_registry_is_read_only(served):
@@ -338,7 +358,7 @@ def test_home_page_lists_the_repos_served(served, model):
     # What a page of the repo shows of latest comes to its card
     get(served, "/org/golem")
     card = get(served, "/")[2].decode()
-    assert "✓ Verified" in card and "1.23B params" in card
+    assert "✓ verified" in card and "1.23B params" in card and "1 pull" in card
 
 
 def test_repo_pages_show_the_image_and_its_model(served, model):
@@ -367,3 +387,85 @@ def test_repo_pages_take_a_tag_and_explain_failures(served, model):
     assert status == 404 and headers["Content-Type"].startswith("text/html")
     assert b"<h1>404 Not Found</h1>" in body
     assert get(served, "/org/golem?tag=no/such")[0] == 404
+
+
+@pytest.fixture
+def checkpoint(api):
+    """A repo that holds a checkpoint: small configs, a document, large
+    weights, and what Git keeps of its own."""
+    base = api.root / "org/ckpt/main"
+    (base / "sub").mkdir(parents=True)
+    files = {
+        "config.json": b'{"architectures": ["LlamaForCausalLM"]}',
+        "README.md": b"# A checkpoint",
+        "model.safetensors": WEIGHTS,
+        "sub/tokenizer.json": b"{}",
+        ".gitattributes": b"*.safetensors filter=lfs",
+    }
+    for path, data in files.items():
+        (base / path).write_bytes(data)
+    return files
+
+
+def test_checkpoint_repos_are_modelpack_artifacts_of_their_files(served, checkpoint):
+    status, headers, body = get(served, "/v2/org/ckpt/manifests/latest")
+    manifest = json.loads(body)
+    assert status == 200 and manifest["artifactType"] == "application/vnd.cncf.model.manifest.v1+json"
+    assert headers["Docker-Content-Digest"] == "sha256:" + hashlib.sha256(body).hexdigest()
+    layers = {layer["annotations"]["org.cncf.model.filepath"]: layer for layer in manifest["layers"]}
+    assert sorted(layers) == ["README.md", "config.json", "model.safetensors", "sub/tokenizer.json"]
+    for path, layer in layers.items():
+        assert layer["digest"] == "sha256:" + hashlib.sha256(checkpoint[path]).hexdigest()
+        assert layer["annotations"]["org.opencontainers.image.title"] == path
+    kinds = {path: layer["mediaType"].split(".model.")[1] for path, layer in layers.items()}
+    assert kinds == {
+        "README.md": "doc.v1.raw",
+        "config.json": "weight.config.v1.raw",
+        "model.safetensors": "weight.v1.raw",
+        "sub/tokenizer.json": "weight.config.v1.raw",
+    }
+    config = json.loads(get(served, f"/v2/org/ckpt/blobs/{manifest['config']['digest']}")[2])
+    assert config["config"]["format"] == "safetensors"
+    assert config["modelfs"]["diffIds"] == [layer["digest"] for layer in manifest["layers"]]
+    # The same commit makes the same artifact
+    assert get(served, "/v2/org/ckpt/manifests/latest")[2] == body
+    # Small files are served, and large ones redirected to where the Hub keeps them
+    status, _, data = get(served, f"/v2/org/ckpt/blobs/{layers['config.json']['digest']}")
+    assert (status, data) == (200, checkpoint["config.json"])
+    status, headers, _ = get(served, f"/v2/org/ckpt/blobs/{layers['model.safetensors']['digest']}")
+    assert status == 307 and headers["Location"].endswith("org/ckpt/main/model.safetensors")
+
+
+def test_checkpoint_pages_list_their_files(served, checkpoint):
+    page = html.unescape(get(served, "/org/ckpt")[2].decode())
+    assert "ModelPack" in page and "model.safetensors" in page and "sub/tokenizer.json" in page
+    assert 'shem run hf.co/org/ckpt "What is a golem?"' in page
+
+
+@pytest.mark.skipif(not shutil.which("oras"), reason="needs ORAS")
+def test_oras_pulls_a_checkpoints_files(served, checkpoint, tmp_path):
+    reference = f"127.0.0.1:{served.server_port}/org/ckpt:latest"
+    command = ["oras", "pull", "--plain-http", "-o", str(tmp_path / "out"), reference]
+    subprocess.run(command, check=True, capture_output=True)
+    for path, data in checkpoint.items():
+        if path != ".gitattributes":
+            assert (tmp_path / "out" / path).read_bytes() == data
+
+
+def test_open_pages_learn_when_they_change(served, api, tmp_path):
+    def version(path):
+        return json.loads(get(served, path)[2])["version"]
+
+    page = get(served, "/")[2].decode()
+    home = version("/live")
+    assert f'<meta name="live" content="{home}"' in page
+    # A pull changes what the home page shows
+    get(served, "/v2/org/clay/manifests/latest")
+    assert version("/live") != home
+    # A push changes the commit a repo's page shows
+    before = version("/live?repo=org/clay&tag=latest")
+    assert f'content="{before}"' in get(served, "/org/clay")[2].decode()
+    other = tmp_path / "other"
+    layout(other, [{"model/shem.json": b'{"v": 2}'}])
+    hub.push(other, "org/clay", api=api)
+    assert version("/live?repo=org/clay&tag=latest") != before

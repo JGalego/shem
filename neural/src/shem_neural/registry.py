@@ -6,7 +6,9 @@ A repo that holds an OCI image layout, as `shem push IMAGE hf.co/ORG/NAME`
 writes one, is the registry's repository ORG/NAME, and its revisions are the
 repository's tags: `latest` is `main`, and a branch, tag or commit is the
 image it holds. So `oras pull`, containerd or Docker can pull
-`localhost:5000/ORG/NAME:TAG` as `shem run hf.co/ORG/NAME:TAG` runs it.
+`localhost:5000/ORG/NAME:TAG` as `shem run hf.co/ORG/NAME:TAG` runs it. A
+repo that holds no layout, but a checkpoint, is a ModelPack artifact of its
+files (see `checkpoints`).
 
 Manifests come from the repo's `index.json` and blobs, and small blobs are
 served as they are. A large blob, a layer of weights, redirects to where
@@ -16,7 +18,8 @@ private and gated repos it can read are served too, to whoever can reach the
 registry: it listens on this host only unless told otherwise.
 
 Outside `/v2/`, the registry serves pages for people: what it is and how
-to pull from it at `/`, and each repo's image at `/ORG/NAME`.
+to pull from it at `/`, and each repo's image at `/ORG/NAME`. `/live` tells
+an open page whether what it shows has changed, so it can show it again.
 """
 
 import argparse
@@ -24,6 +27,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,7 +42,9 @@ from huggingface_hub.errors import (
     RevisionNotFoundError,
 )
 
+from shem_neural import checkpoints
 from shem_neural import registry_pages as pages
+from shem_neural.checkpoints import Artifact, File
 from shem_neural.hub import revision
 
 #: Blobs up to this size are served, and larger ones redirected
@@ -74,6 +80,8 @@ class Hub:
         #: The revisions served by tag, by repo: where a digest is looked for
         #: when the default branch hasn't it
         self.seen: dict[str, set[str]] = {}
+        #: The artifacts made of repos that hold a checkpoint, by repo and commit
+        self.artifacts: dict[tuple[str, str], Artifact] = {}
 
     def read(self, repo: str, path: str, rev: str | None) -> bytes:
         return Path(self.api.hf_hub_download(repo, path, revision=rev)).read_bytes()
@@ -81,22 +89,59 @@ class Hub:
     def revisions(self, repo: str) -> list[str | None]:
         return [None, *sorted(self.seen.get(repo, ()))]
 
-    def index(self, repo: str, tag: str) -> dict:
+    def index(self, repo: str, tag: str) -> dict | None:
+        """The layout's index at `tag`, or None if the repo holds no layout there."""
         rev = revision(tag)
         try:
             data = json.loads(self.read(repo, "index.json", rev))
         except EntryNotFoundError:
-            raise Unknown(
-                "MANIFEST_UNKNOWN",
-                f"{repo} holds no image at {tag}. If it holds a checkpoint, shem imports it: shem run hf.co/{repo}. "
-                f"To serve an image here, push one: shem push IMAGE hf.co/{repo}",
-            ) from None
+            return None
         if rev:
             self.seen.setdefault(repo, set()).add(rev)
         return data
 
+    def commit(self, repo: str, tag: str) -> str:
+        """The commit `tag` names, which changes with whatever the repo holds."""
+        return self.api.model_info(repo, revision=revision(tag)).sha
+
+    def checkpoint(self, repo: str, tag: str) -> Artifact:
+        """The artifact of the checkpoint `repo` holds at `tag`, made once a commit."""
+        key = (repo.lower(), self.commit(repo, tag))
+        if key not in self.artifacts:
+            try:
+                self.artifacts[key] = checkpoints.build(self.api, repo, key[1])
+            except ValueError as error:
+                raise Unknown("MANIFEST_UNKNOWN", str(error)) from None
+        return self.artifacts[key]
+
+    def entry(self, repo: str, tag: str) -> dict:
+        """The descriptor of what `repo` holds at `tag`: the first manifest its
+        layout lists, as `shem run` takes it, or else its checkpoint's artifact."""
+        index = self.index(repo, tag)
+        if index is None:
+            return self.checkpoint(repo, tag).descriptor
+        entries = index.get("manifests") or []
+        if not entries:
+            raise Unknown("MANIFEST_UNKNOWN", f"{repo}:{tag} lists no manifest")
+        return entries[0]
+
+    def made(self, repo: str, hex: str) -> tuple[Artifact, bytes | File] | None:
+        """A blob of an artifact made of `repo`: one it made, or one of the
+        repo's files."""
+        for (name, _), artifact in list(self.artifacts.items()):
+            if name == repo.lower():
+                found = artifact.blobs.get(hex) or artifact.files.get(hex)
+                if found:
+                    return artifact, found
+        return None
+
     def blob(self, repo: str, hex: str) -> bytes:
         """A blob, from the default branch or a revision already served."""
+        if found := self.made(repo, hex):
+            artifact, item = found
+            if isinstance(item, bytes):
+                return item
+            return Path(self.api.hf_hub_download(artifact.repo, item.path, revision=artifact.commit)).read_bytes()
         for rev in self.revisions(repo):
             try:
                 return self.read(repo, f"blobs/sha256/{hex}", rev)
@@ -104,8 +149,15 @@ class Hub:
                 continue
         raise EntryNotFoundError(f"{repo} has no blob sha256:{hex}")
 
-    def locate(self, repo: str, hex: str) -> tuple[int, str]:
-        """A blob's size, and the URL its bytes are at."""
+    def locate(self, repo: str, hex: str) -> tuple[int, str | None]:
+        """A blob's size, and the URL its bytes are at, if they're best
+        fetched there: None for a blob the registry serves itself."""
+        if found := self.made(repo, hex):
+            artifact, item = found
+            if isinstance(item, bytes) or not item.large:
+                return (len(item), None) if isinstance(item, bytes) else (item.size, None)
+            url = hf_hub_url(artifact.repo, item.path, revision=artifact.commit, endpoint=self.api.endpoint)
+            return item.size, get_hf_file_metadata(url, token=self.api.token).location
         for rev in self.revisions(repo):
             url = hf_hub_url(repo, f"blobs/sha256/{hex}", revision=rev, endpoint=self.api.endpoint)
             try:
@@ -142,8 +194,10 @@ class Registry:
 
     def __init__(self, hub):
         self.hub = hub
-        #: What the home page's cards show of the repos served, by repo
+        #: What the home page shows of the repos served, by repo
         self.served: dict[str, dict] = {}
+        #: Pulls, and the bytes of blobs redirected to the Hub and sent from here
+        self.stats = {"pulls": 0, "redirected": 0, "sent": 0}
 
     def base(self, match) -> tuple[HTTPStatus, dict, bytes]:
         return HTTPStatus.OK, {"Content-Type": "application/json"}, b"{}"
@@ -154,26 +208,40 @@ class Registry:
             data = self.hub.blob(name, match["hex"])
             kind = media_type(data, "application/vnd.oci.image.manifest.v1+json")
         else:
-            entries = self.hub.index(name, match["tag"]).get("manifests") or []
-            if not entries:
-                raise Unknown("MANIFEST_UNKNOWN", f"{name}:{match['tag']} lists no manifest")
-            # The first, as `shem run` takes it
-            entry = entries[0]
+            entry = self.hub.entry(name, match["tag"])
             data = self.hub.blob(name, entry["digest"].removeprefix("sha256:"))
-            self.served.setdefault(name, {}).setdefault("tags", set()).add(match["tag"])
+            self.pulled(name, match["tag"], data)
             kind = entry.get("mediaType") or media_type(data, "application/vnd.oci.image.manifest.v1+json")
         digest = "sha256:" + hashlib.sha256(data).hexdigest()
         if match["hex"] and digest != f"sha256:{match['hex']}":
             raise Unknown("MANIFEST_INVALID", f"{name}'s blob {match['hex']} does not match its digest")
         return HTTPStatus.OK, {"Content-Type": kind, "Docker-Content-Digest": digest}, data
 
+    def pulled(self, name: str, tag: str, manifest: bytes) -> None:
+        """Note a pull of `name` at `tag`, for the home page."""
+        summary = self.served.setdefault(name, {})
+        summary.setdefault("tags", set()).add(tag)
+        summary["pulls"] = summary.get("pulls", 0) + 1
+        summary["last"] = time.time()
+        self.stats["pulls"] += 1
+        try:
+            data = json.loads(manifest)
+        except ValueError:
+            return
+        kind = data.get("artifactType") or (data.get("config") or {}).get("mediaType", "")
+        summary["kind"] = "artifact" if ".model." in kind else "image"
+        if "layers" in data:
+            summary["size"] = sum(layer.get("size", 0) for layer in data["layers"])
+
     def blob(self, match) -> tuple[HTTPStatus, dict, bytes]:
         name, hex = match["name"], match["hex"]
         size, location = self.hub.locate(name, hex)
         headers = {"Docker-Content-Digest": f"sha256:{hex}"}
-        if size > SMALL:
+        if location and size > SMALL:
+            self.stats["redirected"] += size
             return HTTPStatus.TEMPORARY_REDIRECT, headers | {"Location": location}, b""
         data = self.hub.blob(name, hex)
+        self.stats["sent"] += len(data)
         return HTTPStatus.OK, headers | {"Content-Type": "application/octet-stream"}, data
 
     def tags(self, match) -> tuple[HTTPStatus, dict, bytes]:
@@ -184,7 +252,13 @@ class Registry:
         """A page for people: the home page, or a repo's."""
         html = {"Content-Type": "text/html; charset=utf-8"}
         if path == "/":
-            return HTTPStatus.OK, html, pages.home(host, self.served)
+            return HTTPStatus.OK, html, pages.home(host, self.served, self.stats, self.version())
+        if path == "/live":
+            repo, tag = (query.get("repo") or [""])[0], (query.get("tag") or ["latest"])[0]
+            if repo and not (PAGE.match(f"/{repo}") and TAG.fullmatch(tag)):
+                raise Unknown("NAME_INVALID", f"{repo}:{tag} is no repo and tag")
+            version = self.hub.commit(repo, tag) if repo else self.version()
+            return HTTPStatus.OK, {"Content-Type": "application/json"}, json.dumps({"version": version}).encode()
         if path == "/go":
             repo = (query.get("repo") or [""])[0].strip().strip("/").removeprefix("hf.co/")
             if PAGE.match(f"/{repo}"):
@@ -197,6 +271,11 @@ class Registry:
             summary = self.served.setdefault(match["name"], {})
             return HTTPStatus.OK, html, pages.repo_page(self.hub, host, match["name"], tag, summary)
         raise Unknown("NAME_INVALID", f"no such page {path}")
+
+    def version(self) -> str:
+        """What the home page shows, as a digest that changes with it."""
+        text = json.dumps([self.served, self.stats], sort_keys=True, default=sorted)
+        return hashlib.sha256(text.encode()).hexdigest()[:16]
 
     def handle(self, target: str, host: str = "localhost:5000") -> tuple[HTTPStatus, dict, bytes]:
         path, _, query = target.partition("?")

@@ -5,20 +5,30 @@ OCI clients.
 started as cards: it can't list the Hub's. `/ORG/NAME?tag=TAG` shows an
 image as a model page: badges for what it is, the system prompt, the model
 from its `shem.json`, the comparison with transformers the Space recorded,
-and its layers, beside a box with the commands to use it. The pages work
-without JavaScript, which only adds copy buttons.
+and its layers, beside a box with the commands to use it.
+
+Open pages stay current: each names its version, which `/live` gives
+again, and a page whose version changes fetches itself and shows what it
+gets, keeping its open sections open. The pages work without JavaScript,
+which only adds that and copy buttons.
 """
 
+import hashlib
 import html
 import io
 import json
 import tarfile
+import time
+import urllib.parse
 from collections import Counter
 
 import zstandard
 
 #: Layers up to this size are read for the model's manifest or a session
 READABLE = 64 << 20
+#: How often an open page asks whether it has changed, in seconds: the home
+#: page asks this registry, a repo's page asks the Hub
+EVERY_HOME, EVERY_REPO = 3, 15
 LABEL = "dev.shem."
 STATE_DIR = ".shem"
 PROMPT = "What is a golem?"
@@ -46,15 +56,36 @@ code, pre { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 code { background: var(--code); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
 pre { margin: 0; background: var(--code); padding: 10px 12px; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
 pre code { background: none; padding: 0; }
-.hero { padding: 8px 0 20px; }
-.hero h1 { font-size: 1.9rem; }
-.hero p { margin: 0; max-width: 640px; }
-.hero + .box { max-width: 720px; }
-.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
-.card { display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; color: var(--fg); }
-.card:hover { border-color: var(--accent); text-decoration: none; }
-.card b { display: block; word-break: break-word; margin-bottom: 8px; }
-.empty { background: var(--panel); border: 1px dashed var(--line); border-radius: 12px; padding: 20px; }
+.hero { text-align: center; padding: 40px 0 28px; }
+.hero .mark { font-size: 44px; line-height: 1; }
+.hero h1 { font-size: 2rem; margin: 10px 0 18px; }
+@media (max-width: 600px) { .hero { padding-top: 24px; } .hero h1 { font-size: 1.4rem; } }
+.find { display: flex; max-width: 620px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 6px; box-shadow: 0 1px 2px rgba(60, 40, 20, .06); }
+.find:focus-within { border-color: var(--accent); }
+.find input { flex: 1; min-width: 0; font: inherit; font-size: 16px; padding: 8px 10px; border: 0; background: none; color: var(--fg); outline: none; }
+.find button { font: inherit; font-weight: 600; padding: 6px 16px; border: 0; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer; }
+.try { margin-top: 12px; font-size: 13px; color: var(--muted); display: flex; gap: 6px; justify-content: center; flex-wrap: wrap; align-items: center; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 8px 0 8px; }
+@media (max-width: 700px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.stat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+.stat b { display: block; font-size: 1.45rem; font-weight: 650; font-variant-numeric: tabular-nums; }
+.stat span { color: var(--muted); font-size: 13px; }
+.section { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; }
+@media (max-width: 760px) { .list { grid-template-columns: minmax(0, 1fr); } }
+.row { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border-radius: 10px; color: var(--fg); background: var(--panel); border: 1px solid var(--line); min-width: 0; }
+.row:hover { border-color: var(--accent); text-decoration: none; }
+.avatar { flex: none; width: 34px; height: 34px; border-radius: 8px; display: grid; place-items: center; font-weight: 700; background: hsl(var(--hue) 55% 88%); color: hsl(var(--hue) 45% 32%); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .avatar { background: hsl(var(--hue) 30% 24%); color: hsl(var(--hue) 60% 78%); } }
+.row .text { min-width: 0; flex: 1; }
+.row .name { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .name .org { color: var(--muted); }
+.row .meta { display: block; font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .meta .ok { color: var(--ok); font-weight: 600; }
+.row .when { flex: none; font-size: 12.5px; color: var(--muted); text-align: right; }
+.empty { background: var(--panel); border: 1px dashed var(--line); border-radius: 12px; padding: 28px; text-align: center; color: var(--muted); }
+.foot { margin-top: 40px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+.foot .cmd { flex: 1; min-width: 260px; }
 .chips, .badges { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
 .chip { padding: 2px 10px; border: 1px solid var(--line); border-radius: 999px; font-size: 13px; color: var(--fg); background: var(--panel); }
 .chip.on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
@@ -96,6 +127,29 @@ summary { cursor: pointer; font-weight: 600; }
 
 SCRIPT = """
 document.documentElement.classList.add('js');
+addEventListener('DOMContentLoaded', function () {
+  var live = document.querySelector('meta[name=live]');
+  if (!live || !window.fetch) return;
+  var version = live.content;
+  function check() {
+    if (document.hidden) return;
+    fetch(live.dataset.src).then(function (r) { return r.json(); }).then(function (answer) {
+      if (!answer.version || answer.version === version) return;
+      return fetch(location.href).then(function (r) { return r.text(); }).then(function (text) {
+        var next = new DOMParser().parseFromString(text, 'text/html');
+        var open = Array.from(document.querySelectorAll('details[open] > summary')).map(function (s) { return s.textContent; });
+        document.querySelector('main').replaceWith(next.querySelector('main'));
+        document.querySelectorAll('details > summary').forEach(function (s) {
+          if (open.indexOf(s.textContent) >= 0) s.parentElement.open = true;
+        });
+        var mark = next.querySelector('meta[name=live]');
+        version = mark ? mark.content : answer.version;
+      });
+    }).catch(function () {});
+  }
+  setInterval(check, live.dataset.every * 1000);
+  document.addEventListener('visibilitychange', check);
+});
 document.addEventListener('click', function (event) {
   var button = event.target.closest('[data-copy]');
   if (!button || !navigator.clipboard) return;
@@ -112,15 +166,23 @@ def e(text) -> str:
     return html.escape(str(text))
 
 
-def page(title: str, body: str, query: str = "") -> bytes:
+def page(
+    title: str, body: str, query: str = "", live: tuple[str, str, int] | None = None, search: bool = True
+) -> bytes:
+    """A page: its body under the header, which has a search box unless the
+    body has its own. `live` is where the page asks whether it has changed,
+    its version, and how often it asks."""
+    find = f"""<form class="search" action="/go" role="search"><input name="repo" value="{e(query)}" placeholder="Open a repo: ORG/NAME" aria-label="Open a repo" required></form>"""
     header = f"""<header><div class="bar">
 <a class="brand" href="/">🗿 shem registry</a>
-<form class="search" action="/go" role="search"><input name="repo" value="{e(query)}" placeholder="Open a repo: ORG/NAME" aria-label="Open a repo" required></form>
+{find if search else ""}
 </div></header>"""
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"<title>{e(title)}</title><style>{STYLE}</style><script>{SCRIPT}</script></head>"
+        f"<title>{e(title)}</title><style>{STYLE}</style><script>{SCRIPT}</script>"
+        + (f'<meta name="live" content="{e(live[1])}" data-src="{e(live[0])}" data-every="{live[2]}">' if live else "")
+        + "</head>"
         f"<body>{header}<main>{body}</main></body></html>"
     ).encode()
 
@@ -162,27 +224,67 @@ def badges(summary: dict) -> str:
     return f'<div class="badges">{"".join(out)}</div>' if out else ""
 
 
-def home(host: str, served: dict[str, dict]) -> bytes:
-    if served:
-        cards = "".join(
-            f'<a class="card" href="/{e(repo)}"><b>{e(repo)}</b>{badges(summary)}'
-            f'<span class="muted">{" · ".join(e(t) for t in sorted(summary.get("tags", ())))}'
-            f"{' · ' + size(summary['size']) if summary.get('size') else ''}</span></a>"
-            for repo, summary in sorted(served.items())
-        )
-        listed = f'<div class="cards">{cards}</div>'
+#: Repos to try on an empty registry: a shem image, and checkpoints
+TRY = ["huggingfacetb/smollm2-135m-instruct", "qwen/qwen3-0.6b", "google/gemma-3-270m-it"]
+
+
+def ago(seconds: float) -> str:
+    for unit, length in (("d", 86400), ("h", 3600), ("min", 60)):
+        if seconds >= length:
+            return f"{int(seconds // length)} {unit} ago"
+    return "just now"
+
+
+def row(repo: str, summary: dict, now: float) -> str:
+    """A repo in the home page's list: who, what, and when it was last pulled."""
+    org, _, name = repo.partition("/")
+    hue = int(hashlib.sha256(org.lower().encode()).hexdigest()[:4], 16) % 360
+    facts = ["ModelPack" if summary.get("kind") == "artifact" else "image" if summary.get("kind") else ""]
+    verified = '<span class="ok">✓ verified</span> · ' if summary.get("verified") else ""
+    if summary.get("parameters"):
+        facts.append(f"{summary['parameters'] / 1e9:.2f}B params")
+    if summary.get("size"):
+        facts.append(size(summary["size"]))
+    facts.append(" · ".join(sorted(summary.get("tags", ()))))
+    meta = verified + " · ".join(e(f) for f in facts if f)
+    pulls = summary.get("pulls", 0)
+    when = f"{pulls} pull{'s' * (pulls != 1)}<br>{ago(now - summary['last'])}" if summary.get("last") else "viewed"
+    return (
+        f'<a class="row" href="/{e(repo)}"><span class="avatar" style="--hue:{hue}">{e(org[:1].upper())}</span>'
+        f'<span class="text"><span class="name"><span class="org">{e(org)} / </span>{e(name)}</span>'
+        f'<span class="meta">{meta}</span></span><span class="when">{when}</span></a>'
+    )
+
+
+def home(host: str, served: dict[str, dict], stats: dict, version: str = "") -> bytes:
+    """The home page: a search box, what the registry has done, and the
+    repos it has served, last pulled first."""
+    now = time.time()
+    order = sorted(served.items(), key=lambda item: -item[1].get("last", 0))
+    if order:
+        listed = '<div class="list">' + "".join(row(repo, summary, now) for repo, summary in order) + "</div>"
     else:
-        listed = '<div class="empty muted">Nothing yet. Open a repo above, or pull one through this registry.</div>'
+        listed = '<div class="empty">Nothing pulled yet. Open a repo, or pull one through this registry.</div>'
+    tiles = [
+        (len(served), "repos"),
+        (stats.get("pulls", 0), "pulls"),
+        (size(stats.get("redirected", 0)), "straight from the Hub"),
+        (size(stats.get("sent", 0)), "sent from here"),
+    ]
+    chips = "".join(f'<a class="chip" href="/{e(repo)}">{e(repo)}</a>' for repo in TRY)
     body = f"""
 <section class="hero">
-<h1>Hugging Face repos as OCI images</h1>
-<p class="muted">Pull an image <code>shem push</code> put on the Hub with any OCI client. Revisions are tags: <code>latest</code> is <code>main</code>. Names are lowercase, as OCI's are; the Hub finds a repo in any case.</p>
+<div class="mark">🗿</div>
+<h1>Pull Hugging Face repos as OCI images</h1>
+<form class="find" action="/go" role="search"><input name="repo" placeholder="ORG/NAME" aria-label="Open a repo" required autofocus><button>Open</button></form>
+<div class="try">Try {chips}</div>
 </section>
-<div class="box"><h3>Pull</h3>{command(f"oras pull {host}/ORG/NAME:latest")}</div>
-<h2>Recently served</h2>
+<div class="stats">{"".join(f'<div class="stat"><b>{e(value)}</b><span>{e(label)}</span></div>' for value, label in tiles)}</div>
+<div class="section"><h2>Recently pulled</h2></div>
 {listed}
+<div class="foot"><span>Pull with any OCI client</span>{command(f"oras pull {host}/ORG/NAME:latest")}</div>
 """
-    return page("shem registry", body)
+    return page("shem registry", body, live=("/live", version, EVERY_HOME), search=False)
 
 
 def members(blob: bytes, media_type: str):
@@ -273,6 +375,12 @@ def image_details(hub, repo: str, manifest: dict, config: dict, summary: dict) -
 def artifact_details(config: dict, summary: dict) -> str:
     descriptor, settings = config.get("descriptor") or {}, config.get("config") or {}
     summary["precision"] = settings.get("precision")
+    summary["licence"] = " AND ".join(descriptor.get("licenses") or [])
+    if (url := descriptor.get("sourceURL", "")).startswith("https://huggingface.co/"):
+        summary["source"] = {
+            "repo": url.removeprefix("https://huggingface.co/"),
+            "revision": descriptor.get("revision"),
+        }
     return "<h2>Model</h2>" + rows(
         [
             ("Name", e(descriptor.get("name", ""))),
@@ -367,9 +475,8 @@ def repo_page(hub, host: str, repo: str, tag: str, summary: dict) -> bytes:
     tags = hub.tags(repo)
     summary.setdefault("tags", set()).add(tag)
     view: dict = {}
-    entry = (hub.index(repo, tag).get("manifests") or [None])[0]
-    if entry is None:
-        return page(repo, f"<h1>{e(repo)}</h1><p>{e(repo)}:{e(tag)} lists no manifest.</p>", repo)
+    version = hub.commit(repo, tag)
+    entry = hub.entry(repo, tag)
     data = json.loads(hub.blob(repo, entry["digest"].removeprefix("sha256:")))
     # An index lists the image under platforms: they are all the same image
     while "manifests" in data:
@@ -413,4 +520,5 @@ def repo_page(hub, host: str, repo: str, tag: str, summary: dict) -> bytes:
 """
     if tag == "latest":
         summary.update(view)
-    return page(f"{repo}:{tag} · shem registry", body, repo)
+    live = (f"/live?repo={urllib.parse.quote(repo)}&tag={urllib.parse.quote(tag)}", version, EVERY_REPO)
+    return page(f"{repo}:{tag} · shem registry", body, repo, live)
