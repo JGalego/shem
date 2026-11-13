@@ -321,11 +321,13 @@ impl<V: Vcpu + Clone> Container<V> {
     ) -> Result<Stop, RunError> {
         (self.pause, self.paused) = (pause, false);
         loop {
-            // A signal typed at the terminal goes to its foreground process group
+            // A signal typed at the terminal goes to its foreground process
+            // group, init's to begin with. The terminal sends it, so no
+            // process's system call returns.
             let typed = TERMINAL_SIGNAL.swap(0, std::sync::atomic::Ordering::SeqCst);
             if typed != 0 {
-                let group = self.linux.foreground as i32;
-                self.kill(INIT, -group, typed);
+                let foreground = self.group(self.linux.foreground);
+                self.raise(&foreground, typed);
             }
             let mut progress = false;
             let tids: Vec<u32> = self.tasks.keys().copied().collect();
@@ -745,35 +747,37 @@ impl<V: Vcpu + Clone> Container<V> {
         true
     }
 
-    /// Send `signal` from thread `sender` to a pid, to a process group (0 for
-    /// the sender's, -g for group g), or to every process but init (-1). A
-    /// process's signals are its threads', so one of them handles it. Zombies
-    /// count as targets, but are past killing.
-    fn kill(&mut self, sender: u32, target: i32, signal: u32) {
-        let group = |pgid: u32| -> Vec<u32> {
-            let members = self
-                .tasks
-                .iter()
-                .filter(|(_, task)| task.is_leader() && task.process().pgid == pgid);
-            members.map(|(&pid, _)| pid).collect()
-        };
-        let targets: Vec<u32> = match target {
+    /// The processes `target` names for a signal from thread `sender`: a
+    /// pid, a process group (0 for the sender's, -g for group g), or every
+    /// process but init (-1).
+    fn targets(&self, sender: u32, target: i32) -> Vec<u32> {
+        match target {
             1.. if self.leader(target as u32).is_some() => vec![target as u32],
             1.. => Vec::new(),
-            0 => group(self.tasks[&sender].process().pgid),
+            0 => self.group(self.tasks[&sender].process().pgid),
             -1 => self
                 .tasks
                 .iter()
                 .filter(|&(&pid, task)| pid != INIT && task.is_leader())
                 .map(|(&pid, _)| pid)
                 .collect(),
-            _ => group(target.unsigned_abs()),
-        };
-        if targets.is_empty() {
-            self.finish(sender, ESRCH.wrapping_neg());
-            return;
+            _ => self.group(target.unsigned_abs()),
         }
-        for &pid in &targets {
+    }
+
+    /// The processes in the process group `pgid`.
+    fn group(&self, pgid: u32) -> Vec<u32> {
+        let members = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| task.is_leader() && task.process().pgid == pgid);
+        members.map(|(&pid, _)| pid).collect()
+    }
+
+    /// Raise `signal` in each of the processes `pids`. A process's signals
+    /// are its threads', so one of them handles it. Zombies are past killing.
+    fn raise(&mut self, pids: &[u32], signal: u32) {
+        for &pid in pids {
             let Some(task) = self.tasks.get(&pid) else {
                 continue;
             };
@@ -785,6 +789,17 @@ impl<V: Vcpu + Clone> Container<V> {
                 self.terminate(pid, termination);
             }
         }
+    }
+
+    /// The `kill` system call of thread `sender`: send `signal` to `target`
+    /// (see `targets`), and return to the sender.
+    fn kill(&mut self, sender: u32, target: i32, signal: u32) {
+        let targets = self.targets(sender, target);
+        if targets.is_empty() {
+            self.finish(sender, ESRCH.wrapping_neg());
+            return;
+        }
+        self.raise(&targets, signal);
         if self
             .tasks
             .get(&sender)
