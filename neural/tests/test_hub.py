@@ -260,6 +260,16 @@ def test_registry_answers_in_the_distribution_specs_errors(served):
     assert json.loads(get(served, "/v2/org/clay/tags/list")[2]) == {"name": "org/clay", "tags": ["latest"]}
 
 
+def test_repos_without_an_image_say_what_to_do(served, api):
+    (api.root / "org/checkpoint/main").mkdir(parents=True)
+    (api.root / "org/checkpoint/main/config.json").write_text("{}")
+    status, _, body = get(served, "/v2/org/checkpoint/manifests/latest")
+    error = json.loads(body)["errors"][0]
+    assert (status, error["code"]) == (404, "MANIFEST_UNKNOWN")
+    assert "shem run hf.co/org/checkpoint" in error["message"]
+    assert "shem push IMAGE hf.co/org/checkpoint" in error["message"]
+
+
 def test_registry_is_read_only(served):
     import http.client
 

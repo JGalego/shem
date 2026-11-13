@@ -83,7 +83,14 @@ class Hub:
 
     def index(self, repo: str, tag: str) -> dict:
         rev = revision(tag)
-        data = json.loads(self.read(repo, "index.json", rev))
+        try:
+            data = json.loads(self.read(repo, "index.json", rev))
+        except EntryNotFoundError:
+            raise Unknown(
+                "MANIFEST_UNKNOWN",
+                f"{repo} holds no image at {tag}. If it holds a checkpoint, shem imports it: shem run hf.co/{repo}. "
+                f"To serve an image here, push one: shem push IMAGE hf.co/{repo}",
+            ) from None
         if rev:
             self.seen.setdefault(repo, set()).add(rev)
         return data

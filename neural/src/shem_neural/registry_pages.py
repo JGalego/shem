@@ -176,7 +176,7 @@ def home(host: str, served: dict[str, dict]) -> bytes:
     body = f"""
 <section class="hero">
 <h1>Hugging Face repos as OCI images</h1>
-<p class="muted">Pull an image <code>shem push</code> put on the Hub with any OCI client. Revisions are tags: <code>latest</code> is <code>main</code>.</p>
+<p class="muted">Pull an image <code>shem push</code> put on the Hub with any OCI client. Revisions are tags: <code>latest</code> is <code>main</code>. Names are lowercase, as OCI's are; the Hub finds a repo in any case.</p>
 </section>
 <div class="box"><h3>Pull</h3>{command(f"oras pull {host}/ORG/NAME:latest")}</div>
 <h2>Recently served</h2>
