@@ -1,9 +1,9 @@
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use containerd_shim_shem::bundle::{self, Bundle};
+use containerd_shim_shem::bundle::{self, Bundle, Control, Wakeable};
 use shem::linux::Stdio;
 
 const BASE: u32 = 0x1_0000;
@@ -100,8 +100,142 @@ fn bundles_run_their_process_on_shem() {
         stdout: Box::new(out.clone()),
         stderr: Box::new(std::io::sink()),
     };
-    assert_eq!(bundle::run(&bundle, stdio, &AtomicU32::new(0)).unwrap(), 3);
+    assert_eq!(bundle::run(&bundle, stdio, &Control::default()).unwrap(), 3);
     assert_eq!(out.0.lock().unwrap().as_slice(), msg);
+}
+
+/// A control that has been asked to stop the program with `signal`.
+fn killed(signal: u32) -> Control {
+    let control = Control::default();
+    control.kill(signal);
+    control
+}
+
+/// `lui` and `addi` that load `value` into `rd`.
+fn li(rd: u32, value: u32) -> [u32; 2] {
+    [
+        lui(rd, value + 0x800),
+        addi(rd, rd, ((value & 0xfff) as i32 ^ 0x800) - 0x800),
+    ]
+}
+
+/// A program that writes "ready", echoes one read of stdin, and exits.
+fn echo() -> Vec<u8> {
+    let data_at = BASE + 84;
+    let buf = data_at + 8;
+    let mut data = b"ready\n".to_vec();
+    data.resize(8 + 64, 0);
+    let mut code = vec![addi(10, 0, 1)]; // write(1, "ready\n", 6)
+    code.extend(li(11, data_at));
+    code.extend([addi(12, 0, 6), addi(17, 0, 64), ECALL]);
+    code.push(addi(10, 0, 0)); // n = read(0, buf, 64)
+    code.extend(li(11, buf));
+    code.extend([addi(12, 0, 64), addi(17, 0, 63), ECALL]);
+    code.extend([addi(12, 10, 0), addi(10, 0, 1)]); // write(1, buf, n)
+    code.extend(li(11, buf));
+    code.extend([addi(17, 0, 64), ECALL]);
+    code.extend([addi(10, 0, 0), addi(17, 0, 93), ECALL]); // exit(0)
+    elf(&code, &data)
+}
+
+/// Start the echo program in `dir` on a thread, its stdin a pipe that a
+/// kill or a pause wakes, and wait until it has said it is ready.
+fn start_echo(
+    dir: &std::path::Path,
+) -> (
+    Arc<Control>,
+    std::io::PipeWriter,
+    Captured,
+    std::thread::JoinHandle<u8>,
+) {
+    let bundle = Bundle::load(dir).unwrap();
+    let control = Arc::new(Control::default());
+    let (reader, writer) = std::io::pipe().unwrap();
+    let out = Captured::default();
+    let stdio = Stdio {
+        stdin: Box::new(Wakeable::new(reader, control.clone())),
+        stdout: Box::new(out.clone()),
+        stderr: Box::new(std::io::sink()),
+    };
+    let run = {
+        let control = control.clone();
+        std::thread::spawn(move || bundle::run(&bundle, stdio, &control).unwrap())
+    };
+    while out.0.lock().unwrap().as_slice() != b"ready\n" {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    (control, writer, out, run)
+}
+
+#[test]
+fn a_kill_stops_a_program_waiting_for_input() {
+    let dir = bundle_with(echo());
+    let (control, _stdin, _, run) = start_echo(dir.path());
+    std::thread::sleep(Duration::from_millis(200)); // well into its read
+    control.kill(15);
+    assert_eq!(run.join().unwrap(), 128 + 15);
+}
+
+#[test]
+fn a_paused_program_is_frozen_for_docker_commit_and_resumes() {
+    let dir = bundle_with(echo());
+    let (control, mut stdin, out, run) = start_echo(dir.path());
+    std::thread::sleep(Duration::from_millis(200)); // well into its read
+
+    // docker commit's pause: the program, frozen at its read, in /.shem
+    assert!(control.pause(Duration::from_secs(10)));
+    let state = dir.path().join("rootfs/.shem");
+    assert!(state.join("container.json").is_file());
+    assert!(state.join("machine.state").is_file());
+
+    // What the commit takes: the container's filesystem, the state and all
+    let committed = tempfile::tempdir().unwrap();
+    let copy = |from: &std::path::Path, to: &std::path::Path| {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    };
+    std::fs::copy(
+        dir.path().join("config.json"),
+        committed.path().join("config.json"),
+    )
+    .unwrap();
+    copy(
+        &dir.path().join("rootfs/bin"),
+        &committed.path().join("rootfs/bin"),
+    );
+    copy(&state, &committed.path().join("rootfs/.shem"));
+
+    // Resumed, the program reads on, and its state is gone again
+    control.resume();
+    stdin.write_all(b"ping\n").unwrap();
+    assert_eq!(run.join().unwrap(), 0);
+    assert_eq!(out.0.lock().unwrap().as_slice(), b"ready\nping\n");
+    assert!(!state.exists());
+
+    // The committed image's container picks up at the read, ready said before
+    let bundle = Bundle::load(committed.path()).unwrap();
+    let out = Captured::default();
+    let stdio = Stdio {
+        stdin: Box::new(std::io::Cursor::new(b"pong\n".to_vec())),
+        stdout: Box::new(out.clone()),
+        stderr: Box::new(std::io::sink()),
+    };
+    assert_eq!(bundle::run(&bundle, stdio, &Control::default()).unwrap(), 0);
+    assert_eq!(out.0.lock().unwrap().as_slice(), b"pong\n");
+}
+
+#[test]
+fn a_kill_ends_a_paused_program() {
+    let dir = bundle_with(echo());
+    let (control, _stdin, _, run) = start_echo(dir.path());
+    assert!(control.pause(Duration::from_secs(10)));
+    control.kill(9);
+    assert_eq!(run.join().unwrap(), 128 + 9);
 }
 
 #[test]
@@ -114,10 +248,7 @@ fn a_kill_stops_a_running_process() {
         stdout: Box::new(std::io::sink()),
         stderr: Box::new(std::io::sink()),
     };
-    assert_eq!(
-        bundle::run(&bundle, stdio, &AtomicU32::new(15)).unwrap(),
-        128 + 15
-    );
+    assert_eq!(bundle::run(&bundle, stdio, &killed(15)).unwrap(), 128 + 15);
 }
 
 /// A program that writes `msg` and exits with status 3.
@@ -151,10 +282,7 @@ fn kubernetes_sandboxes_wait_to_be_stopped() {
         stderr: Box::new(std::io::sink()),
     };
     // /pause is no RV32 program, and the sandbox never runs it
-    assert_eq!(
-        bundle::run(&bundle, stdio, &AtomicU32::new(9)).unwrap(),
-        128 + 9
-    );
+    assert_eq!(bundle::run(&bundle, stdio, &killed(9)).unwrap(), 128 + 9);
 }
 
 #[test]
@@ -218,7 +346,7 @@ fn warm_images_resume_from_their_state_in_the_root() {
         stdout: Box::new(out.clone()),
         stderr: Box::new(std::io::sink()),
     };
-    assert_eq!(bundle::run(&bundle, stdio, &AtomicU32::new(0)).unwrap(), 3);
+    assert_eq!(bundle::run(&bundle, stdio, &Control::default()).unwrap(), 3);
     assert_eq!(out.0.lock().unwrap().as_slice(), msg);
     assert!(!warm.exists(), "the guest never saw its own state");
 }
@@ -242,15 +370,13 @@ fn annotated_bundles_run_inside_the_model() {
         stdout: Box::new(out.clone()),
         stderr: Box::new(std::io::sink()),
     };
-    assert_eq!(bundle::run(&bundle, stdio, &AtomicU32::new(0)).unwrap(), 3);
+    assert_eq!(bundle::run(&bundle, stdio, &Control::default()).unwrap(), 3);
     assert_eq!(out.0.lock().unwrap().as_slice(), msg);
 }
 
 #[test]
 #[ignore = "needs a model server and a model: set SHEM_NEURAL_SOCKET, and SHEM_MODEL to a model directory"]
 fn model_containers_hold_live_sessions() {
-    use std::sync::atomic::Ordering;
-
     let socket = std::env::var("SHEM_NEURAL_SOCKET").expect("SHEM_NEURAL_SOCKET");
     let model =
         std::env::var("SHEM_MODEL").expect("SHEM_MODEL, a model directory holding shem.json");
@@ -276,10 +402,10 @@ fn model_containers_hold_live_sessions() {
         stdout: Box::new(out.clone()),
         stderr: Box::new(std::io::sink()),
     };
-    let kill = Arc::new(AtomicU32::new(0));
+    let control = Arc::new(Control::default());
     let main = {
-        let (bundle, kill) = (bundle.clone(), kill.clone());
-        std::thread::spawn(move || bundle::run(&bundle, stdio, &kill).unwrap())
+        let (bundle, control) = (bundle.clone(), control.clone());
+        std::thread::spawn(move || bundle::run(&bundle, stdio, &control).unwrap())
     };
     while out.0.lock().unwrap().is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -306,6 +432,6 @@ fn model_containers_hold_live_sessions() {
             .is_file()
     );
 
-    kill.store(15, Ordering::SeqCst);
+    control.kill(15);
     assert_eq!(main.join().unwrap(), 128 + 15);
 }

@@ -263,7 +263,12 @@ impl Description {
                 }
                 Ok(n)
             }
-            Kind::Input(input) => Ok(input.read(buf)?),
+            // Input that has nothing yet, as a containerd shim's stdin while
+            // the program is to stop, is waited for like an empty pipe
+            Kind::Input(input) => match input.read(buf) {
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Err(blocked(nonblock)),
+                result => Ok(result?),
+            },
             Kind::File(file) => Ok(file.read(buf)?),
             Kind::Proc { data, .. } => Ok(data.read(buf)?),
             Kind::Dir(_) => Err(Errno::EISDIR),

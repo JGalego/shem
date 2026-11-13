@@ -5,7 +5,8 @@
 //!
 //! In a model container, `docker exec` runs exec processes, each a turn of the
 //! container's live session, and `docker commit`'s pause saves that session
-//! into the container's filesystem (see `session`).
+//! into the container's filesystem (see `session`). A program container's
+//! pause freezes the program there, for the committed image to resume.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -13,8 +14,8 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use containerd_shim::event::Event;
 use containerd_shim::protos::events::task::{
@@ -32,10 +33,12 @@ use containerd_shim::{
 use log::{info, warn};
 use shem::linux::Stdio;
 
-use crate::bundle::{self, Bundle};
+use crate::bundle::{self, Bundle, Control, Wakeable};
 use crate::holder::Holder;
 
 const SIGKILL: u32 = 9;
+/// How long a pause waits for the program to stop between slices.
+const PAUSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct Service {
@@ -54,7 +57,7 @@ struct Task {
     stderr: String,
     status: api::Status,
     exited: Option<(u32, Timestamp)>,
-    kill: Arc<AtomicU32>,
+    control: Arc<Control>,
     /// The task's PID: its namespace holder's, or the shim's when there is none.
     pid: u32,
     holder: Option<Holder>,
@@ -223,11 +226,17 @@ impl Service {
 }
 
 /// The container's standard streams, from the FIFOs containerd made for it.
-fn stdio(stdin: &str, stdout: &str, stderr: &str) -> std::io::Result<Stdio> {
-    let input: Box<dyn Read + Send> = if stdin.is_empty() {
-        Box::new(std::io::empty())
-    } else {
-        Box::new(open_fifo_for_reading(stdin)?)
+/// With `wake`, reads of stdin stop waiting when the program is to stop.
+fn stdio(
+    stdin: &str,
+    stdout: &str,
+    stderr: &str,
+    wake: Option<Arc<Control>>,
+) -> std::io::Result<Stdio> {
+    let input: Box<dyn Read + Send> = match (stdin.is_empty(), wake) {
+        (true, _) => Box::new(std::io::empty()),
+        (false, None) => Box::new(open_fifo_for_reading(stdin)?),
+        (false, Some(control)) => Box::new(Wakeable::new(open_fifo_for_reading(stdin)?, control)),
     };
     let output = |name: &'static str, path: &str| -> std::io::Result<Box<dyn Write + Send>> {
         if path.is_empty() {
@@ -333,7 +342,7 @@ impl shim::Task for Service {
             stderr: req.stderr,
             status: api::Status::CREATED,
             exited: None,
-            kill: Arc::new(AtomicU32::new(0)),
+            control: Arc::new(Control::default()),
             pid: task_pid,
             holder,
             execs: HashMap::new(),
@@ -353,14 +362,14 @@ impl shim::Task for Service {
         if !req.exec_id.is_empty() {
             return self.start_exec(req.exec_id);
         }
-        let (id, bundle_dir, streams, kill, task_pid) = self.with_task(|task| {
+        let (id, bundle_dir, streams, control, task_pid) = self.with_task(|task| {
             task.status = api::Status::RUNNING;
             let streams = (task.stdin.clone(), task.stdout.clone(), task.stderr.clone());
             (
                 task.id.clone(),
                 task.bundle.clone(),
                 streams,
-                task.kill.clone(),
+                task.control.clone(),
                 task.pid,
             )
         })?;
@@ -373,8 +382,11 @@ impl shim::Task for Service {
         let service = self.clone();
         trace("start: published TaskStart, running the container");
         std::thread::spawn(move || {
-            let status = match stdio(&streams.0, &streams.1, &streams.2) {
-                Ok(stdio) => bundle::run(&bundle, stdio, &kill).unwrap_or_else(|err| {
+            // A program's input wakes for a kill or a pause; a session reads its own
+            let program = !bundle.sandbox && !bundle.args[0].starts_with("shem:");
+            let wake = program.then(|| control.clone());
+            let status = match stdio(&streams.0, &streams.1, &streams.2, wake) {
+                Ok(stdio) => bundle::run(&bundle, stdio, &control).unwrap_or_else(|err| {
                     // Tell whoever reads the container's stderr, such as ctr.
                     warn!("the container failed: {err:#}");
                     if let Ok(mut stderr) = OpenOptions::new().write(true).open(&streams.2) {
@@ -489,7 +501,7 @@ impl shim::Task for Service {
         let task = guard
             .as_mut()
             .ok_or_else(|| error("no task has been created"))?;
-        task.kill.store(signal, Ordering::SeqCst);
+        task.control.kill(signal);
         // A running guest stops at its next slice. One that never started
         // ends now, as a process killed before it ran, and its waiters wake.
         if task.status == api::Status::CREATED {
@@ -619,16 +631,21 @@ impl shim::Task for Service {
 
     fn pause(&self, _ctx: &TtrpcContext, _req: api::PauseRequest) -> TtrpcResult<api::Empty> {
         trace("pause");
-        // `docker commit` pauses first: a model container's session goes into
-        // its filesystem then, so the commit carries it
-        let (id, bundle_dir) = self.with_task(|task| {
-            task.status = api::Status::PAUSED;
-            (task.id.clone(), task.bundle.clone())
-        })?;
+        // `docker commit` pauses first: a model container's session, or a
+        // program frozen where it paused, goes into its filesystem then, so
+        // the commit carries it
+        let (id, bundle_dir, control) =
+            self.with_task(|task| (task.id.clone(), task.bundle.clone(), task.control.clone()))?;
         let bundle = Bundle::load(&bundle_dir).map_err(error)?;
         if bundle.args[0].starts_with("shem:") {
             crate::session::save(&bundle).map_err(error)?;
+        } else if !bundle.sandbox && !control.pause(PAUSE_TIMEOUT) {
+            return Err(error(
+                "the program did not pause: it may have ended, or wait on its host",
+            ));
         }
+        self.with_task(|task| task.status = api::Status::PAUSED)?;
+        trace("paused");
         self.publish(TaskPaused {
             container_id: id,
             ..Default::default()
@@ -640,6 +657,7 @@ impl shim::Task for Service {
         trace("resume");
         let id = self.with_task(|task| {
             task.status = api::Status::RUNNING;
+            task.control.resume();
             task.id.clone()
         })?;
         self.publish(TaskResumed {
@@ -677,18 +695,21 @@ mod tests {
 
     #[test]
     fn stdin_fifos_without_a_writer_read_as_empty_instead_of_hanging() {
-        let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("stdin");
-        let path = CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        let (done, opened) = std::sync::mpsc::channel();
-        let name = fifo.to_str().unwrap().to_string();
-        std::thread::spawn(move || {
-            let mut streams = stdio(&name, "", "").unwrap();
-            let mut buf = [0u8; 8];
-            done.send(streams.stdin.read(&mut buf).unwrap()).unwrap();
-        });
-        let read = opened.recv_timeout(Duration::from_secs(5));
-        assert_eq!(read, Ok(0), "opening or reading the FIFO hung");
+        // A session's stdin, and a program's, which a pause or a kill wakes
+        for wake in [None, Some(Arc::new(Control::default()))] {
+            let dir = tempfile::tempdir().unwrap();
+            let fifo = dir.path().join("stdin");
+            let path = CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            let (done, opened) = std::sync::mpsc::channel();
+            let name = fifo.to_str().unwrap().to_string();
+            std::thread::spawn(move || {
+                let mut streams = stdio(&name, "", "", wake).unwrap();
+                let mut buf = [0u8; 8];
+                done.send(streams.stdin.read(&mut buf).unwrap()).unwrap();
+            });
+            let read = opened.recv_timeout(Duration::from_secs(5));
+            assert_eq!(read, Ok(0), "opening or reading the FIFO hung");
+        }
     }
 }

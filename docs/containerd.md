@@ -24,6 +24,26 @@ docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 \
   --annotation dev.shem.neural-socket=/tmp/shem-neural.sock shem-hello one two
 ```
 
+`docker commit` freezes a running program into the image it makes, and a container of that image goes on where the program was, its memory and registers as they were. With an image of [`tally.c`](../guests/tally.c), which prints a running total of the numbers it reads:
+
+```console
+$ docker run -i --name tally --runtime io.containerd.shem.v1 --platform linux/riscv32 tally
+1
+total 1
+2
+total 3
+```
+
+In another terminal, while it waits for more:
+
+```console
+$ docker commit tally tally:at-3
+$ echo 4 | docker run -i --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 tally:at-3
+total 7
+```
+
+A program can be frozen when it is a single process with only its standard streams open; otherwise the commit holds its files alone.
+
 To load an image built with `shem build`, including its `WARM` snapshot:
 
 ```sh
@@ -65,14 +85,15 @@ containerd calls the shim's task service over ttrpc:
 | `create` | Mount the root filesystem prepared by the snapshotter |
 | `start` | Read arguments, environment, working directory and memory limit from `config.json`; run with containerd's FIFOs as stdio. Default guest memory: 64 MiB. |
 | `wait`, `state` | Report init's exit status; publish lifecycle events so Docker observes it |
-| `kill` | Stop at the next instruction slice with the signal's shell exit status |
+| `kill` | Stop at the next instruction slice, or in a wait for input, with the signal's shell exit status |
+| `pause`, `resume` | Freeze a program into `/.shem`, where `docker commit` takes it, until it goes on; save a model session there |
 | `delete` | Unmount the root filesystem |
 
 Implementation: [`bundle.rs`](../crates/containerd-shim-shem/src/bundle.rs) loads bundles; [`service.rs`](../crates/containerd-shim-shem/src/service.rs) handles the protocol. Run `just docker-test` or `just containerd-test` for integration tests.
 
 ## Not yet
 
-- Program containers: `docker exec`, `docker commit` and terminal support.
+- Program containers: `docker exec` and terminal support.
 - Checkpoints and resource statistics.
 
 Model containers already support `exec`, `commit` and terminal input; see [sessions under Docker](models.md#sessions-under-docker).

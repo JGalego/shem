@@ -125,7 +125,7 @@ containerd-test: toolchain
 docker-test: toolchain
     #!/bin/sh
     set -e
-    cargo build --release -p containerd-shim-shem
+    cargo build --release -p containerd-shim-shem -p shem
     sudo install -m 0755 target/release/containerd-shim-shem-v1 /usr/local/bin/
     mkdir -p target/oci-hello
     just cc -O2 -o target/oci-hello/hello guests/hello.c
@@ -145,6 +145,39 @@ docker-test: toolchain
         exit 1
     fi
     timeout 10 docker rm shem-docker-test >/dev/null
+
+    echo "--- docker commit freezes a running program, and the image goes on from there"
+    dir=target/oci-hello
+    just cc -O2 -o $dir/tally guests/tally.c
+    printf 'FROM scratch\nCOPY tally /tally\nENTRYPOINT ["/tally"]\n' | docker build -q --platform linux/riscv32 -t shem-tally:riscv32 -f - $dir
+    run="docker run -i --runtime io.containerd.shem.v1 --platform linux/riscv32"
+    rm -f $dir/tally.in && mkfifo $dir/tally.in
+    timeout 120 $run --name shem-tally shem-tally:riscv32 < $dir/tally.in > $dir/tally.txt 2>&1 &
+    exec 3> $dir/tally.in
+    printf '1\n2\n' >&3
+    seen() { for _ in $(seq 1 30); do grep -q "$1" $dir/tally.txt && return; sleep 1; done; return 1; }
+    failed() {
+        echo "$1"; cat $dir/tally.txt
+        echo "--- the shim's trace"; sudo cat /run/shem/shim.log || true
+        exit 1
+    }
+    seen "total 3" || failed "the program did not read its input"
+    # The commit pauses the program as it waits for more, then it goes on
+    timeout 60 docker commit shem-tally shem-tally:committed >/dev/null || failed "docker commit failed"
+    printf '10\n' >&3
+    seen "total 13" || failed "the program did not go on after the commit"
+    exec 3>&-
+    wait || failed "the program did not end with its input"
+    timeout 10 docker rm shem-tally >/dev/null
+    resumed=$(echo 4 | timeout 30 $run --rm shem-tally:committed)
+    echo "the committed image read 4: $resumed"
+    [ "$resumed" = "total 7" ] || failed "the committed image did not go on from total 3"
+    # And with shem, as on Docker Desktop
+    export SHEM_HOME=$PWD/$dir/home
+    docker save shem-tally:committed | target/release/shem load
+    resumed=$(echo 5 | target/release/shem run shem-tally:committed)
+    echo "shem run read 5: $resumed"
+    [ "$resumed" = "total 8" ] || failed "shem run did not go on from total 3"
 
 # Model containers under Docker: run, run -i, exec into a live session, and commit it; needs Docker, uv and sudo
 model-containers-test:

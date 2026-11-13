@@ -6,8 +6,12 @@
 //!
 //! [runtime spec]: https://github.com/opencontainers/runtime-spec/blob/main/config.md
 
+use std::io::Read;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde_json::Value;
@@ -98,6 +102,131 @@ impl Bundle {
     }
 }
 
+/// What the shim asks of a running program, which it does between slices,
+/// or while it waits for input: stop with a signal, or pause, as `docker
+/// pause` and `docker commit` ask, until it is resumed.
+#[derive(Debug, Default)]
+pub struct Control {
+    /// The signal to stop with, or 0.
+    pub kill: AtomicU32,
+    pause: Mutex<Pausing>,
+    changed: Condvar,
+    /// Whether a read of stdin gave up waiting for input to let the program
+    /// stop, so that a program blocked on nothing else is not deadlocked.
+    woke: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Pausing {
+    #[default]
+    No,
+    /// Asked for; the program has not stopped yet.
+    Asked,
+    /// Stopped, until it is resumed.
+    Paused,
+}
+
+impl Control {
+    /// Whether the program should stop running for now: to end, or to pause.
+    pub fn interrupted(&self) -> bool {
+        self.kill.load(Ordering::SeqCst) != 0 || *self.pause.lock().unwrap() == Pausing::Asked
+    }
+
+    /// Stop the program with `signal`, paused or not.
+    pub fn kill(&self, signal: u32) {
+        self.kill.store(signal, Ordering::SeqCst);
+        let _state = self.pause.lock().unwrap();
+        self.changed.notify_all();
+    }
+
+    /// Ask the program to pause, and wait until it has. Gives up, and lets
+    /// it go on, after `timeout`: one that has ended, or that waits on its
+    /// host for something other than its input, cannot pause. Returns
+    /// whether it paused.
+    pub fn pause(&self, timeout: Duration) -> bool {
+        let mut state = self.pause.lock().unwrap();
+        if *state == Pausing::No {
+            *state = Pausing::Asked;
+        }
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |s| *s == Pausing::Asked)
+            .unwrap();
+        if *state == Pausing::Asked {
+            *state = Pausing::No;
+        }
+        *state == Pausing::Paused
+    }
+
+    /// Let a paused program go on.
+    pub fn resume(&self) {
+        *self.pause.lock().unwrap() = Pausing::No;
+        self.changed.notify_all();
+    }
+
+    /// In the program's thread, once it has stopped for a pause: say so, and
+    /// wait to be resumed or killed.
+    fn paused(&self) {
+        let mut state = self.pause.lock().unwrap();
+        *state = Pausing::Paused;
+        self.changed.notify_all();
+        let _state = self
+            .changed
+            .wait_while(state, |s| {
+                *s == Pausing::Paused && self.kill.load(Ordering::SeqCst) == 0
+            })
+            .unwrap();
+    }
+}
+
+/// A program's stdin, whose reads, while they wait for input, give up when
+/// the program is to stop: the read reports that it would block, the guest
+/// is parked on its system call, and it can stop there, to retry the call
+/// when it goes on.
+pub struct Wakeable<R> {
+    input: R,
+    control: Arc<Control>,
+}
+
+impl<R: Read + AsFd> Wakeable<R> {
+    /// Read `input`, which this makes nonblocking, to wait for it here.
+    pub fn new(input: R, control: Arc<Control>) -> Self {
+        let fd = input.as_fd().as_raw_fd();
+        // SAFETY: fcntl on a descriptor `input` owns
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        Self { input, control }
+    }
+}
+
+impl<R: Read + AsFd> Read for Wakeable<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.control.interrupted() {
+                self.control.woke.store(true, Ordering::SeqCst);
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            // Input, or its end: a FIFO no one ever opened to write reads as
+            // ended, though poll does not say so
+            match self.input.read(buf) {
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+            let mut watch = libc::pollfd {
+                fd: self.input.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd, on the stack. Wait for input a while, then
+            // look at the control again.
+            unsafe { libc::poll(&mut watch, 1, 100) };
+        }
+    }
+}
+
 /// The frozen container of a warm image (`shem save` puts its state under
 /// `/.shem`), if the root filesystem holds one. The files are removed, since
 /// the guest was frozen without them.
@@ -116,10 +245,11 @@ fn warm_state(root: &Path) -> anyhow::Result<Option<Frozen>> {
 
 /// Run the bundle's process to completion and return its exit status. A warm
 /// image resumes where it was frozen, with the memory it was frozen with,
-/// ignoring the bundle's arguments. A nonzero `kill` (a signal number) stops
-/// it at the next slice boundary, with the status a shell reports for that
-/// signal.
-pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8> {
+/// ignoring the bundle's arguments. A kill (a signal number) stops it at the
+/// next slice boundary, with the status a shell reports for that signal; a
+/// pause freezes it there (see `pause`).
+pub fn run(bundle: &Bundle, stdio: Stdio, control: &Control) -> anyhow::Result<u8> {
+    let kill = &control.kill;
     if bundle.sandbox {
         // A pod's sandbox: the holder keeps its namespaces, and it waits to be stopped
         loop {
@@ -133,10 +263,10 @@ pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8
         return crate::session::run(bundle, stdio, kill);
     }
     match &bundle.vcpu {
-        VcpuKind::Reference => run_on(bundle, stdio, kill, SLICE, |mem| {
+        VcpuKind::Reference => run_on(bundle, stdio, control, SLICE, |mem| {
             Ok(ReferenceVcpu::new(mem))
         }),
-        VcpuKind::Neural(socket) => run_on(bundle, stdio, kill, NEURAL_SLICE, |mem| {
+        VcpuKind::Neural(socket) => run_on(bundle, stdio, control, NEURAL_SLICE, |mem| {
             NeuralVcpu::connect(socket, mem).with_context(|| {
                 format!(
                     "connecting to the neural vCPU server at {}",
@@ -150,7 +280,7 @@ pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8
 fn run_on<V: Vcpu + Clone>(
     bundle: &Bundle,
     stdio: Stdio,
-    kill: &AtomicU32,
+    control: &Control,
     slice: u64,
     vcpu: impl FnOnce(u32) -> anyhow::Result<V>,
 ) -> anyhow::Result<u8> {
@@ -176,11 +306,50 @@ fn run_on<V: Vcpu + Clone>(
     loop {
         match container.run(Some(container.steps + slice)) {
             Ok(status) => return Ok(status),
-            Err(RunError::StepLimit(_)) => match kill.load(Ordering::SeqCst) {
-                0 => continue,
-                signal => return Ok(128u32.saturating_add(signal) as u8),
-            },
+            Err(RunError::StepLimit(_)) => {}
+            // Every process waits, one of them on input that stopped waiting
+            // so the program could stop; if it need not now, it waits again
+            Err(RunError::Deadlock) if control.woke.swap(false, Ordering::SeqCst) => {}
             Err(err) => return Err(err.into()),
         }
+        if control.interrupted() {
+            match control.kill.load(Ordering::SeqCst) {
+                0 => pause(&container, bundle, control)?,
+                signal => return Ok(128u32.saturating_add(signal) as u8),
+            }
+        }
     }
+}
+
+/// Pause the program until it is resumed, frozen into `/.shem` in its root
+/// filesystem first, where `docker commit` takes it: a container of the
+/// committed image resumes the program where it paused. The state goes
+/// again when it is resumed. A program that cannot be frozen, as one of
+/// several processes, pauses all the same, and a commit holds its files.
+fn pause<V: Vcpu + Clone>(
+    container: &Container<V>,
+    bundle: &Bundle,
+    control: &Control,
+) -> anyhow::Result<()> {
+    let dir = bundle.root.join(WARM_DIR);
+    let frozen = match container.freeze() {
+        Ok(frozen) => {
+            std::fs::create_dir_all(&dir)?;
+            let host = serde_json::to_vec(&frozen.host)?;
+            std::fs::write(dir.join("container.json"), host)?;
+            std::fs::write(dir.join("machine.state"), frozen.machine.encode())?;
+            true
+        }
+        Err(err) => {
+            log::warn!(
+                "pausing without freezing the program, so a commit holds only its files: {err}"
+            );
+            false
+        }
+    };
+    control.paused();
+    if frozen {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
 }
