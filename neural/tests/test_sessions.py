@@ -137,6 +137,42 @@ def test_sessions_record_their_precision_and_versions(model, tmp_path):
     assert meta["blocks"] == {kind: cls.VERSION for kind, cls in BLOCKS.items()}
 
 
+def similar(a: torch.Tensor, b: torch.Tensor) -> float:
+    """How closely two sets of logits point the same way, from -1 to 1."""
+    return torch.nn.functional.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+
+
+def test_models_compute_in_bfloat16_and_keep_its_sessions(model, tmp_path):
+    """In bfloat16 the logits round otherwise, but point the same way; its
+    sessions say so, resume in bfloat16, and are read again in float32."""
+    half = Model(SAVED / "model", dtype=torch.bfloat16)
+    logits = cold(half, TOKENS)
+    assert logits.dtype == torch.bfloat16
+    assert similar(logits, cold(model, TOKENS)) > 0.99
+
+    session = Session(half)
+    session.feed(TOKENS)
+    session.save(tmp_path / "half")
+    assert json.loads((tmp_path / "half" / "session.json").read_text())["precision"] == "bfloat16"
+    err = io.StringIO()
+    resumed = Session.load(half, tmp_path / "half", err)
+    assert err.getvalue() == "" and resumed.tokens == TOKENS
+    resumed.feed(PROBE)
+    assert similar(resumed.logits, cold(half, TOKENS + PROBE)) > 0.99
+    Session.load(model, tmp_path / "half", err)
+    assert "in bfloat16, and this model runs in float32" in err.getvalue()
+
+
+def test_the_driver_takes_a_dtype():
+    from shem_neural.model.generate import dtype, options
+
+    args = options(["--dtype", "bfloat16", "Hello"], model="m")
+    assert dtype(args.dtype) == torch.bfloat16 and args.prompt == ["Hello"]
+    assert dtype(options([], model="m").dtype) == torch.float32
+    with pytest.raises(SystemExit):
+        options(["--dtype", "int4"], model="m")
+
+
 def save(out: Path) -> None:
     """Write the tiny model, with blocks of every type from the importers'
     tiny random checkpoints, and a session of it, into `out`."""

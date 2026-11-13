@@ -71,14 +71,16 @@ class Models:
         self.sessions: dict[str, Live] = {}
         self.lock = threading.Lock()
 
-    def get(self, directory: Path):
+    def get(self, directory: Path, dtype: str = "float32"):
+        """The model in `directory`, computing in `dtype`, and its tokenizer."""
         from .model.blocks import Model
+        from .model.generate import dtype as torch_dtype
         from .model.tokenizer import Tokenizer
 
-        key = hashlib.sha256((directory / "shem.json").read_bytes()).hexdigest()
+        key = hashlib.sha256((directory / "shem.json").read_bytes()).hexdigest() + "/" + dtype
         with self.lock:
             if key not in self.loaded:
-                model = Model(directory, device=self.device)
+                model = Model(directory, dtype=torch_dtype(dtype), device=self.device)
                 self.loaded[key] = (model, Tokenizer(directory, model.manifest.tokenizer))
             return self.loaded[key]
 
@@ -94,7 +96,7 @@ class Models:
         args = generate.resolve(generate.options(request.get("argv", []), model=request["model"]))
         if request.get("session"):
             args.session = Path(request["session"])
-        model, tokenizer = self.get(args.model)
+        model, tokenizer = self.get(args.model, args.dtype)
         session = generate.start(model, tokenizer, args, err=_Stream(write), vcpu_socket=self.socket)
         prompt = " ".join(args.prompt) or request.get("stdin", "")
         with _all_cores():

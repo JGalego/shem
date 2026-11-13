@@ -272,6 +272,16 @@ def _partial(text: str, tag: str) -> int:
     return 0
 
 
+#: The types a model can compute in: float32, and bfloat16, which halves the
+#: memory its weights and sessions take, and is faster on GPUs that have it
+DTYPES = ["float32", "bfloat16"]
+
+
+def dtype(name: str) -> torch.dtype:
+    """The torch type `--dtype` names."""
+    return getattr(torch, name)
+
+
 def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
     """The driver's arguments: its options, the model, and the prompt. With
     `model`, `argv` holds only options and the prompt, in any order, as a
@@ -290,6 +300,12 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
     parser.add_argument("--stats", action="store_true", help="print the token rate to stderr")
     parser.add_argument("--keep", action="store_true", help="in a container, keep the session open for docker exec")
     parser.add_argument("--device", default="auto", help="cpu, cuda, or auto: a GPU if there is one")
+    parser.add_argument(
+        "--dtype",
+        default="float32",
+        choices=DTYPES,
+        help="the type the model computes in: bfloat16 takes half the memory",
+    )
     parser.add_argument("--tools", help="offer the programs in this directory of the image to the model as tools")
     if model is not None:
         parser.add_argument("prompt", nargs="*")
@@ -375,7 +391,7 @@ def run(model: Model, tokenizer: Tokenizer, args: argparse.Namespace, prompt: st
 
 def main() -> None:
     args = resolve(options(sys.argv[1:]))
-    model = Model(args.model, device=args.device)
+    model = Model(args.model, dtype=dtype(args.dtype), device=args.device)
     tokenizer = Tokenizer(args.model, model.manifest.tokenizer)
     prompt = " ".join(args.prompt) or ("" if args.warm else sys.stdin.read())
     try:

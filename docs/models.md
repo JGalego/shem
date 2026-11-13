@@ -42,6 +42,7 @@ A `shem:` entrypoint selects a host-side driver, not a guest executable.
 | `shem:generate` option | Meaning |
 |---|---|
 | `--max-tokens N` | Maximum reply length; default 256 |
+| `--dtype bfloat16` | Compute in bfloat16, which halves the memory weights and sessions take and is faster on GPUs; default `float32` |
 | `--system TEXT` | System prompt |
 | `--system-file PATH` | Append a file from the image to the system prompt |
 | `--stop TEXT` | End the reply at this text; useful for [base models](../examples/mamba/Shemfile) |
@@ -294,7 +295,7 @@ Recorded results from [`jobs/models_gpu.py`](../neural/jobs/models_gpu.py):
 | Qwen3-0.6B | 7.1 | 27.8 |
 | Qwen3.5-0.8B | 5.6 | 31.2 |
 
-`shem run` caches unpacked images at `$SHEM_HOME/rootfs/<digest>`. Computation uses float32; results are repeatable on the same device, not guaranteed bit-identical across devices.
+`shem run` caches unpacked images at `$SHEM_HOME/rootfs/<digest>`. Computation uses float32 unless the entrypoint gives `--dtype bfloat16`, which halves the memory: Qwen3-30B-A3B's weights take 61 GB instead of 122 GB. Results are repeatable on the same device, not guaranteed bit-identical across devices. A session records the type it was computed in, and a model computing in another reads its tokens again.
 
 ## Next
 
