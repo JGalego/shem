@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail};
 use sha2::{Digest, Sha256};
@@ -136,17 +136,20 @@ pub fn unpack(layer: &[u8], root: &Path) -> anyhow::Result<()> {
         if let Some(name) = path.file_name().and_then(|n| n.to_str())
             && let Some(target) = name.strip_prefix(WHITEOUT)
         {
-            let doomed = root.join(path.with_file_name(target));
-            if doomed.is_dir() && !doomed.is_symlink() {
-                std::fs::remove_dir_all(&doomed).ok();
-            } else {
-                std::fs::remove_file(&doomed).ok();
+            // A deletion outside the root deletes nothing
+            if let Some(doomed) = inside(root, &path.with_file_name(target)) {
+                if doomed.is_dir() && !doomed.is_symlink() {
+                    std::fs::remove_dir_all(&doomed).ok();
+                } else {
+                    std::fs::remove_file(&doomed).ok();
+                }
             }
             continue;
         }
         // A file replacing a directory, or the other way around, replaces it.
-        let target = root.join(&path);
-        if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        if let Some(target) = inside(root, &path)
+            && let Ok(meta) = std::fs::symlink_metadata(&target)
+        {
             let incoming_dir = entry.header().entry_type().is_dir();
             if meta.is_dir() && !incoming_dir {
                 std::fs::remove_dir_all(&target)?;
@@ -160,6 +163,25 @@ pub fn unpack(layer: &[u8], root: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Where the layer entry `path` is under `root`, which already exists: None
+/// if it would be outside, as a path that climbs out with `..` is, or one
+/// that goes through a link that leads out. A leading `/` is dropped, as tar
+/// does.
+fn inside(root: &Path, path: &Path) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    let target = root.join(&relative);
+    let parent = target.parent()?.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    (parent.starts_with(&root) && target != root).then_some(target)
 }
 
 /// The regular files in a layer, by path, for small metadata layers.

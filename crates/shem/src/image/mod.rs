@@ -741,6 +741,9 @@ impl Store {
                 let dir = staging.path().join(model::SESSION_DIR);
                 std::fs::create_dir_all(&dir)?;
                 for (name, data) in files {
+                    if !is_file_name(&name) {
+                        bail!("the image's session holds a file outside it: {name}");
+                    }
                     std::fs::write(dir.join(name), data)?;
                 }
             }
@@ -795,6 +798,11 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Whether `name` names a file in a directory, and nothing outside it.
+pub(crate) fn is_file_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
 }
 
 /// Split `name[:tag]`, checking the name is safe to use as a path. The name

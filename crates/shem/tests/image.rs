@@ -307,6 +307,77 @@ fn loading_refuses_other_platforms_and_damaged_blobs() {
     assert!(store.list().unwrap().is_empty());
 }
 
+/// Append an entry named `name` as it is, as a hostile layer would have it:
+/// tar's builder refuses names that climb out or start with `/`.
+fn raw_entry(tar: &mut tar::Builder<Vec<u8>>, name: &str, kind: tar::EntryType, data: &[u8]) {
+    let mut header = tar::Header::new_old();
+    header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+    header.set_entry_type(kind);
+    header.set_size(data.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append(&header, data).unwrap();
+}
+
+#[test]
+fn layers_cannot_reach_outside_their_root() {
+    use tar::EntryType::{Regular, Symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (root, outside) = (dir.path().join("root"), dir.path().join("outside"));
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(outside.join("dir")).unwrap();
+    fs::write(outside.join("file"), "kept").unwrap();
+    let away = outside.display().to_string();
+
+    // Deletions by a path from /, by one that climbs out, and through a link
+    // that leads out delete nothing
+    let mut tar = tar::Builder::new(Vec::new());
+    raw_entry(&mut tar, &format!("{away}/.wh.file"), Regular, b"");
+    raw_entry(&mut tar, "../outside/.wh.dir", Regular, b"");
+    let mut link = tar::Header::new_old();
+    link.set_entry_type(Symlink);
+    link.set_size(0);
+    link.set_link_name(&outside).unwrap();
+    link.set_mode(0o777);
+    tar.append_link(&mut link, "out", &outside).unwrap();
+    raw_entry(&mut tar, "out/.wh.file", Regular, b"");
+    image::unpack(&tar.into_inner().unwrap(), &root).unwrap();
+    assert!(outside.join("file").is_file() && outside.join("dir").is_dir());
+
+    // Nor does a file through the link replace the one outside
+    let mut tar = tar::Builder::new(Vec::new());
+    raw_entry(&mut tar, "out/file", Regular, b"replaced");
+    assert!(image::unpack(&tar.into_inner().unwrap(), &root).is_err());
+    assert_eq!(fs::read_to_string(outside.join("file")).unwrap(), "kept");
+}
+
+#[test]
+fn a_model_image_session_cannot_write_outside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim");
+    let mut tar = tar::Builder::new(Vec::new());
+    raw_entry(
+        &mut tar,
+        &victim.display().to_string(),
+        tar::EntryType::Regular,
+        b"written",
+    );
+    let image = Image {
+        config: image::Config {
+            model: Some("/model".into()),
+            ..Default::default()
+        },
+        layers: vec![image::Layer::new(STATE_TYPE, tar.into_inner().unwrap())],
+        subject: None,
+    };
+    let store = Store::at(&dir.path().join("home"));
+    let digest = format!("sha256:{}", "0".repeat(64));
+    let err = store.rootfs(&image, &digest).unwrap_err().to_string();
+    assert!(err.contains("outside"), "{err}");
+    assert!(!victim.exists());
+}
+
 #[test]
 fn images_can_be_listed_under_other_platforms_too() {
     let ctx = context(

@@ -165,7 +165,7 @@ pub fn load(dir: &Path, model: &str, into: &Path) -> anyhow::Result<()> {
     let flat = layer::strip(&tar, STATE_DIR)?.context("the session's layer holds no session")?;
     std::fs::create_dir_all(into)?;
     for (name, data) in layer::files(&flat)? {
-        if name.contains('/') {
+        if !super::is_file_name(&name) {
             bail!("the session holds a file outside it: {name}");
         }
         std::fs::write(into.join(name), data)?;
