@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde_json::Value;
-use shem::container::{Container, Frozen, FrozenHost, RunError};
+use shem::container::{Container, Frozen, FrozenHost, RunError, TERMINAL_SIGNAL};
 use shem::image::{WARM_DIR, find_program};
 use shem::linux::{RootFs, Stdio};
 use shem::neural::NeuralVcpu;
@@ -132,6 +132,12 @@ impl Control {
         self.kill.load(Ordering::SeqCst) != 0 || *self.pause.lock().unwrap() == Pausing::Asked
     }
 
+    /// Whether a read of input should stop waiting: the program is to stop,
+    /// or a key typed at its terminal sends it a signal.
+    fn wakes(&self) -> bool {
+        self.interrupted() || TERMINAL_SIGNAL.load(Ordering::SeqCst) != 0
+    }
+
     /// Stop the program with `signal`, paused or not.
     pub fn kill(&self, signal: u32) {
         self.kill.store(signal, Ordering::SeqCst);
@@ -180,9 +186,9 @@ impl Control {
 }
 
 /// A program's stdin, whose reads, while they wait for input, give up when
-/// the program is to stop: the read reports that it would block, the guest
-/// is parked on its system call, and it can stop there, to retry the call
-/// when it goes on.
+/// the program is to stop, or to take a signal from its terminal: the read
+/// reports that it would block, the guest is parked on its system call, and
+/// it can stop there, or take the signal, to retry the call when it goes on.
 pub struct Wakeable<R> {
     input: R,
     control: Arc<Control>,
@@ -204,7 +210,7 @@ impl<R: Read + AsFd> Wakeable<R> {
 impl<R: Read + AsFd> Read for Wakeable<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            if self.control.interrupted() {
+            if self.control.wakes() {
                 self.control.woke.store(true, Ordering::SeqCst);
                 return Err(std::io::ErrorKind::WouldBlock.into());
             }
@@ -247,8 +253,15 @@ fn warm_state(root: &Path) -> anyhow::Result<Option<Frozen>> {
 /// image resumes where it was frozen, with the memory it was frozen with,
 /// ignoring the bundle's arguments. A kill (a signal number) stops it at the
 /// next slice boundary, with the status a shell reports for that signal; a
-/// pause freezes it there (see `pause`).
-pub fn run(bundle: &Bundle, stdio: Stdio, control: &Control) -> anyhow::Result<u8> {
+/// pause freezes it there (see `pause`). With `terminal`, a host terminal's
+/// descriptor, the program's terminal requests on its standard streams go
+/// to that terminal.
+pub fn run(
+    bundle: &Bundle,
+    stdio: Stdio,
+    control: &Control,
+    terminal: Option<i32>,
+) -> anyhow::Result<u8> {
     let kill = &control.kill;
     if bundle.sandbox {
         // A pod's sandbox: the holder keeps its namespaces, and it waits to be stopped
@@ -263,10 +276,10 @@ pub fn run(bundle: &Bundle, stdio: Stdio, control: &Control) -> anyhow::Result<u
         return crate::session::run(bundle, stdio, kill);
     }
     match &bundle.vcpu {
-        VcpuKind::Reference => run_on(bundle, stdio, control, SLICE, |mem| {
+        VcpuKind::Reference => run_on(bundle, stdio, control, terminal, SLICE, |mem| {
             Ok(ReferenceVcpu::new(mem))
         }),
-        VcpuKind::Neural(socket) => run_on(bundle, stdio, control, NEURAL_SLICE, |mem| {
+        VcpuKind::Neural(socket) => run_on(bundle, stdio, control, terminal, NEURAL_SLICE, |mem| {
             NeuralVcpu::connect(socket, mem).with_context(|| {
                 format!(
                     "connecting to the neural vCPU server at {}",
@@ -281,6 +294,7 @@ fn run_on<V: Vcpu + Clone>(
     bundle: &Bundle,
     stdio: Stdio,
     control: &Control,
+    terminal: Option<i32>,
     slice: u64,
     vcpu: impl FnOnce(u32) -> anyhow::Result<V>,
 ) -> anyhow::Result<u8> {
@@ -303,6 +317,7 @@ fn run_on<V: Vcpu + Clone>(
         }
         container
     };
+    container.linux.terminal = terminal;
     loop {
         match container.run(Some(container.steps + slice)) {
             Ok(status) => return Ok(status),

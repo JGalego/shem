@@ -34,6 +34,7 @@ use log::{info, warn};
 use shem::linux::Stdio;
 
 use crate::bundle::{self, Bundle, Control, Wakeable};
+use crate::console::{Console, Resizer};
 use crate::holder::Holder;
 
 const SIGKILL: u32 = 9;
@@ -58,6 +59,8 @@ struct Task {
     status: api::Status,
     exited: Option<(u32, Timestamp)>,
     control: Arc<Control>,
+    /// A program's terminal, when it has one, to set its window size.
+    terminal: Option<Resizer>,
     /// The task's PID: its namespace holder's, or the shim's when there is none.
     pid: u32,
     holder: Option<Holder>,
@@ -343,6 +346,7 @@ impl shim::Task for Service {
             status: api::Status::CREATED,
             exited: None,
             control: Arc::new(Control::default()),
+            terminal: None,
             pid: task_pid,
             holder,
             execs: HashMap::new(),
@@ -374,6 +378,22 @@ impl shim::Task for Service {
             )
         })?;
         let bundle = Bundle::load(&bundle_dir).map_err(error)?;
+        // A program's input wakes for a kill or a pause, and with a terminal,
+        // the program gets one of its own; a session reads and echoes itself
+        let program = !bundle.sandbox && !bundle.args[0].starts_with("shem:");
+        let console = if program && bundle.terminal {
+            let stdin = (!streams.0.is_empty())
+                .then(|| open_fifo_for_reading(&streams.0))
+                .transpose()
+                .map_err(error)?;
+            let (console, stdio) =
+                Console::open(stdin, &streams.1, control.clone()).map_err(error)?;
+            let resizer = console.resizer().map_err(error)?;
+            self.with_task(|task| task.terminal = Some(resizer))?;
+            Some((console, stdio))
+        } else {
+            None
+        };
         self.publish(TaskStart {
             container_id: id.clone(),
             pid: task_pid,
@@ -382,23 +402,34 @@ impl shim::Task for Service {
         let service = self.clone();
         trace("start: published TaskStart, running the container");
         std::thread::spawn(move || {
-            // A program's input wakes for a kill or a pause; a session reads its own
-            let program = !bundle.sandbox && !bundle.args[0].starts_with("shem:");
-            let wake = program.then(|| control.clone());
-            let status = match stdio(&streams.0, &streams.1, &streams.2, wake) {
-                Ok(stdio) => bundle::run(&bundle, stdio, &control).unwrap_or_else(|err| {
-                    // Tell whoever reads the container's stderr, such as ctr.
-                    warn!("the container failed: {err:#}");
-                    if let Ok(mut stderr) = OpenOptions::new().write(true).open(&streams.2) {
-                        let _ = writeln!(stderr, "containerd-shim-shem: {err:#}");
-                    }
-                    125
-                }),
+            let (streams_opened, console) = match console {
+                Some((console, stdio)) => (Ok(stdio), Some(console)),
+                None => {
+                    let wake = program.then(|| control.clone());
+                    (stdio(&streams.0, &streams.1, &streams.2, wake), None)
+                }
+            };
+            let terminal = console.as_ref().map(Console::fd);
+            let status = match streams_opened {
+                Ok(stdio) => {
+                    bundle::run(&bundle, stdio, &control, terminal).unwrap_or_else(|err| {
+                        // Tell whoever reads the container's stderr, such as ctr.
+                        warn!("the container failed: {err:#}");
+                        if let Ok(mut stderr) = OpenOptions::new().write(true).open(&streams.2) {
+                            let _ = writeln!(stderr, "containerd-shim-shem: {err:#}");
+                        }
+                        125
+                    })
+                }
                 Err(err) => {
                     warn!("opening the container's streams: {err}");
                     125
                 }
             };
+            // The program's last output, through its terminal
+            if let Some(console) = console {
+                console.finish();
+            }
             // The container's streams are closed by now, so readers see the end
             let at = Timestamp::now();
             let (lock, exited) = &*service.task;
@@ -670,9 +701,18 @@ impl shim::Task for Service {
     fn resize_pty(
         &self,
         _ctx: &TtrpcContext,
-        _req: api::ResizePtyRequest,
+        req: api::ResizePtyRequest,
     ) -> TtrpcResult<api::Empty> {
-        Ok(api::Empty::default()) // the session echoes what is typed; a size changes nothing
+        trace(format!("resize to {}x{}", req.width, req.height));
+        // A program's terminal takes the size; a session echoes what is
+        // typed, whatever the size
+        self.with_task(|task| {
+            if let Some(terminal) = &task.terminal {
+                let clamp = |n: u32| n.min(u16::MAX as u32) as u16;
+                terminal.resize(clamp(req.height), clamp(req.width));
+            }
+        })?;
+        Ok(api::Empty::default())
     }
 
     fn close_io(&self, _ctx: &TtrpcContext, _req: api::CloseIORequest) -> TtrpcResult<api::Empty> {

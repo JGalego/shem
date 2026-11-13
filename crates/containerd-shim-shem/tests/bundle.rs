@@ -1,79 +1,12 @@
+mod common;
+
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+use common::*;
 use containerd_shim_shem::bundle::{self, Bundle, Control, Wakeable};
 use shem::linux::Stdio;
-
-const BASE: u32 = 0x1_0000;
-
-/// A static RV32 executable: `code` after `data`, in one segment.
-fn elf(code: &[u32], data: &[u8]) -> Vec<u8> {
-    let mut body = data.to_vec();
-    body.resize(data.len().next_multiple_of(4), 0); // keep the entry point aligned
-    let entry = BASE + 84 + body.len() as u32;
-    body.extend(code.iter().flat_map(|w| w.to_le_bytes()));
-    let size = 84 + body.len() as u32;
-    let mut out = b"\x7fELF\x01\x01\x01".to_vec();
-    out.resize(16, 0);
-    out.extend([2u16, 243].iter().flat_map(|h| h.to_le_bytes()));
-    out.extend(
-        [1, entry, 52, 0, 0]
-            .iter()
-            .flat_map(|w: &u32| w.to_le_bytes()),
-    );
-    out.extend(
-        [52u16, 32, 1, 40, 0, 0]
-            .iter()
-            .flat_map(|h| h.to_le_bytes()),
-    );
-    out.extend(
-        [1, 0, BASE, BASE, size, size, 7, 0x1000]
-            .iter()
-            .flat_map(|w: &u32| w.to_le_bytes()),
-    );
-    out.extend(body);
-    out
-}
-
-fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
-    (imm as u32 & 0xfff) << 20 | rs1 << 15 | rd << 7 | 0x13
-}
-
-fn lui(rd: u32, upper: u32) -> u32 {
-    upper & 0xffff_f000 | rd << 7 | 0x37
-}
-
-const ECALL: u32 = 0x73;
-
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn bundle_with(program: Vec<u8>) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let config = r#"{
-        "process": {"args": ["/bin/hello", "x"], "env": ["PATH=/bin"], "cwd": "/"},
-        "root": {"path": "rootfs"},
-        "linux": {"resources": {"memory": {"limit": 8388608}}}
-    }"#;
-    std::fs::write(dir.path().join("config.json"), config).unwrap();
-    let bin = dir.path().join("rootfs/bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(bin.join("hello"), program).unwrap();
-    std::fs::set_permissions(bin.join("hello"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    dir
-}
 
 #[test]
 fn bundles_run_their_process_on_shem() {
@@ -100,7 +33,10 @@ fn bundles_run_their_process_on_shem() {
         stdout: Box::new(out.clone()),
         stderr: Box::new(std::io::sink()),
     };
-    assert_eq!(bundle::run(&bundle, stdio, &Control::default()).unwrap(), 3);
+    assert_eq!(
+        bundle::run(&bundle, stdio, &Control::default(), None).unwrap(),
+        3
+    );
     assert_eq!(out.0.lock().unwrap().as_slice(), msg);
 }
 
@@ -109,33 +45,6 @@ fn killed(signal: u32) -> Control {
     let control = Control::default();
     control.kill(signal);
     control
-}
-
-/// `lui` and `addi` that load `value` into `rd`.
-fn li(rd: u32, value: u32) -> [u32; 2] {
-    [
-        lui(rd, value + 0x800),
-        addi(rd, rd, ((value & 0xfff) as i32 ^ 0x800) - 0x800),
-    ]
-}
-
-/// A program that writes "ready", echoes one read of stdin, and exits.
-fn echo() -> Vec<u8> {
-    let data_at = BASE + 84;
-    let buf = data_at + 8;
-    let mut data = b"ready\n".to_vec();
-    data.resize(8 + 64, 0);
-    let mut code = vec![addi(10, 0, 1)]; // write(1, "ready\n", 6)
-    code.extend(li(11, data_at));
-    code.extend([addi(12, 0, 6), addi(17, 0, 64), ECALL]);
-    code.push(addi(10, 0, 0)); // n = read(0, buf, 64)
-    code.extend(li(11, buf));
-    code.extend([addi(12, 0, 64), addi(17, 0, 63), ECALL]);
-    code.extend([addi(12, 10, 0), addi(10, 0, 1)]); // write(1, buf, n)
-    code.extend(li(11, buf));
-    code.extend([addi(17, 0, 64), ECALL]);
-    code.extend([addi(10, 0, 0), addi(17, 0, 93), ECALL]); // exit(0)
-    elf(&code, &data)
 }
 
 /// Start the echo program in `dir` on a thread, its stdin a pipe that a
@@ -159,7 +68,7 @@ fn start_echo(
     };
     let run = {
         let control = control.clone();
-        std::thread::spawn(move || bundle::run(&bundle, stdio, &control).unwrap())
+        std::thread::spawn(move || bundle::run(&bundle, stdio, &control, None).unwrap())
     };
     while out.0.lock().unwrap().as_slice() != b"ready\n" {
         std::thread::sleep(Duration::from_millis(10));
@@ -225,7 +134,10 @@ fn a_paused_program_is_frozen_for_docker_commit_and_resumes() {
         stdout: Box::new(out.clone()),
         stderr: Box::new(std::io::sink()),
     };
-    assert_eq!(bundle::run(&bundle, stdio, &Control::default()).unwrap(), 0);
+    assert_eq!(
+        bundle::run(&bundle, stdio, &Control::default(), None).unwrap(),
+        0
+    );
     assert_eq!(out.0.lock().unwrap().as_slice(), b"pong\n");
 }
 
@@ -248,7 +160,10 @@ fn a_kill_stops_a_running_process() {
         stdout: Box::new(std::io::sink()),
         stderr: Box::new(std::io::sink()),
     };
-    assert_eq!(bundle::run(&bundle, stdio, &killed(15)).unwrap(), 128 + 15);
+    assert_eq!(
+        bundle::run(&bundle, stdio, &killed(15), None).unwrap(),
+        128 + 15
+    );
 }
 
 /// A program that writes `msg` and exits with status 3.
@@ -282,7 +197,10 @@ fn kubernetes_sandboxes_wait_to_be_stopped() {
         stderr: Box::new(std::io::sink()),
     };
     // /pause is no RV32 program, and the sandbox never runs it
-    assert_eq!(bundle::run(&bundle, stdio, &killed(9)).unwrap(), 128 + 9);
+    assert_eq!(
+        bundle::run(&bundle, stdio, &killed(9), None).unwrap(),
+        128 + 9
+    );
 }
 
 #[test]
@@ -346,7 +264,10 @@ fn warm_images_resume_from_their_state_in_the_root() {
         stdout: Box::new(out.clone()),
         stderr: Box::new(std::io::sink()),
     };
-    assert_eq!(bundle::run(&bundle, stdio, &Control::default()).unwrap(), 3);
+    assert_eq!(
+        bundle::run(&bundle, stdio, &Control::default(), None).unwrap(),
+        3
+    );
     assert_eq!(out.0.lock().unwrap().as_slice(), msg);
     assert!(!warm.exists(), "the guest never saw its own state");
 }
@@ -370,7 +291,10 @@ fn annotated_bundles_run_inside_the_model() {
         stdout: Box::new(out.clone()),
         stderr: Box::new(std::io::sink()),
     };
-    assert_eq!(bundle::run(&bundle, stdio, &Control::default()).unwrap(), 3);
+    assert_eq!(
+        bundle::run(&bundle, stdio, &Control::default(), None).unwrap(),
+        3
+    );
     assert_eq!(out.0.lock().unwrap().as_slice(), msg);
 }
 
@@ -405,7 +329,7 @@ fn model_containers_hold_live_sessions() {
     let control = Arc::new(Control::default());
     let main = {
         let (bundle, control) = (bundle.clone(), control.clone());
-        std::thread::spawn(move || bundle::run(&bundle, stdio, &control).unwrap())
+        std::thread::spawn(move || bundle::run(&bundle, stdio, &control, None).unwrap())
     };
     while out.0.lock().unwrap().is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(200));

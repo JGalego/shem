@@ -24,6 +24,8 @@ docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 \
   --annotation dev.shem.neural-socket=/tmp/shem-neural.sock shem-hello one two
 ```
 
+With `-t`, a program gets a terminal of its own, which echoes what is typed and lets the program set it up, as a shell does to edit lines. `Ctrl-C`, `Ctrl-\` and `Ctrl-Z` send their signals to the program's foreground processes, init included, and the window takes the size of the terminal `docker run -it` runs in.
+
 `docker commit` freezes a running program into the image it makes, and a container of that image goes on where the program was, its memory and registers as they were. With an image of [`tally.c`](../guests/tally.c), which prints a running total of the numbers it reads:
 
 ```console
@@ -86,6 +88,7 @@ containerd calls the shim's task service over ttrpc:
 | `start` | Read arguments, environment, working directory and memory limit from `config.json`; run with containerd's FIFOs as stdio. Default guest memory: 64 MiB. |
 | `wait`, `state` | Report init's exit status; publish lifecycle events so Docker observes it |
 | `kill` | Stop at the next instruction slice, or in a wait for input, with the signal's shell exit status |
+| `resize_pty` | Set the window size of a program's terminal, and send the program SIGWINCH |
 | `pause`, `resume` | Freeze a program into `/.shem`, where `docker commit` takes it, until it goes on; save a model session there |
 | `delete` | Unmount the root filesystem |
 
@@ -93,7 +96,7 @@ Implementation: [`bundle.rs`](../crates/containerd-shim-shem/src/bundle.rs) load
 
 ## Not yet
 
-- Program containers: `docker exec` and terminal support.
+- Program containers: `docker exec`.
 - Checkpoints and resource statistics.
 
 Model containers already support `exec`, `commit` and terminal input; see [sessions under Docker](models.md#sessions-under-docker).

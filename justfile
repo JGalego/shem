@@ -179,6 +179,37 @@ docker-test: toolchain
     echo "shem run read 5: $resumed"
     [ "$resumed" = "total 8" ] || failed "shem run did not go on from total 3"
 
+    echo "--- docker run -t gives a program a terminal of its own"
+    status=0
+    timeout 30 docker run -t --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 shem-hello:riscv32 one two > $dir/tty.txt || status=$?
+    [ "$status" = 3 ] && grep -q "one$(printf '\r')" $dir/tty.txt || failed "no terminal's line ends in $(od -c $dir/tty.txt | head -3), status $status"
+    # Typed at docker run -it: a line, then Ctrl-C, from a terminal of our own
+    python3 - <<'PY' || failed "docker run -it did not take typed keys"
+    import os, pty, select, sys, termios, time
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp("docker", ["docker", "run", "-it", "--rm", "--runtime", "io.containerd.shem.v1",
+                             "--platform", "linux/riscv32", "shem-tally:riscv32"])
+    shown = b""
+    def wait(done, what):
+        global shown
+        deadline = time.time() + 30
+        while not done():
+            if time.time() > deadline:
+                sys.exit(f"waited in vain for {what}: {shown!r}")
+            if select.select([fd], [], [], 0.1)[0]:
+                shown += os.read(fd, 1024)
+    # docker run puts its terminal in raw mode as it attaches, for keys to go to the container
+    wait(lambda: not termios.tcgetattr(fd)[3] & termios.ICANON, "raw mode")
+    time.sleep(1)
+    os.write(fd, b"1\r")
+    wait(lambda: b"total 1" in shown, "total 1")
+    os.write(fd, b"\x03")
+    status = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+    print(f"docker run -it showed {shown!r} and exited with {status}")
+    sys.exit(0 if status == 130 else "Ctrl-C did not interrupt the program")
+    PY
+
 # Model containers under Docker: run, run -i, exec into a live session, and commit it; needs Docker, uv and sudo
 model-containers-test:
     #!/bin/sh
