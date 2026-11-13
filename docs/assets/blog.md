@@ -1,5 +1,9 @@
 # Your LLM is a container now
 
+> **Updates**
+>
+> - **2026-11-13**: [shem 0.2.0](https://github.com/JGalego/shem/releases/tag/v0.2.0) imports many more model families, including mixtures of experts, Mamba and GGUF files. It also pushes and runs [ModelPack](https://github.com/modelpack/model-spec) artifacts, publishes sessions as artifacts linked to their models, and mounts model images as Kubernetes image volumes.
+
 I wanted to find out what happens if you take "it's just a container" much too seriously. So I built [shem](https://github.com/JGalego/shem), a container runtime that does two silly things. It runs language models as containers and it runs containers on a CPU made of model weights.
 
 Both work. Mostly.
@@ -13,7 +17,7 @@ The name comes from the golem legend: a clay figure wakes up when someone puts a
 
 As Steve Yegge says in his [Gas Town](https://steve-yegge.medium.com/welcome-to-gas-town-4f25ee16dd04) post, "I need to get rid of you real quick." Well, same here...
 
-shem is at version 0.1.0 and labelled **experimental** for very good reasons. It supports two model families, Qwen3 and Qwen3.5, because I haven't tried any others. It only decodes greedily. Running models under Docker needs a containerd shim on your machine and a model server running as root. Performance is less than ideal. Bring a book. Hell, bring a library.
+shem is at version 0.2.0 and labelled **experimental** for very good reasons. It supports Llama, Mistral, Qwen, Gemma, Phi, OLMo, SmolLM, Granite and Mamba models, because I haven't tried any others. It only decodes greedily. Running models under Docker needs a containerd shim on your machine and a model server running as root. Performance is less than ideal. Bring a book. Hell, bring a library.
 
 The CPU made of weights runs fewer than 1,000 guest instructions a second on one core. ENIAC did [5,000 additions a second](https://www.britannica.com/technology/ENIAC) in 1946... with freaking vacuum tubes.
 
@@ -52,7 +56,7 @@ The base sets the entrypoint to shem's text-generation driver, the way `FROM pyt
 
 Under the hood, every transformer block gets its own weights file, and every weights file becomes its own image layer. Qwen3-0.6B comes out as 59 layers and 892 MB. Registries deduplicate layers, so images built on the same model share their weights, and pushing a new system prompt doesn't push a gigabyte again. Larger models group neighbouring blocks into a layer to stay under the roughly 128-layer limit of overlay filesystems. Even containers have limits.
 
-Shipping models in container-shaped boxes isn't new. There's even a CNCF standard for it, [ModelPack](https://github.com/modelpack/model-spec), which tools like [KitOps](https://kitops.org) and [llmman](https://github.com/llmmanorg/llmman) implement, and Ollama's Modelfile and Docker Model Runner do their own versions. Those carry the weights as data for an inference server to load.
+Shipping models in container-shaped boxes isn't new. There's even a CNCF standard for it, [ModelPack](https://github.com/modelpack/model-spec), which tools like [KitOps](https://kitops.org) and [llmman](https://github.com/llmmanorg/llmman) implement, and Ollama's Modelfile and Docker Model Runner do their own versions. Those carry the weights as data for an inference server to load. Stage 2 is where shem wanders off.
 
 ## Stage 2: A conversation is just a layer
 
