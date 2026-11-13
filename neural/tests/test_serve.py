@@ -247,3 +247,23 @@ def test_the_model_server_takes_no_session_paths_from_a_container(tmp_path):
             models.generate({"model": str(TINY), "argv": [*argv, "--system", "x", "hi"]}, lambda _: None)
     assert not (tmp_path / "w").exists()
     assert not models.loaded
+
+
+def test_models_are_kept_per_directory_and_released_with_their_last_container(tmp_path):
+    """Two images may hold the same manifest and different weights: each
+    container's model is its own directory's."""
+    import shutil
+
+    from shem_neural.server import Models
+
+    copy = tmp_path / "copy"
+    shutil.copytree(TINY, copy)
+    models = Models(device="cpu")
+    first = models.get(TINY, "float32", "c1")[0]
+    assert models.get(copy, "float32", "c2")[0] is not first
+    assert models.get(TINY, "float32", "c3")[0] is first
+    models.release("c1")
+    assert len(models.loaded) == 2
+    models.release("c3")
+    models.release("c2")
+    assert not models.loaded

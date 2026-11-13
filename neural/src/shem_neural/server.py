@@ -19,6 +19,7 @@ import socketserver
 import struct
 import sys
 import threading
+import uuid
 from enum import IntEnum
 from pathlib import Path
 
@@ -59,9 +60,12 @@ class Status(IntEnum):
 
 
 class Models:
-    """Loaded models, by their manifest's contents, so sessions of the same
-    model share its weights, however many containers unpack it; and the live
-    sessions of running containers, by the ID the shim gives them."""
+    """Loaded models, by where they are and the type they compute in, so
+    the sessions of a container share its model's weights; and the live
+    sessions of running containers, by the ID the shim gives them. A model is
+    not shared between containers: two images may hold the same manifest and
+    different weights or templates, and a container must get its own. It is
+    released when the last container using it closes."""
 
     def __init__(self, device: str = "auto", socket: Path | None = None):
         self.device = device
@@ -71,20 +75,33 @@ class Models:
         self.sessions: dict[str, Live] = {}
         #: Containers' APIs, served in their networks, by the ID the shim gives them
         self.served: dict[str, object] = {}
+        #: The session IDs (or one-off runs) using each loaded model
+        self.users: dict[str, set[str]] = {}
         self.lock = threading.Lock()
 
-    def get(self, directory: Path, dtype: str = "float32"):
-        """The model in `directory`, computing in `dtype`, and its tokenizer."""
+    def get(self, directory: Path, dtype: str = "float32", user: str = ""):
+        """The model in `directory`, computing in `dtype`, and its tokenizer,
+        for `user`, a session ID, until `release(user)`."""
         from .model.blocks import Model
         from .model.generate import dtype as torch_dtype
         from .model.tokenizer import Tokenizer
 
-        key = hashlib.sha256((directory / "shem.json").read_bytes()).hexdigest() + "/" + dtype
+        key = f"{Path(directory).resolve()}\0{dtype}"
         with self.lock:
             if key not in self.loaded:
                 model = Model(directory, dtype=torch_dtype(dtype), device=self.device)
                 self.loaded[key] = (model, Tokenizer(directory, model.manifest.tokenizer))
+            self.users.setdefault(key, set()).add(user)
             return self.loaded[key]
+
+    def release(self, user: str) -> None:
+        """Forget `user`'s models, and unload those nobody else uses."""
+        with self.lock:
+            for key in [key for key, users in self.users.items() if user in users]:
+                self.users[key].discard(user)
+                if not self.users[key]:
+                    del self.users[key]
+                    self.loaded.pop(key, None)
 
     def generate(self, request: dict, write) -> None:
         """Start a session for `request` and reply to its prompt, writing the
@@ -102,18 +119,26 @@ class Models:
             raise ValueError("a container's command line cannot give --warm or --session")
         if request.get("session"):
             args.session = Path(request["session"])
-        model, tokenizer = self.get(args.model, args.dtype)
-        if args.serve and not args.warm:
-            return self._serve(request, model, tokenizer, args, write)
-        session = generate.start(model, tokenizer, args, err=_Stream(write), vcpu_socket=self.socket)
-        prompt = " ".join(args.prompt) or request.get("stdin", "")
-        with _all_cores():
-            if session is not None and prompt:
-                generate.converse(
-                    session, tokenizer, prompt, args.max_tokens, _Stream(write), _Stream(write), args.stop
-                )
-        if session is not None and request.get("session_id"):
-            self.sessions[request["session_id"]] = Live(tokenizer, args, session)
+        user = request.get("session_id") or f"run-{uuid.uuid4()}"
+        model, tokenizer = self.get(args.model, args.dtype, user)
+        kept = False
+        try:
+            if args.serve:
+                kept = True
+                return self._serve(request, model, tokenizer, args, write)
+            session = generate.start(model, tokenizer, args, err=_Stream(write), vcpu_socket=self.socket)
+            prompt = " ".join(args.prompt) or request.get("stdin", "")
+            with _all_cores():
+                if session is not None and prompt:
+                    generate.converse(
+                        session, tokenizer, prompt, args.max_tokens, _Stream(write), _Stream(write), args.stop
+                    )
+            if session is not None and request.get("session_id"):
+                self.sessions[request["session_id"]] = Live(tokenizer, args, session)
+                kept = True
+        finally:
+            if not kept and not request.get("session_id"):
+                self.release(user)
 
     def _serve(self, request: dict, model, tokenizer, args, write) -> None:
         """Serve OpenAI's chat completions API at the container's `--serve`
@@ -161,6 +186,7 @@ class Models:
         if served := self.served.pop(request["session_id"], None):
             served.shutdown()
             served.server_close()
+        self.release(request["session_id"])
 
     def _live(self, request: dict) -> "Live":
         try:
