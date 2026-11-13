@@ -68,6 +68,17 @@ pub fn is_local(host: &str) -> bool {
     host.starts_with("localhost") || host.starts_with("127.0.0.1")
 }
 
+/// `reference` with the `latest` tag if it names neither a tag nor a
+/// digest, as Docker reads it: ORAS needs one or the other.
+fn tagged(reference: &str) -> String {
+    let last = reference.rsplit('/').next().unwrap_or(reference);
+    if last.contains(':') || last.contains('@') || !reference.contains('/') {
+        reference.to_string()
+    } else {
+        format!("{reference}:latest")
+    }
+}
+
 /// Copy `remote`, whatever it is, into a new OCI layout at `dir`, tagged
 /// `latest`.
 pub fn copy_to_layout(remote: &str, dir: &Path, plain_http: bool) -> anyhow::Result<()> {
@@ -77,7 +88,7 @@ pub fn copy_to_layout(remote: &str, dir: &Path, plain_http: bool) -> anyhow::Res
         command.arg("--from-plain-http");
     }
     command
-        .arg(remote)
+        .arg(tagged(remote))
         .arg("--to-oci-layout")
         .arg(format!("{}:latest", dir.display()));
     run(command)
@@ -139,4 +150,22 @@ fn import(remote: &str, context: &Path, out: &Path) -> anyhow::Result<()> {
     })?;
     image.write_layout(out, tag)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tagged;
+
+    #[test]
+    fn references_without_a_tag_or_digest_mean_latest() {
+        assert_eq!(
+            tagged("localhost:5000/org/name"),
+            "localhost:5000/org/name:latest"
+        );
+        assert_eq!(tagged("ghcr.io/org/name:1.0"), "ghcr.io/org/name:1.0");
+        assert_eq!(
+            tagged("localhost:5000/org/name@sha256:ab"),
+            "localhost:5000/org/name@sha256:ab"
+        );
+    }
 }
