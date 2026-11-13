@@ -48,6 +48,7 @@ A `shem:` entrypoint selects a host-side driver, not a guest executable.
 | `--stop TEXT` | End the reply at this text; useful for [base models](../examples/mamba/Shemfile) |
 | `--tools DIR` | Offer programs in this directory as [tools](#compiled-layers-and-tools) |
 | `--keep` | Keep a [Docker session](#sessions-under-docker) open after replying |
+| `--serve [HOST:]PORT` | [Serve OpenAI's chat completions API](#serving-openais-api) instead of replying once |
 
 Decoding is greedy and repeatable for the same model, session, prompt and device.
 
@@ -250,6 +251,33 @@ docker rm clay
 | `docker logs`, `stop`, `rm`, `ps` | Standard container operations |
 
 The `docker run` rows omit the required `--runtime io.containerd.shem.v1 --platform linux/riscv32` flags for brevity.
+
+## Serving OpenAI's API
+
+`shem serve` serves a model image as OpenAI's chat completions API, for the clients and tools written for it:
+
+```sh
+shem serve golem --port 8000
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "Who are you?"}]}'
+```
+
+Under Docker, `--serve PORT` serves in the container's network, which `-p` publishes. The [model server](#sessions-under-docker) runs the model, as it does a session:
+
+```sh
+docker run -d -p 8000:8000 --runtime io.containerd.shem.v1 --platform linux/riscv32 golem --serve 8000
+```
+
+| Endpoint | Answers with |
+|---|---|
+| `POST /v1/chat/completions` | A reply to the messages; with `"stream": true`, server-sent events as it comes |
+| `GET /v1/models` | The model, by the repository it came from |
+| `GET /health` | 200 once the model is loaded |
+
+- Replies are greedy, as the driver's are: sampling settings are accepted and ignored, and `n` must be 1. `max_tokens` and `stop` apply.
+- The image's system prompt comes first unless a request gives its own, and a conversation that starts with the image's [primed session](#sessions-as-layers) goes on from it rather than reading it again.
+- Requests take turns on the model. Messages are text; tools in requests, and images, are not understood yet.
+- An image serves when it starts with `ENTRYPOINT ["shem:generate", "--serve", "8000"]` and `EXPOSE 8000`.
 
 ## Compiled layers and tools
 

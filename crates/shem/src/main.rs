@@ -45,6 +45,9 @@ enum Command {
     /// the store: to run images Docker built where the shim is not, as with
     /// Docker Desktop
     Load(LoadArgs),
+    /// Serve a model image as OpenAI's chat completions API, at
+    /// http://HOST:PORT/v1, until interrupted
+    Serve(ServeArgs),
     /// Boot an operating system kernel in VM mode, with its console on stdio
     Boot(BootArgs),
 }
@@ -200,6 +203,19 @@ struct LoadArgs {
 }
 
 #[derive(Args)]
+struct ServeArgs {
+    /// The port to serve at
+    #[arg(short, long, default_value_t = 8000)]
+    port: u16,
+    /// The address to listen at: this host's own by default, or 0.0.0.0
+    /// for every network it is on
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    /// A model image: name[:tag] in the store, or an OCI layout directory
+    image: String,
+}
+
+#[derive(Args)]
 struct PullArgs {
     /// Talk to the registry over plain HTTP, as to a local test registry
     #[arg(long)]
@@ -240,6 +256,7 @@ fn main() -> ExitCode {
         Command::Pull(args) => pull(args),
         Command::Save(args) => save(args),
         Command::Load(args) => load(args),
+        Command::Serve(args) => serve(args),
         Command::Boot(args) => boot(args),
     };
     match result {
@@ -617,6 +634,23 @@ fn load(args: LoadArgs) -> anyhow::Result<u8> {
         println!("Loaded image: {name}");
     }
     Ok(0)
+}
+
+fn serve(args: ServeArgs) -> anyhow::Result<u8> {
+    let image = load_image(&args.image)?;
+    if !image::model::is_driver(&image.config.entrypoint) {
+        bail!(
+            "{} is no model image: shem serve serves a model",
+            args.image
+        );
+    }
+    let digest = Image::layout_digest(&image_dir(&args.image)?)?;
+    let root = Store::open()?.rootfs(&image, &digest)?;
+    let address = match args.host.contains(':') {
+        true => format!("[{}]:{}", args.host, args.port),
+        false => format!("{}:{}", args.host, args.port),
+    };
+    image::model::serve(&image.config.entrypoint, &root, &address)
 }
 
 fn pull(args: PullArgs) -> anyhow::Result<u8> {

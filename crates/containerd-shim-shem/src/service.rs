@@ -366,7 +366,7 @@ impl shim::Task for Service {
         if !req.exec_id.is_empty() {
             return self.start_exec(req.exec_id);
         }
-        let (id, bundle_dir, streams, control, task_pid) = self.with_task(|task| {
+        let (id, bundle_dir, streams, control, task_pid, holder) = self.with_task(|task| {
             task.status = api::Status::RUNNING;
             let streams = (task.stdin.clone(), task.stdout.clone(), task.stderr.clone());
             (
@@ -375,9 +375,11 @@ impl shim::Task for Service {
                 streams,
                 task.control.clone(),
                 task.pid,
+                task.holder.as_ref().map(Holder::pid),
             )
         })?;
-        let bundle = Bundle::load(&bundle_dir).map_err(error)?;
+        let mut bundle = Bundle::load(&bundle_dir).map_err(error)?;
+        bundle.netns = holder.map(|pid| PathBuf::from(format!("/proc/{pid}/ns/net")));
         // A program's input wakes for a kill or a pause, and with a terminal,
         // the program gets one of its own; a session reads and echoes itself
         let program = !bundle.sandbox && !bundle.args[0].starts_with("shem:");

@@ -94,7 +94,8 @@ pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8
     if bundle.args[0] != "shem:generate" {
         bail!("unknown driver {}: shem has shem:generate", bundle.args[0]);
     }
-    let keep = bundle.args.iter().any(|a| a == "--keep");
+    // A session kept for docker exec, or an API served, lasts until stopped
+    let keep = bundle.args.iter().any(|a| a == "--keep" || a == "--serve");
     let mut server = Server::connect(&socket(bundle))?;
     let out: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(stdio.stdout));
     let mut write = writer(out.clone(), bundle.terminal);
@@ -108,6 +109,10 @@ pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8
     let saved = bundle.root.join(WARM_DIR);
     if saved.join("session.json").is_file() {
         request["session"] = saved.display().to_string().into();
+    }
+    // Where `--serve` listens: in the container's network
+    if let Some(netns) = &bundle.netns {
+        request["netns"] = netns.display().to_string().into();
     }
     server.call(GENERATE, &request, &mut write)?;
 

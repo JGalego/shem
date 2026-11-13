@@ -69,6 +69,8 @@ class Models:
         self.socket = socket
         self.loaded: dict[str, tuple] = {}
         self.sessions: dict[str, Live] = {}
+        #: Containers' APIs, served in their networks, by the ID the shim gives them
+        self.served: dict[str, object] = {}
         self.lock = threading.Lock()
 
     def get(self, directory: Path, dtype: str = "float32"):
@@ -97,6 +99,8 @@ class Models:
         if request.get("session"):
             args.session = Path(request["session"])
         model, tokenizer = self.get(args.model, args.dtype)
+        if args.serve and not args.warm:
+            return self._serve(request, model, tokenizer, args, write)
         session = generate.start(model, tokenizer, args, err=_Stream(write), vcpu_socket=self.socket)
         prompt = " ".join(args.prompt) or request.get("stdin", "")
         with _all_cores():
@@ -106,6 +110,20 @@ class Models:
                 )
         if session is not None and request.get("session_id"):
             self.sessions[request["session_id"]] = Live(tokenizer, args, session)
+
+    def _serve(self, request: dict, model, tokenizer, args, write) -> None:
+        """Serve OpenAI's chat completions API at the container's `--serve`
+        port, in its network namespace, `netns` in the request, until the
+        container ends; its primed session, if it has one, starts replies."""
+        from .model import generate, serve
+
+        primed = generate.Session.load(model, args.session, _Stream(write)) if args.session else None
+        chat = serve.Chat(model, tokenizer, args, primed, compute=_all_cores)
+        host, port = serve.address(args.serve, "0.0.0.0")
+        server = serve.start(chat, serve.listen(host, port, request.get("netns")))
+        port = server.server_address[1]
+        self.served[request.get("session_id") or f"{host}:{port}"] = server
+        _Stream(write).write(f"shem: serving {chat.name} at port {port}, as OpenAI's API at /v1\n")
 
     def turn(self, request: dict, write) -> None:
         """Another turn of a live session: the user's text, from the command
@@ -136,6 +154,9 @@ class Models:
 
     def close(self, request: dict) -> None:
         self.sessions.pop(request["session_id"], None)
+        if served := self.served.pop(request["session_id"], None):
+            served.shutdown()
+            served.server_close()
 
     def _live(self, request: dict) -> "Live":
         try:

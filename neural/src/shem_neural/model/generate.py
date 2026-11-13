@@ -10,7 +10,8 @@ server keeps sessions across turns and saves them for `docker commit`.
 `--tools DIR` offers programs run on the image's compiled CPU (see `tools`).
 `--system-file PATH` adds a file of the image to the system prompt, such as a
 document to answer from. `--stop TEXT` ends a reply where it reaches TEXT,
-which a base model, with no end of turn of its own, needs.
+which a base model, with no end of turn of its own, needs. `--serve PORT`
+serves OpenAI's chat completions API instead (see `serve`).
 """
 
 import argparse
@@ -307,6 +308,12 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
         help="the type the model computes in: bfloat16 takes half the memory",
     )
     parser.add_argument("--tools", help="offer the programs in this directory of the image to the model as tools")
+    parser.add_argument(
+        "--serve",
+        metavar="[HOST:]PORT",
+        help="serve OpenAI's chat completions API at this port, on localhost or a container's network, "
+        "instead of replying once",
+    )
     if model is not None:
         parser.add_argument("prompt", nargs="*")
         args = parser.parse_intermixed_args(argv)
@@ -393,6 +400,12 @@ def main() -> None:
     args = resolve(options(sys.argv[1:]))
     model = Model(args.model, dtype=dtype(args.dtype), device=args.device)
     tokenizer = Tokenizer(args.model, model.manifest.tokenizer)
+    if args.serve and not args.warm:
+        from .serve import serve_forever
+
+        primed = Session.load(model, args.session) if args.session else None
+        serve_forever(model, tokenizer, args, primed)
+        return
     prompt = " ".join(args.prompt) or ("" if args.warm else sys.stdin.read())
     try:
         run(model, tokenizer, args, prompt)

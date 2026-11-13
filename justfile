@@ -246,6 +246,23 @@ model-containers-test:
     check "121932631112635269" "$(timeout 600 target/release/shem run tools 'What is 123456789 times 987654321?')"
     target/release/shem save tools | docker load
     check "8888888888711111111112" "$(timeout 600 $run --rm tools 'What is 99999999999 times 88888888888?')"
+    echo "--- OpenAI's chat completions API, from a container that docker run -p publishes, and from shem serve"
+    ready() {
+        for _ in $(seq 1 150); do curl -sf "localhost:$1/health" >/dev/null && return; sleep 2; done
+        echo "nothing served at port $1"; docker logs served 2>&1 | tail -5
+        tail -20 target/model-server.log; tail -20 target/serve.log 2>/dev/null; exit 1
+    }
+    chat() { curl -sfN --max-time 300 "localhost:$1/v1/chat/completions" -H 'Content-Type: application/json' -d "$2"; }
+    $run -d --name served -p 8000:8000 qwen3 --serve 8000 --system "$sys" --max-tokens 16
+    ready 8000
+    check '"object": "chat.completion"' "$(chat 8000 '{"messages": [{"role": "user", "content": "Say hello in Portuguese."}]}')"
+    check "data: \[DONE\]" "$(chat 8000 '{"messages": [{"role": "user", "content": "Say hello."}], "stream": true}')"
+    timeout 30 docker rm -f served >/dev/null
+    target/release/shem serve qwen3 --port 8001 > target/serve.log 2>&1 &
+    serving=$!
+    ready 8001
+    check '"finish_reason"' "$(chat 8001 '{"messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 8}')"
+    kill $serving
 
 # Run an RV32 program in a Pod on shem, in a kind cluster; needs Docker, kind and kubectl
 kubernetes-test:

@@ -53,6 +53,9 @@ pub struct Bundle {
     /// Whether this is a Kubernetes pod's sandbox, which only holds the pod's
     /// namespaces: its pause program is not a guest.
     pub sandbox: bool,
+    /// The container's network namespace, where a model container serves
+    /// its API: the shim's holder's, when it has one (see `holder`).
+    pub netns: Option<PathBuf>,
 }
 
 impl Bundle {
@@ -98,6 +101,7 @@ impl Bundle {
                 .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
             terminal: process["terminal"].as_bool().unwrap_or(false),
             sandbox: annotations["io.kubernetes.cri.container-type"] == "sandbox",
+            netns: None,
         })
     }
 }
