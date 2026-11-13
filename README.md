@@ -176,6 +176,7 @@ space/          the Hugging Face Space that turns checkpoints into images in the
 toolchain/      the guest toolchain image and the riscv-tests environment
 guests/         C guest programs
 examples/       example Shemfiles and Dockerfiles: models, use cases, programs and VMs
+scripts/        development scripts: hadolint for Dockerfiles and Shemfiles
 docs/
   architecture.md  design, tech stack and roadmap
   neural.md        how the neural vCPU works, and its protocol

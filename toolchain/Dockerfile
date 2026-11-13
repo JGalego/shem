@@ -1,6 +1,9 @@
 # Guest toolchain: Zig cross-compiles C into static RV32 Linux executables against musl,
 # building musl and compiler-rt for the exact target CPU on first use.
 FROM debian:trixie-slim AS toolchain
+# A pipe fails when any of its commands does: a download that breaks off fails
+# the step, not just the command reading it. Stages built on this one keep it
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG ZIG_VERSION=0.17.1
 ARG ZIG_SHA256_AMD64=3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
@@ -31,6 +34,7 @@ WORKDIR /src
 FROM toolchain AS riscv-tests-build
 ARG RISCV_TESTS_COMMIT=3df703cd52d5f0d8224e3c50bf03c6cb70efff98
 WORKDIR /riscv-tests
+# hadolint ignore=DL4006 # SHELL, with pipefail, is the toolchain stage's
 RUN curl -fsSL "https://github.com/riscv-software-src/riscv-tests/archive/$RISCV_TESTS_COMMIT.tar.gz" \
     | tar -xz --strip-components=1
 COPY riscv-tests/riscv_test.h env/shem/riscv_test.h
@@ -38,7 +42,7 @@ COPY riscv-tests/riscv_test.h env/shem/riscv_test.h
 # relax addresses against it.
 RUN mkdir /out \
     && for suite in rv32ui rv32um rv32ua; do \
-        for src in isa/$suite/*.S; do \
+        for src in isa/"$suite"/*.S; do \
             rv32-cc -nostdlib -mno-relax -I env/shem -I isa/macros/scalar \
                 -o "/out/$suite-$(basename "$src" .S)" "$src" || exit 1; \
         done; \
@@ -54,6 +58,7 @@ ARG BUSYBOX_SHA256=34f9ea6ff8636f2c9241153b9114eefa9e65674a45318ae1ef95bb5f31c53
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bzip2 gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
+# hadolint ignore=DL4006 # SHELL, with pipefail, is the toolchain stage's
 RUN curl -fsSL "https://busybox.net/downloads/busybox-$BUSYBOX_VERSION.tar.bz2" -o /tmp/busybox.tar.bz2 \
     && echo "$BUSYBOX_SHA256  /tmp/busybox.tar.bz2" | sha256sum -c - \
     && mkdir /busybox \

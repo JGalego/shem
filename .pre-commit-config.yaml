@@ -42,3 +42,12 @@ repos:
         types: [rust]
         pass_filenames: false
         stages: [pre-push]
+      # Dockerfiles and Shemfiles, in hadolint's image, through a wrapper that
+      # turns shem's own instructions into comments. hadolint can't parse a
+      # base with both a registry port and a tag, as the ModelPack example's
+      - id: hadolint
+        name: hadolint
+        entry: --entrypoint /bin/sh hadolint/hadolint:v2.14.0-alpine scripts/hadolint
+        language: docker_image
+        files: (^|/)(Dockerfile|Shemfile)$
+        exclude: ^examples/modelpack/Shemfile$

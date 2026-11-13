@@ -1,0 +1,25 @@
+#!/bin/sh
+# Lint Dockerfiles and Shemfiles with hadolint: scripts/hadolint FILE...
+#
+# hadolint parses Docker's instructions only, so shem's own (WARM, KERNEL)
+# become comments on the same lines first, and findings keep their line
+# numbers. A Shemfile, or a Dockerfile built with shem's BuildKit frontend,
+# may name a model base as FROM hf.co/ORG/NAME, whose tag is a revision of the
+# model rather than of an image: examples follow the default branch, so the
+# rule that tags bases (DL3006) is off for them. Pinning distribution
+# packages' versions (DL3008, DL3018) is off everywhere: the images install
+# them from releases they pin.
+status=0
+for file in "$@"; do
+    ignores="--ignore DL3008 --ignore DL3018"
+    case "$file" in
+        *Shemfile) ignores="$ignores --ignore DL3006" ;;
+        *) head -n 1 "$file" | grep -q '^# *syntax=.*/shem/dockerfile' && ignores="$ignores --ignore DL3006" ;;
+    esac
+    # shellcheck disable=SC2086 # the ignores are separate arguments
+    report=$(sed -E 's/^([[:space:]]*)(WARM|KERNEL)([[:space:]]|$)/\1# \2\3/' "$file" \
+        | hadolint --no-color $ignores - 2>&1) || status=1
+    # Findings name the file they read, which was stdin
+    [ -n "$report" ] && printf '%s\n' "$report" | sed -e "s|^-:|$file:|" -e "s|^/dev/stdin:|$file:|"
+done
+exit "$status"

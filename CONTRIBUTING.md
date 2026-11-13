@@ -30,6 +30,8 @@ uv run --project neural pytest neural/tests
 cargo deny check                              # requires cargo-deny
 ```
 
+The hooks also lint Dockerfiles and Shemfiles with [hadolint](https://github.com/hadolint/hadolint), in its Docker image, through [`scripts/hadolint`](scripts/hadolint), which turns shem's own instructions into comments first. Run it alone with `pre-commit run hadolint --all-files`.
+
 Integration suites need built guest programs, servers or external tools. The [justfile](justfile) supplies recipes; [CI](.github/workflows/ci.yml) shows the full setup.
 
 | Suite | Command | Requires |
