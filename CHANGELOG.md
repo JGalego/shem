@@ -1,6 +1,37 @@
 # Changelog
 
 
+## 0.3.0 (2026-11-13)
+
+### Features
+
+- `shem load` stores the images of a `docker save` archive, to run what Docker built where its containerd cannot see the shim, as on Docker Desktop
+- `--dtype bfloat16` runs a model session in half the memory, and the model server keeps a model loaded in each type its images ask for
+- `docker commit` freezes a running program, and its image goes on where the program paused; a kill ends a program that waits for input
+- `docker run -t` gives a program a terminal of its own, with echo, line editing, Ctrl-C and the window's size
+- `shem serve` and `docker run --serve` serve a model image as OpenAI's chat completions API, in the container's own network under Docker
+- A landing page and an install script on the website, with the docs under /docs/
+
+### Fixes
+
+- An image's layers and session files can no longer delete or write files outside the root they unpack into, by paths from /, paths that climb out, or links that lead out
+- A signal typed at the terminal goes to its foreground process group, init's included, and no longer returns from a system call init never made
+- Counts a frozen container brings, of instructions and time, wrap or stop at their limits instead of overflowing
+- Leave out the default ENTRYPOINT when a model stage sets its own, which made docker build warn about a line of the generated Dockerfile
+
+### Documentation
+
+- Start the model server from a release, as a systemd service or with sudo and full paths, as well as from a checkout
+- Add CNCF governance files and a DCO check
+
+### Tests
+
+- Fuzz what shem reads from images, archives for `shem load`, programs, frozen containers, layers and Shemfiles, every day, and try their seeds in CI
+
+### Other
+
+- Relicense from MIT to Apache 2.0
+
 ## 0.2.0 (2026-11-12)
 
 ### Features
