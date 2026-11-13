@@ -135,8 +135,8 @@ class Registry:
 
     def __init__(self, hub):
         self.hub = hub
-        #: The repos served by tag, for the home page
-        self.served: set[str] = set()
+        #: What the home page's cards show of the repos served, by repo
+        self.served: dict[str, dict] = {}
 
     def base(self, match) -> tuple[HTTPStatus, dict, bytes]:
         return HTTPStatus.OK, {"Content-Type": "application/json"}, b"{}"
@@ -153,7 +153,7 @@ class Registry:
             # The first, as `shem run` takes it
             entry = entries[0]
             data = self.hub.blob(name, entry["digest"].removeprefix("sha256:"))
-            self.served.add(name)
+            self.served.setdefault(name, {}).setdefault("tags", set()).add(match["tag"])
             kind = entry.get("mediaType") or media_type(data, "application/vnd.oci.image.manifest.v1+json")
         digest = "sha256:" + hashlib.sha256(data).hexdigest()
         if match["hex"] and digest != f"sha256:{match['hex']}":
@@ -177,7 +177,7 @@ class Registry:
         """A page for people: the home page, or a repo's."""
         html = {"Content-Type": "text/html; charset=utf-8"}
         if path == "/":
-            return HTTPStatus.OK, html, pages.home(host, sorted(self.served))
+            return HTTPStatus.OK, html, pages.home(host, self.served)
         if path == "/go":
             repo = (query.get("repo") or [""])[0].strip().strip("/").removeprefix("hf.co/")
             if PAGE.match(f"/{repo}"):
@@ -187,7 +187,8 @@ class Registry:
             tag = (query.get("tag") or ["latest"])[0]
             if not TAG.fullmatch(tag):
                 raise Unknown("TAG_INVALID", f"{tag!r} is no tag")
-            return HTTPStatus.OK, html, pages.repo_page(self.hub, host, match["name"], tag)
+            summary = self.served.setdefault(match["name"], {})
+            return HTTPStatus.OK, html, pages.repo_page(self.hub, host, match["name"], tag, summary)
         raise Unknown("NAME_INVALID", f"no such page {path}")
 
     def handle(self, target: str, host: str = "localhost:5000") -> tuple[HTTPStatus, dict, bytes]:

@@ -5,6 +5,7 @@ pulls through the registry, following a large blob to where it is kept."""
 
 import functools
 import hashlib
+import html
 import http.server
 import io
 import json
@@ -324,27 +325,32 @@ def test_home_page_lists_the_repos_served(served, model):
     assert b"org/golem" not in body
     get(served, "/v2/org/golem/manifests/latest")
     assert b'href="/org/golem"' in get(served, "/")[2]
+    # What a page of the repo shows of latest comes to its card
+    get(served, "/org/golem")
+    card = get(served, "/")[2].decode()
+    assert "✓ Verified" in card and "1.23B params" in card
 
 
 def test_repo_pages_show_the_image_and_its_model(served, model):
     status, _, body = get(served, "/org/golem")
-    page = body.decode()
+    page = html.unescape(body.decode())
     assert status == 200
     # How to run and pull it, from this registry
     assert 'shem run hf.co/org/golem "What is a golem?"' in page
     assert f"oras pull 127.0.0.1:{served.server_port}/org/golem:latest" in page
     # The image, its model and its comparison
-    assert "You are a &lt;golem&gt;." in page
-    assert "Yes: runs start after the system prompt" in page
+    assert "You are a &lt;golem&gt;." in body.decode()
+    assert "Primed session" in page
     assert "Org/Clay-1B" in page and "0123456789ab" in page and "1.23B" in page
     assert "2 attention, 2 mlp" in page
-    assert "8.10e-05" in page and "Verified" in page
+    assert "8.10e-05" in page and "✓ Verified" in page
     assert '<a href="/org/golem?tag=modelpack">modelpack</a>' in page
-    assert "org.example" in page and "dev.shem.model" not in page.split("<h2>Labels</h2>")[1]
+    assert "org.example" in page and "dev.shem.model" not in page.split("<summary>Labels</summary>")[1]
 
 
 def test_repo_pages_take_a_tag_and_explain_failures(served, model):
-    assert b"<b>modelpack</b>" in get(served, "/org/golem?tag=modelpack")[2]
+    page = get(served, "/org/golem?tag=modelpack")[2].decode()
+    assert 'class="chip on" href="/org/golem?tag=modelpack" aria-current="page">modelpack<' in page
     status, headers, _ = get(served, "/go?repo=hf.co/org/golem/")
     assert (status, headers["Location"]) == (302, "/org/golem")
     status, headers, body = get(served, "/org/nothing-here")

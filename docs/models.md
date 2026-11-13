@@ -252,7 +252,7 @@ docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 localho
 
 Requests to Hugging Face use this host's token, so whoever reaches the registry can pull the private repos it can read; it listens on `127.0.0.1` unless given `--host`. Hugging Face resolves repo names in any case, so a client that needs lowercase names, as Docker does, can pull `qwen/qwen3-0.6b-shem` for `Qwen/Qwen3-0.6B-shem`.
 
-Outside `/v2/`, the registry serves pages for people. `/` says how to pull from it and lists the repos it has served since it started. `/ORG/NAME?tag=TAG` shows an image: its tags, how to run and pull it, its entrypoint and system prompt, whether a session is primed, the model from its `shem.json`, the comparison with transformers in the repo's `comparison.json`, and its layers.
+Outside `/v2/`, the registry serves pages for people, with a search box to open any repo. `/` shows the repos it has served since it started as cards. `/ORG/NAME?tag=TAG` shows an image as a model page: badges for its comparison with transformers (from the repo's `comparison.json`), size, precision, licence and primed session; its system prompt, the model from its `shem.json`, its entrypoint and its layers; and beside them, the commands to use it with shem, oras or Docker, its digest, its source checkpoint and its tags.
 
 ### Comparing an import with transformers
 
