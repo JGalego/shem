@@ -262,6 +262,10 @@ Outside `/v2/`, the registry serves pages for people. `/` says how to pull from 
 uv run --project neural shem-neural-verify Qwen/Qwen3-0.6B ./model --report comparison.json
 ```
 
+### The Space
+
+[`space/`](../space/README.md) is a Hugging Face Space that runs these steps for a checkpoint: it checks the architecture and size before downloading, builds the image with an optional system prompt primed by `WARM`, compares it with transformers, pushes it to `YOU/NAME-shem` with a ModelPack artifact on its `modelpack` branch, and writes a model card and `comparison.json`. Its [`convert.py`](../space/convert.py) runs the same steps from a terminal.
+
 ## Sessions under Docker
 
 Model sessions run in `shem-neural-server`, keyed by container ID. [Install the shim](containerd.md#with-docker), then start the server as root so it can read containerd-mounted root filesystems. The install script can run it as a systemd service, from the `shem-neural` release that matches shem:

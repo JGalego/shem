@@ -1,0 +1,12 @@
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[lint.isort]
+known-first-party = ["shem_neural"]
+
+[lint.per-file-ignores]
+# Model cards and the intro are Markdown, one line per paragraph
+"*.py" = ["E501"]
