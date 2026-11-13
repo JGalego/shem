@@ -15,8 +15,10 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde_json::Value;
+
+use crate::state;
 use shem::container::{Container, Frozen, FrozenHost, RunError, TERMINAL_SIGNAL};
-use shem::image::{WARM_DIR, find_program};
+use shem::image::find_program;
 use shem::linux::{RootFs, Stdio};
 use shem::neural::NeuralVcpu;
 use shem::reference::ReferenceVcpu;
@@ -239,17 +241,18 @@ impl<R: Read + AsFd> Read for Wakeable<R> {
 
 /// The frozen container of a warm image (`shem save` puts its state under
 /// `/.shem`), if the root filesystem holds one. The files are removed, since
-/// the guest was frozen without them.
+/// the guest was frozen without them. They are the image's, so they are read
+/// as regular files of a bounded size, through no link (see `state`).
 fn warm_state(root: &Path) -> anyhow::Result<Option<Frozen>> {
-    let dir = root.join(WARM_DIR);
-    if !dir.join("container.json").is_file() {
+    let Some(host) = state::read(root, "container.json", 64 << 20)? else {
         return Ok(None);
-    }
-    let host: FrozenHost = serde_json::from_slice(&std::fs::read(dir.join("container.json"))?)
-        .context("the warm image's container.json")?;
-    let machine = MachineState::decode(&std::fs::read(dir.join("machine.state"))?)
-        .context("the warm image's machine.state")?;
-    std::fs::remove_dir_all(&dir)?;
+    };
+    let host: FrozenHost =
+        serde_json::from_slice(&host).context("the warm image's container.json")?;
+    let machine = state::read(root, "machine.state", state::MAX_STATE)?
+        .context("the warm image has a container.json, and no machine.state")?;
+    let machine = MachineState::decode(&machine).context("the warm image's machine.state")?;
+    state::remove(root)?;
     Ok(Some(Frozen { machine, host }))
 }
 
@@ -350,13 +353,12 @@ fn pause<V: Vcpu + Clone>(
     bundle: &Bundle,
     control: &Control,
 ) -> anyhow::Result<()> {
-    let dir = bundle.root.join(WARM_DIR);
+    // The guest may have left links at /.shem: written as new files, not through them
     let frozen = match container.freeze() {
         Ok(frozen) => {
-            std::fs::create_dir_all(&dir)?;
             let host = serde_json::to_vec(&frozen.host)?;
-            std::fs::write(dir.join("container.json"), host)?;
-            std::fs::write(dir.join("machine.state"), frozen.machine.encode())?;
+            state::write(&bundle.root, "container.json", &host)?;
+            state::write(&bundle.root, "machine.state", &frozen.machine.encode())?;
             true
         }
         Err(err) => {
@@ -368,7 +370,7 @@ fn pause<V: Vcpu + Clone>(
     };
     control.paused();
     if frozen {
-        std::fs::remove_dir_all(&dir)?;
+        state::remove(&bundle.root)?;
     }
     Ok(())
 }

@@ -14,10 +14,10 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde_json::json;
-use shem::image::WARM_DIR;
 use shem::linux::Stdio;
 
 use crate::bundle::{Bundle, DEFAULT_NEURAL_SOCKET, VcpuKind};
+use crate::state;
 
 const GENERATE: u8 = 14;
 const TURN: u8 = 15;
@@ -106,8 +106,12 @@ pub fn run(bundle: &Bundle, stdio: Stdio, kill: &AtomicU32) -> anyhow::Result<u8
         "argv": &bundle.args[1..],
         "session_id": bundle.id,
     });
-    let saved = bundle.root.join(WARM_DIR);
-    if saved.join("session.json").is_file() {
+    // The image's session, if it has one the model server can read without
+    // following links the image put there
+    if let Some(saved) = state::dir(&bundle.root)
+        && state::has(&bundle.root, "session.json")
+        && state::has(&bundle.root, "session.safetensors")
+    {
         request["session"] = saved.display().to_string().into();
     }
     // Where `--serve` listens: in the container's network
@@ -227,17 +231,13 @@ pub fn exec(bundle: &Bundle, args: &[String], stdout: &mut dyn Write) -> anyhow:
 pub fn save(bundle: &Bundle) -> anyhow::Result<()> {
     let mut server = Server::connect(&socket(bundle))?;
     let files = server.call(SAVE, &json!({"session_id": bundle.id}), |_| Ok(()))?;
-    let dir = bundle.root.join(WARM_DIR);
-    std::fs::create_dir_all(&dir)?;
     let mut rest = &files[..];
     while !rest.is_empty() {
         let (name, after) = field(rest)?;
         let (data, after) = field(after)?;
         let name = std::str::from_utf8(name)?;
-        if name.contains('/') {
-            bail!("the model server named a session file {name:?}");
-        }
-        std::fs::write(dir.join(name), data)?;
+        // New files in a /.shem that is a directory, whatever links the image left there
+        state::write(&bundle.root, name, data)?;
         rest = after;
     }
     Ok(())
