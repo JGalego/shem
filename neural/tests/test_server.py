@@ -107,3 +107,20 @@ def test_clones_and_restored_snapshots_share_pages(server):
     for vcpu in clones:
         c.call(Op.DROP, struct.pack("<I", vcpu))
     assert pool.in_use == before
+
+
+def test_a_run_that_fails_fails_alone(server):
+    """One guest the executor cannot step gets an error, and the executor
+    goes on to run every other guest."""
+    path, registry = server
+    client = Client(path)
+    bad, good = client.create(), client.create()
+    registry.vcpus[bad].state = None  # as a vCPU the network cannot step
+    frame = bytes([Op.RUN]) + struct.pack("<IQ", bad, 10)
+    client.stream.write(struct.pack("<I", len(frame)) + frame)
+    client.stream.flush()
+    (length,) = struct.unpack("<I", client.stream.read(4))
+    assert client.stream.read(length)[0] == Status.ERROR
+    client.call(Op.WRITE_MEM, struct.pack("<II", good, 0) + sum_to(10))
+    reason, _, _, steps = struct.unpack("<BIIQ", client.call(Op.RUN, struct.pack("<IQ", good, 1000)))
+    assert (reason, steps) == (EXIT_EBREAK, 33)

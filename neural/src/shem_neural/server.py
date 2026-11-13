@@ -206,6 +206,8 @@ class Job:
         self.budget = budget
         self.steps = 0
         self.result: tuple[int, int, int] | None = None
+        #: Why the job failed, if it did
+        self.error: Exception | None = None
         self.done = threading.Event()
 
 
@@ -231,6 +233,8 @@ class Batcher:
             self.arrivals += 1
             self.wake.notify()
         job.done.wait()
+        if job.error is not None:
+            raise job.error
         assert job.result is not None
         return job.result
 
@@ -239,17 +243,35 @@ class Batcher:
             with self.wake:
                 while not self.jobs:
                     self.wake.wait()
-                first = self.jobs[0].vcpu
-                if first.dense:  # the dense network's memory does not batch
-                    job = self.jobs.pop(0)
-                    job.result = first.run(job.budget)
-                    job.done.set()
-                    continue
-                jobs = [j for j in self.jobs if j.vcpu.mem_size == first.mem_size and j.vcpu.cpu is first.cpu]
+                head = self.jobs[0]
+                first = head.vcpu
+                jobs = [head]
                 arrivals = self.arrivals
-                batch = State.stack([j.vcpu.state for j in jobs])
-                self.largest = max(self.largest, len(jobs))
-            self._step(jobs, batch, arrivals)
+            # A job that fails fails alone: the executor goes on for the others
+            try:
+                if not first.dense:  # the dense network's memory does not batch
+                    size = first.mem_size
+                    with self.lock:
+                        jobs += [j for j in self.jobs if j is not head and _batches_with(j.vcpu, first, size)]
+                        arrivals = self.arrivals
+                if first.dense:
+                    with self.lock:
+                        jobs[0].result = first.run(jobs[0].budget)
+                        self.jobs.remove(jobs[0])
+                        jobs[0].done.set()
+                    continue
+                with self.lock:
+                    batch = State.stack([j.vcpu.state for j in jobs])
+                    self.largest = max(self.largest, len(jobs))
+                self._step(jobs, batch, arrivals)
+            except Exception as error:
+                with self.lock:
+                    for job in jobs:
+                        if not job.done.is_set():
+                            job.error = error
+                            if job in self.jobs:
+                                self.jobs.remove(job)
+                            job.done.set()
 
     def _step(self, jobs: list[Job], batch: State, arrivals: int) -> None:
         cpu = jobs[0].vcpu.cpu
@@ -278,6 +300,15 @@ class Batcher:
                 if job.result is not None:
                     self.jobs.remove(job)
                     job.done.set()
+
+
+def _batches_with(vcpu: NeuralVcpu, first: NeuralVcpu, size: int) -> bool:
+    """Whether `vcpu` can step in a batch with `first`: a vCPU that cannot
+    say is left to fail on its own turn."""
+    try:
+        return not vcpu.dense and vcpu.mem_size == size and vcpu.cpu is first.cpu
+    except Exception:
+        return False
 
 
 class Registry:
@@ -329,6 +360,8 @@ class Registry:
     def _handle(self, op: Op, payload: bytes) -> bytes:
         if op == Op.CREATE:
             (mem_size,) = struct.unpack_from("<I", payload, 1)
+            if mem_size == 0:
+                raise ValueError("a vCPU needs some memory")
             (base,) = struct.unpack_from("<I", payload, 5) if len(payload) >= 9 else (0,)
             weights = payload[9:].decode() if len(payload) > 9 else ""
             cpu = self.cpu_for(Path(weights)) if weights else self.cpu
