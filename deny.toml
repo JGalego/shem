@@ -12,7 +12,7 @@ unmaintained = "workspace"
 ignore = []
 
 [licenses]
-# Permissive licences only, so shem can stay MIT
+# Permissive licences only, so shem can stay Apache-2.0
 allow = [
     "0BSD",
     "Apache-2.0",

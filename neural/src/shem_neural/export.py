@@ -19,7 +19,7 @@ from . import isa
 from .compile import compile_weights, save
 
 CARD = """---
-license: mit
+license: apache-2.0
 library_name: shem
 tags:
 - shem
