@@ -10,6 +10,7 @@ import gradio as gr
 from huggingface_hub import HfApi
 
 from convert import MAX_BYTES, MAX_PRIMED, MAX_VERIFIED, Refused, Result, check, convert, refuse, target
+from log_view import CSS, Log
 
 INTRO = f"""
 # 🗿 shem my repo
@@ -31,7 +32,7 @@ def start(
 ):
     """Convert `source`, yielding the status and the log as they change."""
     if profile is None or oauth_token is None:
-        yield "Log in with Hugging Face first: the image goes to your account.", ""
+        yield "Log in with Hugging Face first: the image goes to your account.", Log().html()
         return
     source = source.strip().removeprefix("https://huggingface.co/").removeprefix("hf.co/").strip("/")
     log = Log()
@@ -39,11 +40,11 @@ def start(
         checkpoint = check(source, HfApi(token=oauth_token.token))
         refuse(checkpoint, system)
     except Refused as error:
-        yield f"❌ {error}", ""
+        yield f"❌ {error}", log.html()
         return
     repo = target(profile.username, checkpoint.repo)
     status = f"Converting [{checkpoint.repo}](https://huggingface.co/{checkpoint.repo}) ({checkpoint.architecture}, {checkpoint.parameters / 1e9:.2f}B parameters) to `{repo}`…"
-    yield status, ""
+    yield status, log.html()
     work = Path(tempfile.mkdtemp(prefix="shem-"))
     try:
         steps = convert(
@@ -59,34 +60,16 @@ def start(
         )
         for item in steps:
             if isinstance(item, Result):
-                yield done(item, repo), log.text()
+                log.end("done")
+                yield done(item, repo), log.html()
             else:
                 log.add(item)
-                yield status, log.text()
+                yield status, log.html()
     except Exception as error:
-        yield f"❌ Converting {checkpoint.repo} failed: {error}", log.text()
+        log.end("failed")
+        yield f"❌ Converting {checkpoint.repo} failed: {error}", log.html()
     finally:
         shutil.rmtree(work, ignore_errors=True)
-
-
-class Log:
-    """What the conversion has written, with a progress bar's latest state
-    as its last line while it runs."""
-
-    def __init__(self, keep: int = 400):
-        self.lines: list[str] = []
-        self.bar: str | None = None
-        self.keep = keep
-
-    def add(self, item: str) -> None:
-        if item.startswith("\r"):
-            self.bar = item[1:]
-        else:
-            self.bar = None
-            self.lines = [*self.lines[-self.keep :], item]
-
-    def text(self) -> str:
-        return "\n".join(self.lines + ([self.bar] if self.bar else []))
 
 
 def done(result: Result, repo: str) -> str:
@@ -122,7 +105,7 @@ with gr.Blocks(title="shem my repo") as demo:
         private = gr.Checkbox(value=False, label="Private repo")
     button = gr.Button("Convert", variant="primary")
     status = gr.Markdown()
-    log = gr.Textbox(label="Log", lines=16, max_lines=16, autoscroll=True)
+    log = gr.HTML(Log().html(), css_template=CSS)
     # The spinner over the status only, so the log shows as it comes
     button.click(start, [source, system, verify, modelpack, private], [status, log], show_progress_on=status)
 

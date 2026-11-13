@@ -47,6 +47,24 @@ DTYPE_BYTES = {"F64": 8, "I64": 8, "F32": 4, "I32": 4, "BF16": 2, "F16": 2, "I16
 SHEM = os.environ.get("SHEM_BIN", "shem")
 
 
+@dataclass
+class Step:
+    """A step begins: the output that follows is its own."""
+
+    title: str
+    detail: str = ""
+    #: A step that doesn't run, and why in `detail`
+    skipped: bool = False
+
+
+@dataclass
+class Outcome:
+    """The step that ran ends, well or not, as `text` sums up."""
+
+    ok: bool
+    text: str
+
+
 class Refused(Exception):
     """A checkpoint the Space can't convert, and why."""
 
@@ -174,7 +192,7 @@ def convert(
     modelpack: bool = True,
     private: bool = False,
     cache: Path | None = None,
-) -> Iterator[str | Result]:
+) -> Iterator[str | Step | Outcome | Result]:
     """Build, compare and push, yielding each step's output a line at a time,
     and last the result. Downloads go to `cache`, or Hugging Face's own."""
     refuse(checkpoint, system)
@@ -190,12 +208,15 @@ def convert(
     (context / "Shemfile").write_text(shemfile(checkpoint, system))
     result = Result(checkpoint, work / "image")
 
-    yield f"## Building {checkpoint.repo} at {checkpoint.commit[:12]}"
+    primed = " with its system prompt primed" if system and system.strip() else ""
+    yield Step("Build the image", f"{checkpoint.repo} at {checkpoint.commit[:12]}{primed}")
     yield from run([SHEM, "build", "-o", str(result.layout), str(context)], env)
     result.digest = json.loads((result.layout / "index.json").read_text())["manifests"][0]["digest"]
+    yield Outcome(True, result.digest)
 
+    compare = "Compare with transformers"
     if verify and checkpoint.verifiable:
-        yield "## Comparing the import with transformers"
+        yield Step(compare, "logits in float32, and a greedy reply")
         unpack(result.layout, work / "root")
         report = work / "comparison.json"
         command = [sys.executable, "-m", "shem_neural.model.verify", checkpoint.repo, str(work / "root" / "model")]
@@ -206,24 +227,32 @@ def convert(
             # A comparison that disagrees exits 1 too, having written its report
             pass
         if report.is_file():
-            result.comparison = json.loads(report.read_text())
+            result.comparison = c = json.loads(report.read_text())
+            same = "the same" if c["tokens"] else "a different"
+            yield Outcome(c["passed"], f"logits within {c['difference']:.1e}, {same} {c['length']}-token reply")
         else:
             result.unverified = "The comparison with transformers failed to run."
-            yield f"## {result.unverified}"
+            yield Outcome(False, result.unverified)
     elif verify:
         result.unverified = f"At {checkpoint.parameters / 1e9:.1f}B parameters, the model is larger than the Space compares with transformers."
-        yield f"## {result.unverified}"
+        yield Step(
+            compare, f"{checkpoint.parameters / 1e9:.1f}B parameters is more than this machine compares", skipped=True
+        )
     else:
         result.unverified = "The comparison with transformers was skipped."
+        yield Step(compare, "turned off", skipped=True)
 
     if push:
         api = HfApi(token=token)
         api.create_repo(push, private=private, exist_ok=True)
-        yield f"## Pushing to hf.co/{push}"
+        yield Step("Push the image", f"hf.co/{push}")
         yield from run([SHEM, "push", str(result.layout), f"hf.co/{push}"], env)
+        yield Outcome(True, f"https://huggingface.co/{push}")
         if modelpack:
-            yield f"## Pushing a ModelPack artifact to hf.co/{push}:modelpack"
+            yield Step("Push a ModelPack artifact", f"hf.co/{push}:modelpack")
             yield from run([SHEM, "push", "--modelpack", str(result.layout), f"hf.co/{push}:modelpack"], env)
+            yield Outcome(True, f"https://huggingface.co/{push}/tree/modelpack")
+        yield Step("Write the model card")
         api.upload_file(
             path_or_fileobj=card(result, push, system, modelpack).encode(),
             path_in_repo="README.md",
@@ -239,7 +268,7 @@ def convert(
                 commit_message="Record the comparison with transformers",
             )
         result.url = f"https://huggingface.co/{push}"
-        yield f"## Done: {result.url}"
+        yield Outcome(True, f"{result.url}/blob/main/README.md")
     yield result
 
 
@@ -328,6 +357,11 @@ def main() -> None:
         for item in steps:
             if isinstance(item, Result):
                 print(json.dumps({"digest": item.digest, "comparison": item.comparison, "url": item.url}, indent=2))
+            elif isinstance(item, Step):
+                skipped = " (skipped)" if item.skipped else ""
+                print(f"\r\033[K## {item.title}{': ' + item.detail if item.detail else ''}{skipped}", flush=True)
+            elif isinstance(item, Outcome):
+                print(f"\r\033[K{'✓' if item.ok else '✗'} {item.text}", flush=True)
             elif item.startswith("\r"):
                 # A progress bar, redrawn in place
                 print(f"\r\033[K{item[1:]}", end="", flush=True)
