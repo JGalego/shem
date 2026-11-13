@@ -246,7 +246,8 @@ frontend-models-test registry="localhost:5000":
     model=hf.co/trl-internal-testing/tiny-Qwen3ForCausalLM
     # The registry is on localhost, which a build's fetch reaches on the host's network
     build() { docker build -q --platform linux/riscv32 --allow network.host --build-arg SHEM_NEURAL_IMAGE=$reg/shem-neural:ci -t "$1" "$2" >/dev/null; }
-    layout() { docker save "$1" -o $dir/$1.tar && mkdir -p $dir/$1 && tar -xf $dir/$1.tar -C $dir/$1; }
+    # Images Docker built run from shem's store, as on Docker Desktop
+    load() { docker save "$1" | $shem load; }
     same() { [ "$1" = "$2" ] || { echo "expected the same reply:"; echo "$1"; echo "$2"; exit 1; }; }
 
     echo "--- WARM through docker build, as shem build primes it, from a file of the image too"
@@ -255,9 +256,9 @@ frontend-models-test registry="localhost:5000":
     printf "# syntax=$reg/shem-dockerfile:ci\n$shemfile" > $dir/warm/Dockerfile
     printf "$shemfile" > $dir/warm/Shemfile
     build shem-warm $dir/warm
-    layout shem-warm
+    load shem-warm
     $shem build -t warm $dir/warm
-    same "$($shem run $dir/shem-warm 'Who are you?')" "$($shem run warm 'Who are you?')"
+    same "$($shem run shem-warm 'Who are you?')" "$($shem run warm 'Who are you?')"
 
     echo "--- a ModelPack artifact as a base"
     printf "FROM $model\n" > $dir/model/Shemfile
@@ -265,14 +266,14 @@ frontend-models-test registry="localhost:5000":
     $shem push --plain-http --modelpack --uncompressed tiny $reg/shem-tests/tiny:modelpack
     printf "# syntax=$reg/shem-dockerfile:ci\nFROM $reg/shem-tests/tiny:modelpack\n" > $dir/artifact/Dockerfile
     build shem-artifact $dir/artifact
-    layout shem-artifact
-    same "$($shem run $dir/shem-artifact 'Hello')" "$($shem run $reg/shem-tests/tiny:modelpack 'Hello')"
+    load shem-artifact
+    same "$($shem run shem-artifact 'Hello')" "$($shem run $reg/shem-tests/tiny:modelpack 'Hello')"
 
     echo "--- a GGUF file"
     printf "# syntax=$reg/shem-dockerfile:ci\nFROM hf.co/Qwen/Qwen3-0.6B-GGUF:Q8_0\nENTRYPOINT [\"shem:generate\", \"--max-tokens\", \"8\"]\n" > $dir/gguf/Dockerfile
     build shem-gguf $dir/gguf
-    layout shem-gguf
-    $shem run $dir/shem-gguf 'Say hi.' | tee $dir/gguf.out
+    load shem-gguf
+    $shem run shem-gguf 'Say hi.' | tee $dir/gguf.out
     test -s $dir/gguf.out
 
 # Build and run the model examples, each in a store of its own, then the

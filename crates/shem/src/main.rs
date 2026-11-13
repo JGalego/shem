@@ -41,6 +41,10 @@ enum Command {
     /// Write an image as an OCI archive for `docker load`, to run with
     /// `docker run --runtime io.containerd.shem.v1`
     Save(SaveArgs),
+    /// Load images from an OCI archive, such as `docker save` writes, into
+    /// the store: to run images Docker built where the shim is not, as with
+    /// Docker Desktop
+    Load(LoadArgs),
     /// Boot an operating system kernel in VM mode, with its console on stdio
     Boot(BootArgs),
 }
@@ -186,6 +190,16 @@ struct SaveArgs {
 }
 
 #[derive(Args)]
+struct LoadArgs {
+    /// Read the archive from this file instead of stdin
+    #[arg(short, long, value_name = "FILE")]
+    input: Option<PathBuf>,
+    /// The name to store the image under, if not the one in the archive
+    #[arg(short, long)]
+    tag: Option<String>,
+}
+
+#[derive(Args)]
 struct PullArgs {
     /// Talk to the registry over plain HTTP, as to a local test registry
     #[arg(long)]
@@ -225,6 +239,7 @@ fn main() -> ExitCode {
         Command::Push(args) => push(args),
         Command::Pull(args) => pull(args),
         Command::Save(args) => save(args),
+        Command::Load(args) => load(args),
         Command::Boot(args) => boot(args),
     };
     match result {
@@ -579,6 +594,27 @@ fn save(args: SaveArgs) -> anyhow::Result<u8> {
             bail!("not writing an archive to a terminal: pipe it to `docker load` or give --output")
         }
         None => std::io::stdout().lock().write_all(&archive)?,
+    }
+    Ok(0)
+}
+
+fn load(args: LoadArgs) -> anyhow::Result<u8> {
+    use std::io::IsTerminal;
+    let store = Store::open()?;
+    let tag = args.tag.as_deref();
+    let names = match &args.input {
+        Some(path) => {
+            let file =
+                std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+            store.load(std::io::BufReader::new(file), tag)?
+        }
+        None if std::io::stdin().is_terminal() => {
+            bail!("no archive on stdin: pipe `docker save IMAGE` to it, or give --input")
+        }
+        None => store.load(std::io::stdin().lock(), tag)?,
+    };
+    for name in names {
+        println!("Loaded image: {name}");
     }
     Ok(0)
 }

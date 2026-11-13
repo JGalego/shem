@@ -82,6 +82,13 @@ docker run --rm --platform linux/riscv32 \
   --runtime io.containerd.shem.v1 "$image" "What is a golem?"
 ```
 
+On Docker Desktop, containerd runs in a VM that cannot see the shim, so run the image with shem instead ([Docker Desktop](docs/containerd.md#docker-desktop)):
+
+```sh
+docker save "$image" | shem load
+shem run "$image" "What is a golem?"
+```
+
 For RV32 programs, the [hello Dockerfile](examples/hello/Dockerfile) cross-compiles a static executable and copies it into `FROM scratch`. These use the reference vCPU by default; add `--annotation dev.shem.vcpu=neural` with the [neural vCPU server](docs/neural.md) running to execute on the compiled CPU instead. Language-model images use their session driver, not the vCPU.
 
 ### Cleaning up

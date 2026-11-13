@@ -249,6 +249,39 @@ struct Index {
     manifests: Vec<Descriptor>,
 }
 
+/// The blob `descriptor` names in the image layout `dir`, checked against
+/// its digest.
+fn read_blob(dir: &Path, descriptor: &Descriptor) -> anyhow::Result<Vec<u8>> {
+    let hex = descriptor
+        .digest
+        .strip_prefix("sha256:")
+        .context("unsupported digest")?;
+    let data = std::fs::read(dir.join("blobs/sha256").join(hex))?;
+    if digest(&data) != descriptor.digest {
+        bail!("blob {} does not match its digest", descriptor.digest);
+    }
+    Ok(data)
+}
+
+/// The image manifest that `entry` of the layout in `dir` leads to. An
+/// index, such as the manifest list BuildKit writes beside its attestations,
+/// holds the image for linux/riscv32 among others.
+fn layout_manifest(dir: &Path, entry: &Descriptor) -> anyhow::Result<Manifest> {
+    let mut data = read_blob(dir, entry)?;
+    while let Ok(nested) = serde_json::from_slice::<Index>(&data) {
+        let riscv = |d: &&Descriptor| {
+            d.platform
+                .as_ref()
+                .is_some_and(|p| p["architecture"] == "riscv32")
+        };
+        let entry = (nested.manifests.iter().find(riscv))
+            .or(nested.manifests.first())
+            .context("an index in the image layout lists no manifests")?;
+        data = read_blob(dir, entry)?;
+    }
+    Ok(serde_json::from_slice(&data)?)
+}
+
 /// A platform as `os/architecture[/variant]`, such as `linux/arm64/v8`, as
 /// an OCI descriptor's platform.
 fn parse_platform(text: &str) -> anyhow::Result<serde_json::Value> {
@@ -442,39 +475,13 @@ impl Image {
 
     /// Read the image an OCI image layout holds.
     pub fn read_layout(dir: &Path) -> anyhow::Result<Self> {
-        let blob = |descriptor: &Descriptor| -> anyhow::Result<Vec<u8>> {
-            let hex = descriptor
-                .digest
-                .strip_prefix("sha256:")
-                .context("unsupported digest")?;
-            let data = std::fs::read(dir.join("blobs/sha256").join(hex))?;
-            if digest(&data) != descriptor.digest {
-                bail!("blob {} does not match its digest", descriptor.digest);
-            }
-            Ok(data)
-        };
+        let blob = |descriptor: &Descriptor| read_blob(dir, descriptor);
         let index: Index = serde_json::from_slice(&std::fs::read(dir.join("index.json"))?)?;
-        let mut entry = index
+        let entry = index
             .manifests
             .first()
-            .context("the image layout has no manifest")?
-            .clone();
-        // An index, such as the manifest list BuildKit writes beside its
-        // attestations, holds the image for linux/riscv32 among others
-        let mut data = blob(&entry)?;
-        while let Ok(nested) = serde_json::from_slice::<Index>(&data) {
-            let riscv = |d: &&Descriptor| {
-                d.platform
-                    .as_ref()
-                    .is_some_and(|p| p["architecture"] == "riscv32")
-            };
-            entry = (nested.manifests.iter().find(riscv))
-                .or(nested.manifests.first())
-                .context("an index in the image layout lists no manifests")?
-                .clone();
-            data = blob(&entry)?;
-        }
-        let manifest: Manifest = serde_json::from_slice(&data)?;
+            .context("the image layout has no manifest")?;
+        let manifest = layout_manifest(dir, entry)?;
         let config = match manifest.config.media_type.as_str() {
             OCI_CONFIG_TYPE | DOCKER_CONFIG_TYPE => {
                 Config::from_oci(&serde_json::from_slice(&blob(&manifest.config)?)?)?
@@ -684,9 +691,14 @@ impl Store {
                     .join(".local/share/shem"),
             },
         };
-        Ok(Self {
+        Ok(Self::at(&home))
+    }
+
+    /// The store in `home`, as `SHEM_HOME` names it.
+    pub fn at(home: &Path) -> Self {
+        Self {
             root: home.join("images"),
-        })
+        }
     }
 
     /// The layout of the image twin of the ModelPack artifact in the layout

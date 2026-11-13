@@ -32,6 +32,18 @@ shem save IMAGE | docker load
 
 Keep both `--runtime io.containerd.shem.v1` and `--platform linux/riscv32`. Without the runtime, Docker tries the host CPU and fails with `exec format error`.
 
+### Docker Desktop
+
+Docker Desktop, on macOS, Windows and Linux, runs containerd in a VM of its own, which cannot see a shim installed on the host. Build images with Docker there, and run them with shem:
+
+```sh
+docker build --platform linux/riscv32 -t shem-hello examples/hello
+docker save shem-hello | shem load
+shem run shem-hello one two
+```
+
+`shem load` stores each image of the archive under the name `docker save` gave it, or under `--tag`, and refuses images for other platforms. Model images run the same way: `shem run` starts their session driver itself, without the model server.
+
 ## With containerd
 
 ```sh

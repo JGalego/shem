@@ -10,6 +10,7 @@ shem images                                   # list the store
 shem build -o hello.oci examples/hello        # or write an OCI image layout directory
 shem push hello ghcr.io/your-user/hello:1.0   # push to an OCI registry
 shem pull ghcr.io/your-user/hello:1.0         # pull into the store, and run it by that name
+docker save hello | shem load                 # or load an image docker build made
 ```
 
 ## With docker build
@@ -31,6 +32,8 @@ The published frontend and runtime images are built for `linux/amd64` and `linux
 ```sh
 docker build --platform linux/riscv32 -t golem .
 ```
+
+Run it with `docker run` through the [containerd shim](containerd.md#with-docker), or with `docker save golem | shem load` and `shem run golem`.
 
 The frontend translates shem instructions into Docker build stages:
 

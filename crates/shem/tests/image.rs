@@ -7,7 +7,7 @@ use std::path::Path;
 use common::*;
 use shem::container::Container;
 use shem::image::shemfile::{self, Instruction, Until};
-use shem::image::{self, BuildOptions, Image, STATE_TYPE, parse_reference};
+use shem::image::{self, BuildOptions, Image, STATE_TYPE, Store, parse_reference};
 use shem::linux::Stdio;
 use shem::reference::ReferenceVcpu;
 
@@ -217,6 +217,94 @@ fn images_save_as_docker_archives_with_their_state_as_files() {
     let state = fs::read(root.path().join(".shem/machine.state")).unwrap();
     assert_eq!(state, frozen.machine.encode());
     assert!(root.path().join(".shem/container.json").is_file());
+}
+
+#[test]
+fn docker_archives_load_into_the_store() {
+    let shemfile = "FROM scratch\nCOPY echo /bin/echo\nENTRYPOINT [\"/bin/echo\"]\nWARM --until=syscall:read\n";
+    let ctx = context(shemfile, &[("echo", echo())]);
+    let image = build(ctx.path()).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::at(home.path());
+
+    // Listed under another platform too, so the image is in a nested index
+    let archive = image
+        .docker_archive("echo", &["linux/amd64".to_string()])
+        .unwrap();
+    assert_eq!(store.load(&archive[..], None).unwrap(), ["echo:latest"]);
+    let loaded = Image::read_layout(&store.path("echo").unwrap()).unwrap();
+    assert_eq!(loaded.warm_state().unwrap(), image.warm_state().unwrap());
+    assert_eq!(run(&loaded, &[], b"ping\n"), (0, b"ping\n".to_vec()));
+
+    // Under a name of its own, which a second load replaces
+    store.load(&archive[..], Some("team/echo:1")).unwrap();
+    store.load(&archive[..], Some("team/echo:1")).unwrap();
+    let names: Vec<String> = store.list().unwrap().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["echo:latest", "team/echo:1"]);
+}
+
+/// A tar of `files`, as an archive to load.
+fn tar_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut tar = tar::Builder::new(Vec::new());
+    for (name, data) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, name, *data).unwrap();
+    }
+    tar.into_inner().unwrap()
+}
+
+#[test]
+fn loading_refuses_other_platforms_and_damaged_blobs() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::at(home.path());
+    let blob = |data: &[u8]| format!("blobs/sha256/{}", &image::digest(data)[7..]);
+    let json = |value: serde_json::Value| serde_json::to_vec(&value).unwrap();
+
+    // An image built without --platform linux/riscv32
+    let config = json(serde_json::json!({ "architecture": "amd64", "os": "linux" }));
+    let manifest = json(serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": image::digest(&config),
+            "size": config.len(),
+        },
+        "layers": [],
+    }));
+    let index = json(serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": image::digest(&manifest),
+            "size": manifest.len(),
+            "annotations": { "io.containerd.image.name": "docker.io/library/web:latest" },
+        }],
+    }));
+    let amd64 = tar_of(&[
+        ("index.json", &index),
+        (&blob(&config), &config),
+        (&blob(&manifest), &manifest),
+    ]);
+    let err = store.load(&amd64[..], None).unwrap_err().to_string();
+    assert!(err.contains("--platform linux/riscv32"), "{err}");
+
+    // A blob that is not what its name says
+    let damaged = tar_of(&[("index.json", &index), (&blob(&config), b"{}")]);
+    let err = store.load(&damaged[..], None).unwrap_err().to_string();
+    assert!(err.contains("does not match its digest"), "{err}");
+
+    // Neither an archive without a name, unless the load gives it one
+    let unnamed = String::from_utf8(index.clone())
+        .unwrap()
+        .replace("io.containerd.image.name", "other");
+    let anonymous = tar_of(&[("index.json", unnamed.as_bytes())]);
+    let err = store.load(&anonymous[..], None).unwrap_err().to_string();
+    assert!(err.contains("--tag"), "{err}");
+    assert!(store.list().unwrap().is_empty());
 }
 
 #[test]

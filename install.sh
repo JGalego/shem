@@ -143,4 +143,9 @@ case ":$PATH:" in
     *) info "Add $install_dir to your PATH" ;;
 esac
 command -v oras >/dev/null 2>&1 || info "Pulling and pushing images needs ORAS: https://oras.land/docs/installation"
+# Docker Desktop, and Docker on macOS, run containerd in a VM, which cannot
+# see the shim: Docker builds images there, and shem runs them
+if [ "$os" = Darwin ] || docker info --format '{{.OperatingSystem}}' 2>/dev/null | grep -q 'Docker Desktop'; then
+    info "Docker runs containers in a VM here, where the shim is not. Run the images docker build makes with: docker save IMAGE | shem load && shem run IMAGE"
+fi
 info "Done. Try: shem run ghcr.io/jgalego/shem/hello:latest"
