@@ -43,16 +43,21 @@ pub fn neural_project() -> Option<PathBuf> {
         .then_some(checkout)
 }
 
+/// The module of the neural package that imports models.
+const IMPORTER: &str = "shem_neural.model.importers";
+
 /// Run a module of the neural package with uv: from its source when there
-/// is one, otherwise the release on PyPI that matches this binary.
+/// is one, otherwise the release on PyPI that matches this binary. The
+/// importer gets the `gguf` extra too, which reads GGUF files.
 fn python(module: &str) -> Command {
     let mut command = Command::new("uv");
     command.args(["run", "--quiet"]);
     match neural_project() {
         Some(project) => command.arg("--project").arg(project),
-        None => command
-            .args(["--no-project", "--with"])
-            .arg(concat!("shem-neural==", env!("CARGO_PKG_VERSION"))),
+        None => command.args(["--no-project", "--with"]).arg(match module {
+            IMPORTER => concat!("shem-neural[gguf]==", env!("CARGO_PKG_VERSION")),
+            _ => concat!("shem-neural==", env!("CARGO_PKG_VERSION")),
+        }),
     };
     command.args(["python", "-m", module]);
     // Tools' programs run through this shem, on the model's compiled layer
@@ -87,7 +92,7 @@ pub fn compile(name: &str, out: &Path) -> anyhow::Result<()> {
 /// a Hugging Face model (in a repo of GGUF files, `revision` names a
 /// quantization), or a checkpoint's directory or GGUF file, by its full path.
 pub fn import(repo: &str, revision: Option<&str>, out: &Path) -> anyhow::Result<()> {
-    let mut command = python("shem_neural.model.importers");
+    let mut command = python(IMPORTER);
     command.arg(repo).arg(out);
     if let Some(revision) = revision {
         command.args(["--revision", revision]);
@@ -105,7 +110,7 @@ pub fn import(repo: &str, revision: Option<&str>, out: &Path) -> anyhow::Result<
 /// besides its own files, which stay where they are: the manifest, and an
 /// index or a chat template if the checkpoint has none.
 pub fn import_in_place(dir: &Path, out: &Path) -> anyhow::Result<()> {
-    let status = python("shem_neural.model.importers")
+    let status = python(IMPORTER)
         .arg(dir)
         .arg(out)
         .arg("--in-place")

@@ -28,7 +28,7 @@ CMD ["Introduce yourself in one sentence."]
 | GGUF repository and quantization | `FROM hf.co/Qwen/Qwen3-0.6B-GGUF:Q8_0` |
 | GGUF file in the build context | `FROM model.gguf` |
 
-GGUF import uses transformers to dequantize into float32. It requires `shem-neural[gguf]`, included in the `shem-neural` image.
+GGUF import uses transformers to dequantize into float32, from the `gguf` extra of shem-neural, which a release of shem fetches with its importer and the `shem-neural` image includes.
 
 Model bases set `ENTRYPOINT ["shem:generate"]`. `ENTRYPOINT` and `CMD` keep their Docker meanings:
 
