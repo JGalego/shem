@@ -77,11 +77,16 @@ class Log:
 
     def __init__(self):
         self.steps: list[dict] = []
+        self.began = time.monotonic()
+        #: Every line, as (seconds since the start, text), for the raw log
+        self.raw: list[tuple[float, str]] = []
 
     def add(self, item: str | Step | Outcome) -> None:
         now = time.monotonic()
         if isinstance(item, Step):
             self.end("done")
+            skipped = " (skipped)" if item.skipped else ""
+            self.raw.append((now - self.began, f"## {item.title}{' — ' + item.detail if item.detail else ''}{skipped}"))
             state = "skipped" if item.skipped else "running"
             self.steps.append(
                 dict(
@@ -101,17 +106,28 @@ class Log:
         step = self.steps[-1]
         if isinstance(item, Outcome):
             step["outcome"] = item.text
+            self.raw.append((now - self.began, f"{'✓' if item.ok else '✗'} {item.text}"))
             self.end("done" if item.ok else "failed")
         elif item.startswith("\r"):
             step["bar"] = item[1:]
         else:
             step["bar"] = None
             step["lines"] = [*step["lines"][-KEEP:], item]
+            self.raw.append((now - self.began, item))
 
     def end(self, state: str) -> None:
         """End the step that runs, if one does, in `state`."""
         if self.steps and self.steps[-1]["state"] == "running":
             self.steps[-1].update(state=state, end=time.monotonic())
+
+    def text(self) -> str:
+        """The raw log: every line, after the time since the start, and the
+        progress bar that is drawing, if one is."""
+        lines = [f"{int(t) // 60:02d}:{int(t) % 60:02d}  {text}" for t, text in self.raw]
+        if self.steps and self.steps[-1]["bar"]:
+            t = time.monotonic() - self.began
+            lines.append(f"{int(t) // 60:02d}:{int(t) % 60:02d}  {self.steps[-1]['bar']}")
+        return "\n".join(lines)
 
     def html(self) -> str:
         if not self.steps:

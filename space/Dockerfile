@@ -31,6 +31,6 @@ USER user
 # elsewhere, without SPACE_ID, it mocks the login as before
 ENV SYSTEM=spaces
 WORKDIR /home/user/app
-COPY --chown=user app.py convert.py ./
+COPY --chown=user *.py ./
 EXPOSE 7860
 CMD ["python", "app.py"]
