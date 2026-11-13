@@ -17,12 +17,14 @@ Each step's output is yielded as it comes, a line at a time.
 """
 
 import argparse
+import codecs
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,15 +131,35 @@ def target(user: str, source: str) -> str:
     return f"{user}/{re.sub(r'[^a-z0-9._-]', '-', name)}-shem"
 
 
+#: How often a progress bar's redraws are passed on, in seconds
+REDRAW = 0.5
+
+
 def run(command: list[str], env: dict[str, str]) -> Iterator[str]:
-    """Run `command`, yielding its output a line at a time."""
-    process = subprocess.Popen(
-        command, env=os.environ | env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-    )
+    """Run `command`, yielding its output as it comes, a line at a time. A
+    progress bar, which redraws its line after a carriage return, comes as
+    that line with a carriage return in front, at most every REDRAW seconds,
+    and once more as a plain line when it ends."""
+    # Python, which shem runs, buffers what it writes to a pipe unless told not to
+    env = os.environ | {"PYTHONUNBUFFERED": "1"} | env
+    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     assert process.stdout
-    for line in process.stdout:
-        # Progress bars redraw with carriage returns: their last state is enough
-        yield line.rstrip("\n").split("\r")[-1]
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending, bar, shown = "", None, 0.0
+    while chunk := process.stdout.read1(1 << 16):
+        pending += decoder.decode(chunk)
+        while end := re.search(r"[\r\n]", pending):
+            text, ending, pending = pending[: end.start()], end.group(), pending[end.end() :]
+            if ending == "\r":
+                bar = text or bar
+                if text and time.monotonic() - shown > REDRAW:
+                    shown = time.monotonic()
+                    yield "\r" + text
+            elif text or bar:
+                yield text or bar
+                bar = None
+    if pending:
+        yield pending
     if process.wait():
         raise RuntimeError(f"{command[0]} {command[1]} failed ({process.returncode})")
 
@@ -306,8 +328,11 @@ def main() -> None:
         for item in steps:
             if isinstance(item, Result):
                 print(json.dumps({"digest": item.digest, "comparison": item.comparison, "url": item.url}, indent=2))
+            elif item.startswith("\r"):
+                # A progress bar, redrawn in place
+                print(f"\r\033[K{item[1:]}", end="", flush=True)
             else:
-                print(item, flush=True)
+                print(f"\r\033[K{item}", flush=True)
 
 
 if __name__ == "__main__":
