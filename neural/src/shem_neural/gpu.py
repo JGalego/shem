@@ -13,6 +13,8 @@ A guest stops at its first exit and keeps that exit's reason and detail;
 services exits, still steps guests on the CPU.
 """
 
+import gc
+
 import torch
 
 from .compile import to
@@ -76,7 +78,10 @@ class Batch:
 
     def _capture(self) -> None:
         """Warm up on a side stream, as capture requires, then record
-        `graph_steps` steps."""
+        `graph_steps` steps. A batch is a reference cycle, through its step,
+        so only the garbage collector frees one, and with it its graph; a
+        graph freed during another one's capture invalidates that capture.
+        So the collector runs first, and not during it."""
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
@@ -84,6 +89,13 @@ class Batch:
                 self.step()
         torch.cuda.current_stream().wait_stream(side)
         self._graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._graph):
-            for _ in range(self.graph_steps):
-                self.step()
+        collecting = gc.isenabled()
+        gc.collect()
+        gc.disable()
+        try:
+            with torch.cuda.graph(self._graph):
+                for _ in range(self.graph_steps):
+                    self.step()
+        finally:
+            if collecting:
+                gc.enable()

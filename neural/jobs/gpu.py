@@ -20,6 +20,7 @@ tree. It runs locally too, with `--local`, on whatever device torch finds.
 """
 
 import argparse
+import gc
 import io
 import json
 import sys
@@ -205,7 +206,10 @@ def throughput(neural, weights, device: str, sizes: list[int], seconds: float) -
             row = {"mode": mode, "guests": size, "error": "out of memory"}
             print(f"{mode:>15} {size:>7} guests: out of memory", flush=True)
         rows.append(row)
+        # A batch is a reference cycle: collect it, and its memory and graph,
+        # before the next one, which would otherwise start with less memory
         del batch
+        gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
     return rows
