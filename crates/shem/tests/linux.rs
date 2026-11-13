@@ -605,6 +605,23 @@ fn sendfile_into_a_pipe_loses_nothing_the_pipe_had_no_room_for() {
 }
 
 #[test]
+fn file_times_past_what_64_bits_of_nanoseconds_hold_are_refused() {
+    let mut g = Guest::new();
+    fs::write(g.host("file"), b"").unwrap();
+    let path = g.cstr("/file");
+    let mut times = Vec::new();
+    for (sec, nsec) in [(i64::MAX, 0i64), (0, 0)] {
+        times.extend(sec.to_le_bytes());
+        times.extend(nsec.to_le_bytes());
+    }
+    let times = g.put(&times);
+    assert_eq!(
+        g.call(UTIMENSAT_TIME64, &[AT_FDCWD, path, times, 0]),
+        EINVAL
+    );
+}
+
+#[test]
 fn files_map_as_private_copies() {
     let mut g = Guest::new();
     let data: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();

@@ -1061,7 +1061,14 @@ impl Process {
                 *stamp = match nsec {
                     UTIME_NOW => Some(now),
                     UTIME_OMIT => None,
-                    0..1_000_000_000 if sec >= 0 => Some(sec as u64 * NS_PER_SEC + nsec as u64),
+                    // A time past what nanoseconds since 1970 hold in 64 bits
+                    // is refused, as one before 1970 is
+                    0..1_000_000_000 if sec >= 0 => Some(
+                        (sec as u64)
+                            .checked_mul(NS_PER_SEC)
+                            .and_then(|ns| ns.checked_add(nsec as u64))
+                            .ok_or(Errno::EINVAL)?,
+                    ),
                     _ => return Err(Errno::EINVAL),
                 };
             }
@@ -1424,13 +1431,6 @@ fn guest_ino(root: Option<&RootFs>, dev: u64, ino: u64) -> u64 {
 /// are set, not its target's. Failing to set them is not the guest's problem,
 /// so errors are ignored.
 fn stamp(path: &std::path::Path, access: Option<u64>, modify: Option<u64>) {
-    let timespec = |ns: Option<u64>| match ns {
-        Some(ns) => libc::timespec {
-            tv_sec: (ns / NS_PER_SEC) as libc::time_t,
-            tv_nsec: (ns % NS_PER_SEC) as libc::c_long,
-        },
-        None => libc::timespec {
-            tv_sec: 0,
     let _ = set_times(path, access, modify);
 }
 
@@ -1441,6 +1441,13 @@ fn set_times(
     access: Option<u64>,
     modify: Option<u64>,
 ) -> Result<(), Errno> {
+    let timespec = |ns: Option<u64>| match ns {
+        Some(ns) => libc::timespec {
+            tv_sec: (ns / NS_PER_SEC) as libc::time_t,
+            tv_nsec: (ns % NS_PER_SEC) as libc::c_long,
+        },
+        None => libc::timespec {
+            tv_sec: 0,
             tv_nsec: libc::UTIME_OMIT,
         },
     };
