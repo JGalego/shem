@@ -2,7 +2,7 @@
 
 > **Updates**
 >
-> - **2026-11-14**: [Hugging Face Spaces](#-the-hub-is-a-registry-now): one turns any supported checkpoint into a shem image in your account, the other serves every repo on the Hub as an OCI registry.
+> - **2026-11-14**: [Hugging Face Spaces](#🤗-the-hub-is-a-registry-now): one turns any supported checkpoint into a shem image in your account, the other serves every repo on the Hub as an OCI registry.
 > - **2026-11-13**: [shem 0.2.0](https://github.com/JGalego/shem/releases/tag/v0.2.0) imports many more model families, including mixtures of experts, Mamba and GGUF files. It also pushes and runs [ModelPack](https://github.com/modelpack/model-spec) artifacts, publishes sessions as artifacts linked to their models, and mounts model images as Kubernetes image volumes.
 
 I wanted to find out what happens if you take "it's just a container" much too seriously. So I built [shem](https://github.com/JGalego/shem), a container runtime that does two silly things. It runs language models as containers and it runs containers on a CPU made of model weights.
@@ -16,13 +16,15 @@ The name comes from the golem legend: a clay figure wakes up when someone puts a
 
 **Contents**
 
-- [🚧 Please don't run this in production](#-please-dont-run-this-in-production)
-- [📦 Stage 1: A model is just an image](#-stage-1-a-model-is-just-an-image)
-- [💬 Stage 2: A conversation is just a layer](#-stage-2-a-conversation-is-just-a-layer)
-- [🧠 Stage 3: The machine is a model too](#-stage-3-the-machine-is-a-model-too)
-- [🤔 So why bother?](#-so-why-bother)
-- [🤗 The Hub is a registry now](#-the-hub-is-a-registry-now)
-- [🧪 Try it](#-try-it)
+- [🚧 Please don't run this in production](#🚧-please-dont-run-this-in-production)
+- [📦 Stage 1: A model is just an image](#📦-stage-1-a-model-is-just-an-image)
+- [💬 Stage 2: A conversation is just a layer](#💬-stage-2-a-conversation-is-just-a-layer)
+- [🧠 Stage 3: The machine is a model too](#🧠-stage-3-the-machine-is-a-model-too)
+- [🤔 So why bother?](#🤔-so-why-bother)
+- [🤗 The Hub is a registry now](#🤗-the-hub-is-a-registry-now)
+- [🧪 Try it](#🧪-try-it)
+
+<a id="🚧-please-dont-run-this-in-production"></a>
 
 ## 🚧 Please don't run this in production
 
@@ -40,6 +42,8 @@ Still here? Good. Meet the cast:
 - 🐳 **The shim**: `io.containerd.shem.v1`, the door Docker and Kubernetes walk through.
 
 There are three stages to taking a joke too far...
+
+<a id="📦-stage-1-a-model-is-just-an-image"></a>
 
 ## 📦 Stage 1: A model is just an image
 
@@ -69,6 +73,8 @@ Under the hood, every transformer block gets its own weights file, and every wei
 
 Shipping models in container-shaped boxes isn't new. There's even a CNCF standard for it, [ModelPack](https://github.com/modelpack/model-spec), which tools like [KitOps](https://kitops.org) and [llmman](https://github.com/llmmanorg/llmman) implement, and Ollama's Modelfile and Docker Model Runner do their own versions. Those carry the weights as data for an inference server to load. Stage 2 is where shem wanders off.
 
+<a id="💬-stage-2-a-conversation-is-just-a-layer"></a>
+
 ## 💬 Stage 2: A conversation is just a layer
 
 A model in the middle of a conversation has state. For attention layers, that's the KV cache. Qwen3.5 also has Gated DeltaNet layers, which keep a fixed-size memory matrix per head. A container has state too, and Docker has had verbs for freezing state into images since forever.
@@ -97,6 +103,8 @@ docker commit clay golem:remembers
 The containerd shim also lets Kubernetes run model sessions through a RuntimeClass, the same way runwasi runs WebAssembly.
 
 A Pod can be a conversation now. I'm... so... sorry!
+
+<a id="🧠-stage-3-the-machine-is-a-model-too"></a>
 
 ## 🧠 Stage 3: The machine is a model too
 
@@ -133,11 +141,15 @@ Qwen3-0.6B asks for the tool, a C program runs on a CPU made of weights, and the
 
 Compiling is deterministic, so every build gets the same CPU weights, and they're on the Hub with a model card at [jgalego/shem-rv32im](https://huggingface.co/jgalego/shem-rv32im). They pass all 60 official riscv-tests, which I suspect not many models on the Hub can say.
 
+<a id="🤔-so-why-bother"></a>
+
 ## 🤔 So why bother?
 
 The neural vCPU is a toy. A beautiful, very slow toy.
 
 I think the model containers are more useful. A model with its tokenizer, prompt and session becomes one artifact with a digest. You can build it, pin it, push it, run it, exec into it and commit it with existing tools and registries. Decoding is greedy and runs in float32, so the same image, prompt and device give the same reply every time. That beats a README that ends in "pip install these and good luck".
+
+<a id="🤗-the-hub-is-a-registry-now"></a>
 
 ## 🤗 The Hub is a registry now
 
@@ -159,6 +171,8 @@ oras pull jgalego-shem-registry.hf.space/qwen/qwen3-0.6b
 
 ![The shem registry Space: opening Qwen/Qwen3-0.6B shows it as a ModelPack artifact, a shem image's page shows its system prompt, model and comparison with transformers, and the home page counts a docker pull as it happens.](https://raw.githubusercontent.com/JGalego/shem/main/docs/assets/shem-registry.gif)
 *Figure 5: Weights from the Hub, the rest from the registry*
+
+<a id="🧪-try-it"></a>
 
 ## 🧪 Try it
 
