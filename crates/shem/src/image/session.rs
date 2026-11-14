@@ -66,9 +66,14 @@ pub fn publish(image: &Image, root: &Path, out: &Path, tag: &str) -> anyhow::Res
         bail!("the image's session is not a {FORMAT} session");
     }
 
-    // The model the session belongs to: the image as it was before WARM
+    // The model the session belongs to: the image as it was before WARM,
+    // its history without the step that made the session, the last layer
+    let mut config = image.config.clone();
+    if let Some(at) = config.history.iter().rposition(|h| !h.empty_layer) {
+        config.history.remove(at);
+    }
     let model = Image {
-        config: image.config.clone(),
+        config,
         layers: (image.layers.iter())
             .filter(|l| l.media_type != STATE_TYPE)
             .cloned()
