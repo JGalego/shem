@@ -148,6 +148,8 @@ shem is now on Hugging Face Spaces.
 ![The shem my repo Space converts HuggingFaceTB/SmolLM2-135M-Instruct with a system prompt: it builds the image, compares it with transformers, and pushes it and its ModelPack artifact to jgalego/smollm2-135m-instruct-shem with a model card.](https://raw.githubusercontent.com/JGalego/shem/main/docs/assets/shem-my-repo.gif)
 *Figure 4: From checkpoint to verified image*
 
+[jgalego/smollm2-135m-instruct-shem](https://huggingface.co/jgalego/smollm2-135m-instruct-shem) and [jgalego/gemma-3-270m-it-shem](https://huggingface.co/jgalego/gemma-3-270m-it-shem) are ready-made examples you can `shem run` straight from the Hub.
+
 [shem registry](https://huggingface.co/spaces/jgalego/shem-registry) serves every model repo on the Hub as an OCI registry. Repos that hold a shem image are served as that image, and the rest as ModelPack artifacts built on request. Weights are never copied: pulls redirect to the Hub's own storage. Log in with your Hugging Face token for gated and private repos.
 
 ```sh
