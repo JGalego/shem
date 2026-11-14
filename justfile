@@ -111,10 +111,16 @@ containerd-test: toolchain
     docker save shem-hello:latest | sudo ctr images import -
     # The shim traces every request here, and what it wrote to each stream
     sudo mkdir -p /run/shem
-    status=0
-    timeout 120 sudo ctr run --rm --runtime io.containerd.shem.v1 docker.io/library/shem-hello:latest shem-test /hello one two > target/oci-hello/out.txt || status=$?
-    cat target/oci-hello/out.txt
-    echo "ctr run exited with status $status (the program exits with its argument count, 3)"
+    # ctr run --rm may delete the task, and with it the copy of its output, before
+    # it has read what a container that lives milliseconds wrote: the shim writes
+    # and closes the streams before it publishes the exit. A real fault repeats.
+    for attempt in 1 2 3; do
+        status=0
+        timeout 120 sudo ctr run --rm --runtime io.containerd.shem.v1 docker.io/library/shem-hello:latest shem-test /hello one two > target/oci-hello/out.txt || status=$?
+        cat target/oci-hello/out.txt
+        echo "ctr run exited with status $status (the program exits with its argument count, 3), attempt $attempt"
+        grep -q "sum of squares below 100000" target/oci-hello/out.txt && break
+    done
     if ! grep -q "sum of squares below 100000" target/oci-hello/out.txt; then
         echo "--- the shim's trace"; sudo cat /run/shem/shim.log || true
         echo "--- containerd"; sudo journalctl -u containerd --no-pager | grep -iE 'shem|error|warn' | tail -30 || true
