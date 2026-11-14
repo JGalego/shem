@@ -1,0 +1,43 @@
+# A Hugging Face checkpoint mounted as an image volume and run by
+# transformers, without shem on the node: `shem registry` serves the repo as
+# an image of its files, here the shem registry Space, and of the files of
+# one format of weights, without the repo's ONNX exports. No image is built
+# or pushed first:
+#
+#   kubectl apply -f examples/kubernetes/hub-volume.yaml
+#   kubectl logs -f smollm2-hub-volume
+#
+# Image volumes need the ImageVolume feature gate, where it is still off.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smollm2-hub-volume
+spec:
+  restartPolicy: Never
+  containers:
+    - name: transformers
+      image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+      command:
+        - uv
+        - run
+        - --no-project
+        - --with=transformers
+        - --with=torch
+        - --index=https://download.pytorch.org/whl/cpu
+        - --index-strategy=unsafe-best-match
+        - python
+        - -c
+        - |
+          from transformers import pipeline
+          chat = pipeline("text-generation", "/models/smollm2")
+          messages = [{"role": "user", "content": "What is a golem? Answer in one sentence."}]
+          print(chat(messages, max_new_tokens=48, do_sample=False)[0]["generated_text"][-1]["content"])
+      volumeMounts:
+        - name: smollm2
+          mountPath: /models/smollm2
+          readOnly: true
+  volumes:
+    - name: smollm2
+      image:
+        reference: jgalego-shem-registry.hf.space/safetensors/huggingfacetb/smollm2-135m-instruct
+        pullPolicy: IfNotPresent

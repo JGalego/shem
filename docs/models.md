@@ -248,6 +248,7 @@ docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 localho
 | `GET /v2/ORG/NAME/manifests/sha256:…` | That blob, from `main` or a revision already served |
 | `GET /v2/ORG/NAME/blobs/sha256:…` | Up to 1 MB, the blob; larger, a redirect to where Hugging Face keeps it, so weights never pass through the registry |
 | `GET /v2/ORG/NAME/tags/list` | `latest`, the other branches, and the tags |
+| `GET /v2/files/ORG/NAME/…` | The same, for [an image of a checkpoint's files](#checkpoints-as-images-of-their-files); `safetensors/ORG/NAME` and other formats' names, for the files of one format of weights |
 | `PUT`, `POST`, `PATCH`, `DELETE` | `405`: push with `shem push IMAGE hf.co/ORG/NAME` |
 
 A repo that holds a checkpoint rather than an image is served as a ModelPack artifact made on request: a raw layer for each file but `.gitattributes`, at its path, typed as weights, documents, code or configs, and a model config from what the Hub says of the repo. A large file's layer is the file itself, named by the sha256 the Hub keeps for it, so it redirects to the Hub like any large blob; small files are downloaded once to learn their digests. The same commit makes the same artifact. `oras pull localhost:5000/huggingfacetb/smollm2-135m-instruct` downloads the repo's files, and `shem run localhost:5000/huggingfacetb/smollm2-135m-instruct` runs its image twin, which wraps each file in a tar of its own. The artifact is the whole repo, ONNX exports and all, where `shem run hf.co/…` downloads only what the import needs.
@@ -270,7 +271,36 @@ oras pull jgalego-shem-registry.hf.space/qwen/qwen3-0.6b
 
 ![The shem registry Space: opening Qwen/Qwen3-0.6B shows it as a ModelPack artifact, a shem image's page shows its system prompt, model and comparison with transformers, and the home page counts a docker pull as it happens.](assets/shem-registry.gif)
 
-Outside `/v2/`, the registry serves pages for people. `/` has a search box, counts of the repos served, the pulls, and the bytes sent from the Hub and from the registry, and the repos pulled since it started, last pulled first. `/ORG/NAME?tag=TAG` shows an image as a model page: badges for its comparison with transformers (from the repo's `comparison.json`), size, precision, licence and primed session; its system prompt, the model from its `shem.json`, its entrypoint and its layers; and beside them, the commands to use it with shem, oras or Docker, its digest, its source checkpoint and its tags. Open pages stay current: they ask `/live` whether what they show has changed, every 3 seconds for the home page and every 15 for a repo's, which asks the Hub for the revision's commit, and show the new version without reloading.
+Outside `/v2/`, the registry serves pages for people. `/` has a search box, counts of the repos served, the pulls, and the bytes sent from the Hub, from the Hub as tars and from the registry, and the repos pulled since it started, last pulled first. `/ORG/NAME?tag=TAG` shows an image as a model page: badges for its comparison with transformers (from the repo's `comparison.json`), size, precision, licence and primed session; its system prompt, the model from its `shem.json`, its entrypoint and its layers; and beside them, the commands to use it with shem, oras or Docker, its digest, its source checkpoint and its tags. Open pages stay current: they ask `/live` whether what they show has changed, every 3 seconds for the home page and every 15 for a repo's, which asks the Hub for the revision's commit, and show the new version without reloading.
+
+### Checkpoints as images of their files
+
+Docker, containerd and Kubernetes take images, not artifacts: layers that are tars, listed for the host's platform. The registry serves every checkpoint's repo that way too, under `files/`, with the repo's files at the root of the filesystem:
+
+```sh
+docker pull localhost:5000/files/huggingfacetb/smollm2-135m             # every file of the repo
+docker pull localhost:5000/safetensors/huggingfacetb/smollm2-135m-instruct   # without its ONNX exports
+```
+
+```dockerfile
+FROM python:3.12-slim
+COPY --from=localhost:5000/safetensors/huggingfacetb/smollm2-135m-instruct / /models/smollm2/
+```
+
+The image is listed for `linux/amd64` and `linux/arm64`, and has no entrypoint: it is files, for a Dockerfile to copy, or to mount as a [Kubernetes image volume](kubernetes.md#hugging-face-checkpoints-as-image-volumes) or with `docker run --mount type=image`. A mounted image is not copied into another: the weights stay on the Hub, and no registry keeps a copy of them.
+
+| Name | Files |
+|---|---|
+| `files/ORG/NAME` | All of the repo's but `.gitattributes` |
+| `safetensors/ORG/NAME` | Without those of other formats of weights, by the extensions in their names: no `model.onnx`, `model.onnx_data` or `pytorch_model.bin` |
+| `gguf/`, `onnx/`, `bin/`, `pt/`, `pth/`, `ckpt/`, `h5/`, `msgpack/`, `tflite/` | The same, for that format |
+
+- Files up to 1 MB, and those Git keeps itself, share the first layer, which the registry makes and serves.
+- Each larger file is a layer of its own: an uncompressed tar of the file, which is the file between a 512-byte header and padding. Past 95 such files, neighbours share layers.
+- A tar's digest is not the file's, which is the one the Hub knows. The registry reads each large file through once to learn it, so the first pull of a repo waits for that, and afterwards sends the layer as it reads the file from the Hub again. It keeps the digests in memory, by file, and stores no weights. A commit that changes other files reads none of them again.
+- These layers pass through the registry, as nothing else does. `--files-limit 16G` refuses to make an image of a checkpoint with more weights than that left to read, which a registry anyone may reach should set. The artifact, at the repo's own name, is served whatever its size.
+- Tags are the repo's revisions, as for the artifact. A repo that holds an image has no image of its files: pull it by its own name.
+- A layer answers `Range` requests, so an interrupted pull resumes.
 
 ### Comparing an import with transformers
 

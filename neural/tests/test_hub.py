@@ -268,8 +268,8 @@ def serving(api, monkeypatch):
     servers = [cdn]
     threading.Thread(target=cdn.serve_forever, daemon=True).start()
 
-    def start(public=False):
-        server = registry.serve(("127.0.0.1", 0), registry.Hub(api), public)
+    def start(public=False, limit=None):
+        server = registry.serve(("127.0.0.1", 0), registry.Hub(api), public, limit)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)
         return server
@@ -284,11 +284,11 @@ def served(serving, pushed):
     return serving()
 
 
-def get(server, path: str, headers: dict | None = None):
+def get(server, path: str, headers: dict | None = None, method: str = "GET"):
     import http.client
 
     connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
-    connection.request("GET", path, headers=headers or {})
+    connection.request(method, path, headers=headers or {})
     response = connection.getresponse()
     return response.status, dict(response.getheaders()), response.read()
 
@@ -491,6 +491,118 @@ def test_oras_pulls_a_checkpoints_files(served, checkpoint, tmp_path):
     for path, data in checkpoint.items():
         if path != ".gitattributes":
             assert (tmp_path / "out" / path).read_bytes() == data
+
+
+def unpacked(server, repo: str, manifest: dict) -> dict[str, bytes]:
+    """The files an image's layers hold, each layer checked against its descriptor."""
+    found = {}
+    for layer in manifest["layers"]:
+        status, headers, data = get(server, f"/v2/{repo}/blobs/{layer['digest']}")
+        assert status == 200 and int(headers["Content-Length"]) == layer["size"] == len(data)
+        assert "sha256:" + hashlib.sha256(data).hexdigest() == layer["digest"]
+        with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+            for member in archive:
+                assert (member.mode, member.uid, member.mtime) == (0o644, 0, 0)
+                found[member.name] = archive.extractfile(member).read()
+    return found
+
+
+def test_checkpoint_repos_are_images_of_their_files_too(served, checkpoint):
+    status, headers, body = get(served, "/v2/files/org/ckpt/manifests/latest")
+    index = json.loads(body)
+    assert status == 200 and headers["Content-Type"] == index["mediaType"] == "application/vnd.oci.image.index.v1+json"
+    assert headers["Docker-Content-Digest"] == "sha256:" + hashlib.sha256(body).hexdigest()
+    platforms = [entry["platform"] for entry in index["manifests"]]
+    assert platforms == [{"architecture": a, "os": "linux"} for a in ("amd64", "arm64")]
+    files = {path: data for path, data in checkpoint.items() if path != ".gitattributes"}
+    layers = None
+    for entry in index["manifests"]:
+        status, headers, body = get(served, f"/v2/files/org/ckpt/manifests/{entry['digest']}")
+        manifest = json.loads(body)
+        assert status == 200 and headers["Content-Type"] == MANIFEST == entry["mediaType"]
+        config = json.loads(get(served, f"/v2/files/org/ckpt/blobs/{manifest['config']['digest']}")[2])
+        assert (config["architecture"], config["os"]) == (entry["platform"]["architecture"], "linux")
+        # Uncompressed layers, so what they unpack to is what they are
+        assert config["rootfs"]["diff_ids"] == [layer["digest"] for layer in manifest["layers"]]
+        assert {layer["mediaType"] for layer in manifest["layers"]} == {"application/vnd.oci.image.layer.v1.tar"}
+        # Every platform's image is of the same layers: the small files, then the weights
+        assert layers in (None, manifest["layers"])
+        layers = manifest["layers"]
+        assert unpacked(served, "files/org/ckpt", manifest) == files
+    assert len(layers) == 2 and layers[1]["size"] == 512 + len(WEIGHTS) + 1024
+    # The same commit makes the same image, and its tags are the repo's
+    assert json.loads(get(served, "/v2/files/org/ckpt/manifests/latest")[2]) == index
+    assert json.loads(get(served, "/v2/files/org/ckpt/tags/list")[2]) == {"name": "files/org/ckpt", "tags": ["latest"]}
+    # A layer of weights is as long as it says before it is sent, and sends the part asked for
+    blob = f"/v2/files/org/ckpt/blobs/{layers[1]['digest']}"
+    whole = get(served, blob)[2]
+    status, headers, body = get(served, blob, method="HEAD")
+    assert (status, int(headers["Content-Length"]), body) == (200, len(whole), b"")
+    for asked, start, end in [
+        ("bytes=500-5000", 500, 5001),
+        ("bytes=16000-", 16000, len(whole)),
+        ("bytes=-700", -700, None),
+    ]:
+        status, headers, body = get(served, blob, {"Range": asked})
+        first, last = range(len(whole))[start:end][0], range(len(whole))[start:end][-1]
+        assert (status, body) == (206, whole[start:end])
+        assert headers["Content-Range"] == f"bytes {first}-{last}/{len(whole)}"
+    # The artifact is still what the repo's own name gives
+    assert "artifactType" in json.loads(get(served, "/v2/org/ckpt/manifests/latest")[2])
+    page = html.unescape(get(served, "/org/ckpt")[2].decode())
+    assert f"docker pull 127.0.0.1:{served.server_port}/files/org/ckpt:latest" in page
+    assert "from the Hub, as tars" in get(served, "/")[2].decode()
+
+
+def test_weights_are_read_through_once_whatever_else_changes(serving, api, checkpoint, monkeypatch):
+    server = serving()
+    asked = []
+    metadata = registry.get_hf_file_metadata
+    monkeypatch.setattr(registry, "get_hf_file_metadata", lambda url, token=None: asked.append(url) or metadata(url))
+    first = json.loads(get(server, "/v2/files/org/ckpt/manifests/latest")[2])
+    assert len(asked) == 1 and asked[0].endswith("/model.safetensors")
+    (api.root / "org/ckpt/main/README.md").write_text("# The same checkpoint, said otherwise")
+    second = json.loads(get(server, "/v2/files/org/ckpt/manifests/latest")[2])
+    assert second != first and len(asked) == 1
+
+    def layers(index: dict) -> list[str]:
+        manifest = get(server, f"/v2/files/org/ckpt/manifests/{index['manifests'][0]['digest']}")[2]
+        return [layer["digest"] for layer in json.loads(manifest)["layers"]]
+
+    # Another layer of small files, over the same layer of weights
+    assert layers(first)[0] != layers(second)[0] and layers(first)[1] == layers(second)[1]
+
+
+def test_a_formats_image_is_of_no_other_formats_files(served, api, checkpoint):
+    (api.root / "org/ckpt/main/model.onnx").write_bytes(WEIGHTS[::-1])
+
+    def files(view: str) -> list[str]:
+        index = json.loads(get(served, f"/v2/{view}/org/ckpt/manifests/latest")[2])
+        manifest = get(served, f"/v2/{view}/org/ckpt/manifests/{index['manifests'][0]['digest']}")[2]
+        return sorted(unpacked(served, f"{view}/org/ckpt", json.loads(manifest)))
+
+    shared = ["README.md", "config.json", "sub/tokenizer.json"]
+    assert files("files") == sorted([*shared, "model.onnx", "model.safetensors"])
+    assert files("safetensors") == sorted([*shared, "model.safetensors"])
+    assert files("onnx") == sorted([*shared, "model.onnx"])
+    # A checkpoint has images of the formats it has
+    status, _, body = get(served, "/v2/gguf/org/ckpt/manifests/latest")
+    assert (status, json.loads(body)["errors"][0]["message"]) == (404, "org/ckpt has no gguf weights")
+    assert json.loads(get(served, "/v2/onnx/org/ckpt/tags/list")[2])["name"] == "onnx/org/ckpt"
+
+
+def test_images_of_files_are_of_checkpoints_within_the_limit(serving, pushed, checkpoint):
+    status, _, body = get(serving(), "/v2/files/org/clay/manifests/latest")
+    error = json.loads(body)["errors"][0]
+    assert (status, error["code"]) == (404, "MANIFEST_UNKNOWN")
+    assert error["message"] == "org/clay holds an image, not a checkpoint: pull it without files/"
+    limited = serving(limit=len(WEIGHTS) - 1)
+    status, _, body = get(limited, "/v2/files/org/ckpt/manifests/latest")
+    message = json.loads(body)["errors"][0]["message"]
+    assert status == 404 and message.startswith("org/ckpt has 16.4 KB of weights, and this registry makes images")
+    # Its artifact sends nothing through the registry, so it is served whatever its size
+    assert get(limited, "/v2/org/ckpt/manifests/latest")[0] == 200
+    assert get(serving(limit=len(WEIGHTS)), "/v2/files/org/ckpt/manifests/latest")[0] == 200
 
 
 def test_open_pages_learn_when_they_change(served, api, tmp_path):

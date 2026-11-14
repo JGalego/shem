@@ -65,8 +65,7 @@ pre code { background: none; padding: 0; }
 .find input { flex: 1; min-width: 0; font: inherit; font-size: 16px; padding: 8px 10px; border: 0; background: none; color: var(--fg); outline: none; }
 .find button { font: inherit; font-weight: 600; padding: 6px 16px; border: 0; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer; }
 .try { margin-top: 12px; font-size: 13px; color: var(--muted); display: flex; gap: 6px; justify-content: center; flex-wrap: wrap; align-items: center; }
-.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 8px 0 8px; }
-@media (max-width: 700px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 8px 0 8px; }
 .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
 .stat b { display: block; font-size: 1.45rem; font-weight: 650; font-variant-numeric: tabular-nums; }
 .stat span { color: var(--muted); font-size: 13px; }
@@ -269,6 +268,7 @@ def home(host: str, served: dict[str, dict], stats: dict, version: str = "") -> 
         (len(served), "repos"),
         (stats.get("pulls", 0), "pulls"),
         (size(stats.get("redirected", 0)), "straight from the Hub"),
+        (size(stats.get("streamed", 0)), "from the Hub, as tars"),
         (size(stats.get("sent", 0)), "sent from here"),
     ]
     chips = "".join(f'<a class="chip" href="/{e(repo)}">{e(repo)}</a>' for repo in TRY)
@@ -430,11 +430,14 @@ def use(host: str, repo: str, tag: str, artifact: bool) -> str:
     """The box of commands to use the image, a tab for each client."""
     reference = repo if tag == "latest" else f"{repo}:{tag}"
     clients = [("shem", f'shem run hf.co/{reference} "{PROMPT}"'), ("oras", f"oras pull {host}/{repo}:{tag}")]
-    if not artifact:
+    if artifact:
+        # Docker takes images: the artifact's files, as one
+        docker = f"docker pull {host}/files/{repo}:{tag}"
+    else:
         docker = (
             f'docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 {host}/{repo}:{tag} "{PROMPT}"'
         )
-        clients.append(("docker", docker))
+    clients.append(("docker", docker))
     inputs = "".join(
         f'<input type="radio" name="use" id="use-{name}"{" checked" if i == 0 else ""}><label for="use-{name}">{name}</label>'
         for i, (name, _) in enumerate(clients)

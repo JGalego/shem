@@ -68,7 +68,8 @@ enum Command {
     /// http://HOST:PORT/v1, until interrupted
     Serve(ServeArgs),
     /// Serve the images in Hugging Face repos as a read-only OCI registry,
-    /// at HOST:PORT/ORG/NAME:TAG, until interrupted
+    /// at HOST:PORT/ORG/NAME:TAG, and checkpoints' files as images at
+    /// HOST:PORT/files/ORG/NAME:TAG, until interrupted
     Registry(RegistryArgs),
     /// Boot an operating system kernel in VM mode, with its console on stdio
     Boot(BootArgs),
@@ -344,6 +345,11 @@ struct RegistryArgs {
     /// login`, or none, never with this host's: for a registry anyone may reach
     #[arg(long)]
     public: bool,
+    /// The most weights a checkpoint may have, such as 16G, to be served as
+    /// an image of its files at files/ORG/NAME, whose layers the registry
+    /// sends as it reads them from Hugging Face: any amount by default
+    #[arg(long, value_name = "SIZE")]
+    files_limit: Option<String>,
 }
 
 #[derive(Args)]
@@ -395,7 +401,12 @@ fn main() -> ExitCode {
         Command::Save(args) => save(args),
         Command::Load(args) => load(args),
         Command::Serve(args) => serve(args),
-        Command::Registry(args) => image::model::serve_registry(&args.host, args.port, args.public),
+        Command::Registry(args) => image::model::serve_registry(
+            &args.host,
+            args.port,
+            args.public,
+            args.files_limit.as_deref(),
+        ),
         Command::Boot(args) => boot(args),
     };
     match result {

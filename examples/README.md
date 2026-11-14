@@ -31,6 +31,7 @@ Model examples also include Dockerfiles for the [BuildKit frontend](../docs/shem
 | [`tools`](tools/Shemfile) | RV32 tool calls on compiled CPU weights |
 | [`modelpack`](modelpack/run.sh) | Import, session artifacts and export through a registry with modctl |
 | [`kubernetes/model-volume.yaml`](kubernetes/model-volume.yaml) | A model image mounted as a checkpoint and loaded by transformers, without shem |
+| [`kubernetes/hub-volume.yaml`](kubernetes/hub-volume.yaml) | A Hugging Face checkpoint mounted straight from the Hub, through `shem registry`, and loaded by transformers |
 
 ## Programs and machines
 

@@ -265,12 +265,22 @@ pub fn push_layout(dir: &Path, repo: &str, revision: Option<&str>) -> anyhow::Re
 
 /// Serve the images kept in Hugging Face repos as a read-only OCI registry
 /// at `host`:`port`, until interrupted, reading them with each client's
-/// token if `public`. Returns the server's status.
-pub fn serve_registry(host: &str, port: u16, public: bool) -> anyhow::Result<u8> {
+/// token if `public`, and making images of the files of checkpoints with
+/// weights up to `files_limit`, a size such as `16G`. Returns the server's
+/// status.
+pub fn serve_registry(
+    host: &str,
+    port: u16,
+    public: bool,
+    files_limit: Option<&str>,
+) -> anyhow::Result<u8> {
     let mut command = python("shem_neural.registry");
     command.args(["--host", host, "--port", &port.to_string()]);
     if public {
         command.arg("--public");
+    }
+    if let Some(limit) = files_limit {
+        command.args(["--files-limit", limit]);
     }
     let status = command
         .status()

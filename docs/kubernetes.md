@@ -78,3 +78,25 @@ containers:
 ```
 
 The [complete Pod example](../examples/kubernetes/model-volume.yaml) loads the checkpoint with transformers. Replace `your-user` in the manifest before applying it. `just kubernetes-model-volume-test` checks volume mounting in kind.
+
+## Hugging Face checkpoints as image volumes
+
+[`shem registry`](models.md#checkpoints-as-images-of-their-files) serves any checkpoint on Hugging Face as an image of its files, listed for the node's platform. A Pod mounts it without shem on the node, an init container to download it, or a copy of the weights in a registry of yours:
+
+```yaml
+volumes:
+- name: model
+  image:
+    reference: jgalego-shem-registry.hf.space/safetensors/huggingfacetb/smollm2-135m-instruct
+containers:
+- name: server
+  # Set the server image and point it at /models/smollm2.
+  volumeMounts:
+  - name: model
+    mountPath: /models/smollm2
+    readOnly: true
+```
+
+The node pulls each file of weights once, as a layer, and Pods that mount the same checkpoint share it. Pin a revision with a tag, as in `…/smollm2-135m-instruct:COMMIT`, or an image with its digest. The [complete Pod example](../examples/kubernetes/hub-volume.yaml) loads the checkpoint with transformers.
+
+The reference above is the [shem registry Space](https://huggingface.co/spaces/jgalego/shem-registry), which makes images of checkpoints with up to 16 GB of weights. For more, or for private repos read with a token of the cluster's, run `shem registry` where the nodes reach it.
