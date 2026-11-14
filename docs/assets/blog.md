@@ -14,6 +14,16 @@ Both work. Mostly.
 
 The name comes from the golem legend: a clay figure wakes up when someone puts a *shem*, a slip of paper with a word on it, into its mouth. The weights are the clay. The program is the word. It's also one vowel away from a containerd *shim*, which is how shem plugs into Docker, and I regret nothing.
 
+**Contents**
+
+- [Please don't run this in production](#please-dont-run-this-in-production)
+- [Stage 1: A model is just an image](#stage-1-a-model-is-just-an-image)
+- [Stage 2: A conversation is just a layer](#stage-2-a-conversation-is-just-a-layer)
+- [Stage 3: The machine is a model too](#stage-3-the-machine-is-a-model-too)
+- [So why bother?](#so-why-bother)
+- [The Hub is a registry now](#the-hub-is-a-registry-now)
+- [Try it](#try-it)
+
 ## Please don't run this in production
 
 As Steve Yegge says in his [Gas Town](https://steve-yegge.medium.com/welcome-to-gas-town-4f25ee16dd04) post, "I need to get rid of you real quick." Well, same here...
