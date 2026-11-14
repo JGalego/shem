@@ -33,7 +33,7 @@ The name comes from the golem legend: a clay figure wakes up when someone puts a
 
 As Steve Yegge says in his [Gas Town](https://steve-yegge.medium.com/welcome-to-gas-town-4f25ee16dd04) post, "I need to get rid of you real quick." Well, same here...
 
-shem is at version 0.2.0 and labelled **experimental** for very good reasons. It supports Llama, Mistral, Qwen, Gemma, Phi, OLMo, SmolLM, Granite and Mamba models, because I haven't tried any others. It only decodes greedily. Running models under Docker needs a containerd shim on your machine and a model server running as root. Performance is less than ideal. Bring a book. Hell, bring a library.
+shem is at version 0.3.0 and labelled **experimental** for very good reasons. It supports Llama, Mistral, Qwen, Gemma, Phi, OLMo, SmolLM, Granite and Mamba models, because I haven't tried any others. It only decodes greedily. Running models under Docker needs a containerd shim on your machine and a model server running as root. Performance is less than ideal. Bring a book. Hell, bring a library.
 
 The CPU made of weights runs fewer than 1,000 guest instructions a second on one core. ENIAC did [5,000 additions a second](https://www.britannica.com/technology/ENIAC) in 1946... with freaking vacuum tubes.
 

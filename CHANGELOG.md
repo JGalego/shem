@@ -1,7 +1,7 @@
 # Changelog
 
 
-## 0.3.0 (2026-11-13)
+## 0.3.0 (2026-11-14)
 
 ### Features
 
@@ -11,6 +11,12 @@
 - `docker run -t` gives a program a terminal of its own, with echo, line editing, Ctrl-C and the window's size
 - `shem serve` and `docker run --serve` serve a model image as OpenAI's chat completions API, in the container's own network under Docker
 - A landing page and an install script on the website, with the docs under /docs/
+- `shem push`, `pull` and `run` take `hf.co/ORG/NAME`, a Hugging Face repo that holds an image's OCI layout or a checkpoint to import
+- `shem registry` serves those repos to other OCI clients: a checkpoint's files as a ModelPack artifact, or as an image at `files/ORG/NAME` or `safetensors/ORG/NAME` for Docker to pull and Kubernetes to mount, with pages like model pages
+- `shem registry --public` reads each repo with the client's own Hugging Face token, from `docker login`, or none, never the host's
+- The shem my repo Space turns a Hugging Face checkpoint into a shem image in the user's own repo, compared with transformers, with a ModelPack artifact on its `modelpack` branch
+- `shem run --receipt` records a model run, with each token chosen and its margin, and `shem replay` checks it by running it again; the shem replay Space does so in a browser
+- `shem images` lists the store as a table, with `--format`, `-q` and `--no-trunc`; `shem rmi` and `shem prune` remove images and the unpacked copies no tag holds; `shem tag`, `shem inspect` and `shem history` store, describe and trace images
 
 ### Fixes
 
@@ -18,15 +24,27 @@
 - A signal typed at the terminal goes to its foreground process group, init's included, and no longer returns from a system call init never made
 - Counts a frozen container brings, of instructions and time, wrap or stop at their limits instead of overflowing
 - Leave out the default ENTRYPOINT when a model stage sets its own, which made docker build warn about a line of the generated Dockerfile
+- The shim reads and writes a container's `/.shem` state without following links, and a guest's paths, device nodes, FIFOs and `utimensat` no longer lead out of its root onto the host
+- Programs with program headers Linux refuses are refused instead of taking ages to load, and `utimensat` refuses times past 64 bits of nanoseconds, as fuzzing found
+- `sendfile` into a pipe moves its input on only by what the pipe took, so BusyBox pipelines no longer lose data
+- The model server keeps each container's model apart, refuses `--warm` and `--session` on a container's command line, and a `RUN` it cannot step fails alone
+- A batch's CUDA graph capture no longer fails when the garbage collector frees another batch's graph, as it did on T4, A100, L40S and RTX PRO 6000
+- A release's shem imports GGUF files and builds model images, which needed shem-neural's `gguf` extra and no `requests`
+- A session published beside its model leaves the model's history without the step that made the session
+- `shem pull` and `run` read a registry reference without a tag or digest as `latest`, as Docker does
+- The BuildKit frontend is built with golang.org/x/net 0.60.0 and Go 1.27.4, which fix vulnerabilities govulncheck finds on its path
 
 ### Documentation
 
 - Start the model server from a release, as a systemd service or with sudo and full paths, as well as from a checkout
 - Add CNCF governance files and a DCO check
+- Docs, GIFs and a blog post on the Spaces, images of a checkpoint's files and receipts
 
 ### Tests
 
 - Fuzz what shem reads from images, archives for `shem load`, programs, frozen containers, layers and Shemfiles, every day, and try their seeds in CI
+- Lint Dockerfiles and Shemfiles with hadolint, and run the toolchain's pipes with pipefail
+- The containerd test tries `ctr run` up to three times, as `ctr run --rm` can drop the output of a container that lives milliseconds
 
 ### Other
 
