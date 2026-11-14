@@ -39,6 +39,7 @@ import copy
 import hashlib
 import json
 import re
+import socket
 import sys
 import threading
 import time
@@ -619,6 +620,23 @@ def handler(registry: Registry) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "shem-registry"
         protocol_version = "HTTP/1.1"
+        # What is no HTTP request is refused in HTTP all the same, rather than
+        # as HTTP/0.9 would be, with no status line
+        default_request_version = "HTTP/1.0"
+
+        def handle(self) -> None:
+            # A client that expects HTTPS, as Docker does, starts a TLS
+            # handshake, which is no line of text to wait for the end of. Told
+            # at once, in HTTP, that this is HTTP, Docker goes on in it, for a
+            # registry on localhost
+            try:
+                hello = self.connection.recv(1, socket.MSG_PEEK) == b"\x16"
+            except OSError:
+                hello = False
+            if hello:
+                self.wfile.write(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                return
+            super().handle()
 
         def respond(self, body: bool) -> None:
             status, headers, data = registry.handle(

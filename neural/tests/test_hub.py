@@ -341,6 +341,20 @@ def test_registry_is_read_only(served):
     assert json.loads(response.read())["errors"][0]["code"] == "UNSUPPORTED"
 
 
+def test_a_client_that_expects_https_is_told_this_is_http(served):
+    import socket
+
+    # The start of a TLS handshake, which ends no line: Docker falls back to
+    # HTTP, for a registry on localhost, when what comes back is an HTTP response
+    with socket.create_connection(("127.0.0.1", served.server_port), timeout=5) as client:
+        client.sendall(bytes.fromhex("16030100c6010000c20303") + bytes(64))
+        assert client.recv(64).startswith(b"HTTP/1.1 400 ")
+    # As is anything else that is no request
+    with socket.create_connection(("127.0.0.1", served.server_port), timeout=5) as client:
+        client.sendall(b"{}\r\n\r\n")
+        assert client.recv(64).startswith(b"HTTP/1.1 400 ")
+
+
 @pytest.mark.skipif(not shutil.which("oras"), reason="needs ORAS")
 def test_oras_pulls_through_the_registry(served, pushed, tmp_path):
     out = tmp_path / "pulled"
