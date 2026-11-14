@@ -13,6 +13,8 @@ shem pull ghcr.io/your-user/hello:1.0         # pull into the store, and run it 
 docker save hello | shem load                 # or load an image docker build made
 ```
 
+`shem images --format` takes `json`, or a Go template as `docker images --format` does, such as `'{{.Repository}}:{{.Tag}} {{.Size}}'`, after `table ` for aligned columns with headers. Its fields are `.Repository`, `.Tag`, `.ID`, `.Digest`, `.Kind` (`program`, `vm` or `model`), `.Size` and `.Bytes`, and its functions Docker's `json`, `upper`, `lower`, `title`, `truncate`, `pad`, `join`, `split` and `len`. `shem images -q` prints the IDs alone.
+
 ## With docker build
 
 To use shem's [BuildKit frontend](../frontend/), start the Dockerfile with its syntax directive:

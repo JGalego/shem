@@ -9,6 +9,7 @@ use shem::image::{self, BuildOptions, Image, Store};
 use shem::linux::Stdio;
 use shem::neural::NeuralVcpu;
 use shem::reference::ReferenceVcpu;
+use shem::template::Template;
 use shem::vcpu::Vcpu;
 use shem::vm::{self, Console, Halt, Machine};
 
@@ -33,7 +34,7 @@ enum Command {
     /// Build an image from a Shemfile
     Build(BuildArgs),
     /// List the images in the local store
-    Images,
+    Images(ImagesArgs),
     /// Push an image to an OCI registry (uses oras), or to a Hugging Face
     /// repo as hf.co/ORG/NAME[:BRANCH]
     Push(PushArgs),
@@ -199,6 +200,23 @@ struct SaveArgs {
 }
 
 #[derive(Args)]
+struct ImagesArgs {
+    /// Print only image IDs, each once
+    #[arg(short, long)]
+    quiet: bool,
+    /// Show whole IDs, as their digests
+    #[arg(long)]
+    no_trunc: bool,
+    /// `table` (the default), `json` for an object a line, or a Go
+    /// template such as '{{.Repository}}:{{.Tag}}', after `table ` for
+    /// columns with headers. Fields: .Repository .Tag .ID .Digest .Kind
+    /// .Size .Bytes; functions: json upper lower title truncate pad join
+    /// split len
+    #[arg(long, value_name = "FORMAT")]
+    format: Option<String>,
+}
+
+#[derive(Args)]
 struct LoadArgs {
     /// Read the archive from this file instead of stdin
     #[arg(short, long, value_name = "FILE")]
@@ -270,7 +288,7 @@ fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Run(args) => run(args),
         Command::Build(args) => build(args),
-        Command::Images => images(),
+        Command::Images(args) => images(args),
         Command::Push(args) => push(args),
         Command::Pull(args) => pull(args),
         Command::Save(args) => save(args),
@@ -681,48 +699,160 @@ fn pull(args: PullArgs) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-/// List the store as `docker images` does: a column each for the reference,
-/// the short manifest digest, what the image runs and its stored size. On a
-/// terminal, and unless NO_COLOR is set, the header is bold and the tag and
-/// ID dim.
-fn images() -> anyhow::Result<u8> {
+/// The fields a `shem images --format` template can use, and their headers
+/// in a table.
+const IMAGE_FIELDS: [(&str, &str); 7] = [
+    ("Repository", "REPOSITORY"),
+    ("Tag", "TAG"),
+    ("ID", "IMAGE ID"),
+    ("Digest", "DIGEST"),
+    ("Kind", "KIND"),
+    ("Size", "SIZE"),
+    ("Bytes", "BYTES"),
+];
+
+/// List the store as `docker images` does: by default a column each for the
+/// reference, the short manifest digest, what the image runs and its stored
+/// size. On a terminal, and unless NO_COLOR is set, the header is bold and
+/// the tag and ID dim.
+fn images(args: ImagesArgs) -> anyhow::Result<u8> {
     use std::io::IsTerminal;
     let store = Store::open()?;
-    let mut rows = Vec::new();
+    let mut records = Vec::new();
     for (reference, digest) in store.list()? {
         let summary = Image::layout_summary(&store.path(&reference)?)?;
-        let id = digest.trim_start_matches("sha256:");
-        rows.push((reference, id[..12.min(id.len())].to_string(), summary));
+        let (repository, tag) = image::parse_reference(&reference)?;
+        let hex = digest.trim_start_matches("sha256:");
+        let id = match args.no_trunc {
+            true => digest.clone(),
+            false => hex[..12.min(hex.len())].to_string(),
+        };
+        records.push(serde_json::json!({
+            "Repository": repository,
+            "Tag": tag,
+            "ID": id,
+            "Digest": digest,
+            "Kind": summary.kind.to_string(),
+            "Size": human_size(summary.size),
+            "Bytes": summary.size,
+        }));
     }
-    let style = std::io::stdout().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-    let paint = |code: &str, text: &str| match style {
-        true => format!("\x1b[{code}m{text}\x1b[0m"),
-        false => text.to_string(),
-    };
-    let width = rows
-        .iter()
-        .map(|(reference, ..)| reference.chars().count())
-        .chain(["IMAGE".len()])
-        .max()
-        .unwrap_or_default();
-    let header = format!(
-        "{:<width$}   {:<12}   {:<7}   {:>8}",
-        "IMAGE", "ID", "KIND", "SIZE"
-    );
-    println!("{}", paint("1", &header));
-    for (reference, id, summary) in rows {
-        let pad = " ".repeat(width - reference.chars().count());
-        let (name, tag) = image::parse_reference(&reference)?;
-        let reference = format!("{name}{}", paint("2", &format!(":{tag}")));
-        println!(
-            "{reference}{pad}   {}   {:<7}   {:>8}",
-            paint("2", &id),
-            summary.kind,
-            human_size(summary.size),
-        );
+    if args.quiet {
+        let mut seen = std::collections::HashSet::new();
+        for record in &records {
+            if seen.insert(&record["ID"]) {
+                println!("{}", record["ID"].as_str().unwrap_or_default());
+            }
+        }
+        return Ok(0);
+    }
+    let format = args.format.as_deref().unwrap_or("table").trim();
+    match format {
+        "table" => {
+            let style = std::io::stdout().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+            let paint = |code: &str, text: &str| match style {
+                true => format!("\x1b[{code}m{text}\x1b[0m"),
+                false => text.to_string(),
+            };
+            let mut rows = vec![
+                ["IMAGE", "ID", "KIND", "SIZE"]
+                    .map(|h| paint("1", h))
+                    .to_vec(),
+            ];
+            for record in &records {
+                let field = |name: &str| record[name].as_str().unwrap_or_default().to_string();
+                rows.push(vec![
+                    format!(
+                        "{}{}",
+                        field("Repository"),
+                        paint("2", &format!(":{}", field("Tag")))
+                    ),
+                    paint("2", &field("ID")),
+                    field("Kind"),
+                    field("Size"),
+                ]);
+            }
+            print_columns(&rows, &[3]);
+        }
+        "json" => {
+            for record in &records {
+                println!("{record}");
+            }
+        }
+        _ => {
+            let (table, source) = match format.strip_prefix("table") {
+                Some(rest) if rest.starts_with(char::is_whitespace) => (true, rest.trim_start()),
+                _ => (false, format),
+            };
+            let template = Template::parse(source).context("in --format")?;
+            let mut lines = Vec::new();
+            if table {
+                let headers: serde_json::Map<_, _> = IMAGE_FIELDS
+                    .iter()
+                    .map(|(field, header)| (field.to_string(), (*header).into()))
+                    .collect();
+                lines.push(template.render(&headers.into())?);
+            }
+            for record in &records {
+                lines.push(template.render(record).context("in --format")?);
+            }
+            match table {
+                true => {
+                    let rows: Vec<Vec<String>> = (lines.iter().flat_map(|l| l.lines()))
+                        .map(|line| line.split('\t').map(String::from).collect())
+                        .collect();
+                    print_columns(&rows, &[]);
+                }
+                false => lines.iter().for_each(|line| println!("{line}")),
+            }
+        }
     }
     Ok(0)
+}
+
+/// Print `rows` in columns three spaces apart, as Docker's tables are, the
+/// cells of the `right` columns aligned right. Widths leave out the escape
+/// sequences that style a cell.
+fn print_columns(rows: &[Vec<String>], right: &[usize]) {
+    fn width(cell: &str) -> usize {
+        let mut count = 0;
+        let mut escaped = false;
+        for c in cell.chars() {
+            match (escaped, c) {
+                (false, '\x1b') => escaped = true,
+                (true, 'm') => escaped = false,
+                (true, _) => {}
+                (false, _) => count += 1,
+            }
+        }
+        count
+    }
+    let mut widths: Vec<usize> = Vec::new();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            match widths.get_mut(i) {
+                Some(w) => *w = (*w).max(width(cell)),
+                None => widths.push(width(cell)),
+            }
+        }
+    }
+    for row in rows {
+        let mut line = String::new();
+        for (i, cell) in row.iter().enumerate() {
+            let pad = " ".repeat(widths[i] - width(cell));
+            let last = i + 1 == row.len();
+            match right.contains(&i) {
+                true => line.push_str(&format!("{pad}{cell}")),
+                false if last => line.push_str(cell),
+                false => line.push_str(&format!("{cell}{pad}")),
+            }
+            if !last {
+                line.push_str("   ");
+            }
+        }
+        println!("{line}");
+    }
 }
 
 /// `bytes` in decimal units, as `docker images` shows sizes: 435kB, 1.81MB.

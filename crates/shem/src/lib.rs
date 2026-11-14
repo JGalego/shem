@@ -13,5 +13,6 @@ pub mod linux;
 pub mod mm;
 pub mod neural;
 pub mod reference;
+pub mod template;
 pub mod vcpu;
 pub mod vm;
