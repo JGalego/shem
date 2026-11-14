@@ -1,8 +1,10 @@
 """Images in Hugging Face repos: fetched, pushed and unpacked as OCI layouts,
 and served as a registry. A fake Hub keeps each repo's revisions in a
 directory, so these need no network; with ORAS installed, a real client
-pulls through the registry, following a large blob to where it is kept."""
+pulls through the registry, following a large blob to where it is kept,
+and logs in to a public one."""
 
+import base64
 import functools
 import hashlib
 import html
@@ -19,7 +21,13 @@ from types import SimpleNamespace
 
 import pytest
 import zstandard
-from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
+from huggingface_hub.errors import (
+    EntryNotFoundError,
+    GatedRepoError,
+    HfHubHTTPError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 
 from shem_neural import hub, registry
 
@@ -70,6 +78,9 @@ def layout(dir: Path, files: list[dict[str, bytes]], process: dict | None = None
 #: A response as the Hub's errors read one, whichever HTTP library
 #: huggingface_hub is built on
 NOT_FOUND = SimpleNamespace(headers={}, request=None, status_code=404)
+UNAUTHORIZED = SimpleNamespace(headers={}, request=None, status_code=401)
+#: The one token the fake Hub knows, which reads its private and gated repos
+TOKEN = "hf_clay"
 
 
 class FakeApi:
@@ -83,6 +94,19 @@ class FakeApi:
         self.root = root
         #: The branch each commit model_info gave is on
         self.commits: dict[str, str] = {}
+        #: Repos only TOKEN may see, and repos anyone may see but only TOKEN read
+        self.private: set[str] = set()
+        self.gated: set[str] = set()
+
+    def auth_check(self, repo):
+        self.repo(repo)
+        if repo in self.gated and self.token != TOKEN:
+            raise GatedRepoError(f"{repo} is gated", response=UNAUTHORIZED)
+
+    def whoami(self):
+        if self.token != TOKEN:
+            raise HfHubHTTPError("no such token", response=UNAUTHORIZED)
+        return {"name": "clay"}
 
     def dir(self, repo: str, rev: str | None) -> Path:
         self.repo(repo)
@@ -92,7 +116,7 @@ class FakeApi:
         return path
 
     def repo(self, repo: str) -> Path:
-        if not (self.root / repo).is_dir():
+        if not (self.root / repo).is_dir() or (repo in self.private and self.token != TOKEN):
             raise RepositoryNotFoundError(f"no repo {repo}", response=NOT_FOUND)
         return self.root / repo
 
@@ -101,7 +125,13 @@ class FakeApi:
         return [p.relative_to(base).as_posix() for p in base.rglob("*") if p.is_file()]
 
     def hf_hub_download(self, repo, path, revision=None):
-        file = self.dir(repo, revision) / path
+        # Whoever asks, as huggingface_hub's cache answers for a commit
+        # it has kept
+        token, self.token = self.token, TOKEN
+        try:
+            file = self.dir(repo, revision) / path
+        finally:
+            self.token = token
         if not file.is_file():
             raise EntryNotFoundError(f"{repo} has no {path}")
         return str(file)
@@ -215,9 +245,9 @@ def test_layouts_unpack_into_their_filesystem(tmp_path):
 
 
 @pytest.fixture
-def served(api, pushed, monkeypatch):
-    """The registry over the fake Hub, with large blobs where a CDN keeps
-    them: a server of their own, as Hugging Face's are elsewhere."""
+def serving(api, monkeypatch):
+    """Start registries over the fake Hub, with large blobs where a CDN
+    keeps them: a server of their own, as Hugging Face's are elsewhere."""
     cdn = http.server.ThreadingHTTPServer(
         ("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=api.root)
     )
@@ -235,19 +265,30 @@ def served(api, pushed, monkeypatch):
     monkeypatch.setattr(registry, "get_hf_file_metadata", metadata)
     # Between a tar of a small file, a 10 KiB record, and the weights
     monkeypatch.setattr(registry, "SMALL", 12 * 1024)
-    server = registry.serve(("127.0.0.1", 0), registry.Hub(api))
-    for s in (cdn, server):
-        threading.Thread(target=s.serve_forever, daemon=True).start()
-    yield server
-    for s in (cdn, server):
+    servers = [cdn]
+    threading.Thread(target=cdn.serve_forever, daemon=True).start()
+
+    def start(public=False):
+        server = registry.serve(("127.0.0.1", 0), registry.Hub(api), public)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return server
+
+    yield start
+    for s in servers:
         s.shutdown()
 
 
-def get(server, path: str):
+@pytest.fixture
+def served(serving, pushed):
+    return serving()
+
+
+def get(server, path: str, headers: dict | None = None):
     import http.client
 
     connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
-    connection.request("GET", path)
+    connection.request("GET", path, headers=headers or {})
     response = connection.getresponse()
     return response.status, dict(response.getheaders()), response.read()
 
@@ -469,3 +510,62 @@ def test_open_pages_learn_when_they_change(served, api, tmp_path):
     layout(other, [{"model/shem.json": b'{"v": 2}'}])
     hub.push(other, "org/clay", api=api)
     assert version("/live?repo=org/clay&tag=latest") != before
+
+
+@pytest.fixture
+def public(serving, api, pushed, tmp_path):
+    """A public registry, with a private image and a gated one beside org/clay."""
+    for repo in ("org/secret", "org/gated"):
+        hub.push(tmp_path / "image", repo, api=api)
+    api.private.add("org/secret")
+    api.gated.add("org/gated")
+    return serving(public=True)
+
+
+def basic(password: str) -> dict:
+    return {"Authorization": "Basic " + base64.b64encode(f"user:{password}".encode()).decode()}
+
+
+def test_public_registries_give_tokens_for_hugging_faces(public):
+    port = public.server_port
+    status, headers, _ = get(public, "/v2/")
+    assert status == 401
+    assert headers["WWW-Authenticate"] == f'Bearer realm="http://127.0.0.1:{port}/token",service="127.0.0.1:{port}"'
+    # Behind a proxy that says it was asked over HTTPS
+    status, headers, _ = get(public, "/v2/", {"X-Forwarded-Proto": "https"})
+    assert headers["WWW-Authenticate"].startswith(f'Bearer realm="https://127.0.0.1:{port}/token"')
+    assert json.loads(get(public, "/token")[2])["token"] == "anonymous"
+    assert json.loads(get(public, "/token", basic(TOKEN))[2])["token"] == TOKEN
+    status, _, body = get(public, "/token", basic("hf_mud"))
+    assert (status, json.loads(body)["errors"][0]["code"]) == (401, "UNAUTHORIZED")
+    assert get(public, "/v2/", {"Authorization": "Bearer anonymous"})[0] == 200
+
+
+def test_public_registries_serve_repos_as_the_hub_would_to_the_client(public, pushed):
+    anonymous = {"Authorization": "Bearer anonymous"}
+    logged_in = {"Authorization": f"Bearer {TOKEN}"}
+    assert get(public, "/v2/org/clay/manifests/latest", anonymous)[0] == 200
+    for repo in ("org/secret", "org/gated"):
+        status, headers, _ = get(public, f"/v2/{repo}/manifests/latest", anonymous)
+        assert status == 401 and headers["WWW-Authenticate"].endswith(f',scope="repository:{repo}:pull"')
+        status, _, body = get(public, f"/v2/{repo}/manifests/latest", logged_in)
+        assert status == 200
+    # What the registry keeps of a repo, it serves only to whoever may read it
+    small = json.loads(body)["layers"][1]["digest"]
+    assert get(public, f"/v2/org/gated/blobs/{small}", logged_in)[0] == 200
+    assert get(public, f"/v2/org/gated/blobs/{small}", anonymous)[0] == 401
+    assert get(public, f"/v2/org/gated/blobs/{small}", {"Authorization": "Bearer hf_mud"})[0] == 403
+    # Nor do its pages show private repos, or name them
+    assert get(public, "/org/secret")[0] == 404
+    home = get(public, "/")[2]
+    assert b"org/gated" in home and b"org/clay" in home and b"org/secret" not in home
+
+
+@pytest.mark.skipif(not shutil.which("oras"), reason="needs ORAS")
+def test_oras_logs_in_to_a_public_registry(public, tmp_path):
+    reference = f"127.0.0.1:{public.server_port}/org/gated:latest"
+    command = ["oras", "cp", "--from-plain-http", reference, "--to-oci-layout", f"{tmp_path / 'out'}:latest"]
+    assert subprocess.run(command, capture_output=True).returncode != 0
+    subprocess.run([*command, "--from-username", "clay", "--from-password", TOKEN], check=True, capture_output=True)
+    hub.unpack(tmp_path / "out", tmp_path / "root")
+    assert (tmp_path / "root/model/weights").read_bytes() == WEIGHTS

@@ -254,6 +254,13 @@ A repo that holds a checkpoint rather than an image is served as a ModelPack art
 
 Requests to Hugging Face use this host's token, so whoever reaches the registry can pull the private repos it can read; it listens on `127.0.0.1` unless given `--host`. Hugging Face resolves repo names in any case, so a client that needs lowercase names, as Docker does, can pull `qwen/qwen3-0.6b-shem` for `Qwen/Qwen3-0.6B-shem`.
 
+`shem registry --public` is for a registry anyone can reach. It never uses this host's token, only each client's, through the distribution spec's token flow: `/v2/` asks clients to log in, and `/token` gives them back the Hugging Face token they logged in with, once the Hub has confirmed it, or an anonymous one for public repos. A client asked for a gated or private repo without a token of its own is asked to log in. What the registry keeps of a repo, such as small blobs and the artifacts it made, is served only to clients the Hub lets read the repo, which it asks every 5 minutes for each token. The home page lists only repos that aren't private. Behind a proxy that terminates TLS, as a Space's does, the registry takes the scheme from `X-Forwarded-Proto`.
+
+```sh
+shem registry --public --host 0.0.0.0 --port 5000 &
+echo "$HF_TOKEN" | docker login localhost:5000 -u hf --password-stdin   # only for gated and private repos
+```
+
 Outside `/v2/`, the registry serves pages for people. `/` has a search box, counts of the repos served, the pulls, and the bytes sent from the Hub and from the registry, and the repos pulled since it started, last pulled first. `/ORG/NAME?tag=TAG` shows an image as a model page: badges for its comparison with transformers (from the repo's `comparison.json`), size, precision, licence and primed session; its system prompt, the model from its `shem.json`, its entrypoint and its layers; and beside them, the commands to use it with shem, oras or Docker, its digest, its source checkpoint and its tags. Open pages stay current: they ask `/live` whether what they show has changed, every 3 seconds for the home page and every 15 for a repo's, which asks the Hub for the revision's commit, and show the new version without reloading.
 
 ### Comparing an import with transformers

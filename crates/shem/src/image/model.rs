@@ -264,10 +264,15 @@ pub fn push_layout(dir: &Path, repo: &str, revision: Option<&str>) -> anyhow::Re
 }
 
 /// Serve the images kept in Hugging Face repos as a read-only OCI registry
-/// at `host`:`port`, until interrupted. Returns the server's status.
-pub fn serve_registry(host: &str, port: u16) -> anyhow::Result<u8> {
-    let status = python("shem_neural.registry")
-        .args(["--host", host, "--port", &port.to_string()])
+/// at `host`:`port`, until interrupted, reading them with each client's
+/// token if `public`. Returns the server's status.
+pub fn serve_registry(host: &str, port: u16, public: bool) -> anyhow::Result<u8> {
+    let mut command = python("shem_neural.registry");
+    command.args(["--host", host, "--port", &port.to_string()]);
+    if public {
+        command.arg("--public");
+    }
+    let status = command
         .status()
         .context("serving the registry, which needs uv")?;
     Ok(status.code().unwrap_or(1) as u8)

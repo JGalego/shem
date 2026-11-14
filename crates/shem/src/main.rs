@@ -316,9 +316,13 @@ struct RegistryArgs {
     port: u16,
     /// The address to listen at: this host's own by default. Repos are read
     /// with this host's Hugging Face token, so whoever reaches the registry
-    /// can pull the private ones it can read
+    /// can pull the private ones it can read, unless --public
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
+    /// Read repos with each client's own Hugging Face token, from `docker
+    /// login`, or none, never with this host's: for a registry anyone may reach
+    #[arg(long)]
+    public: bool,
 }
 
 #[derive(Args)]
@@ -369,7 +373,7 @@ fn main() -> ExitCode {
         Command::Save(args) => save(args),
         Command::Load(args) => load(args),
         Command::Serve(args) => serve(args),
-        Command::Registry(args) => image::model::serve_registry(&args.host, args.port),
+        Command::Registry(args) => image::model::serve_registry(&args.host, args.port, args.public),
         Command::Boot(args) => boot(args),
     };
     match result {

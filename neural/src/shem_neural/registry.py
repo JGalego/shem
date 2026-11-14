@@ -1,6 +1,6 @@
 """Serve images kept in Hugging Face repos as a read-only OCI registry.
 
-    python -m shem_neural.registry [--host HOST] [--port PORT]
+    python -m shem_neural.registry [--host HOST] [--port PORT] [--public]
 
 A repo that holds an OCI image layout, as `shem push IMAGE hf.co/ORG/NAME`
 writes one, is the registry's repository ORG/NAME, and its revisions are the
@@ -17,12 +17,19 @@ to Hugging Face use this host's token (`HF_TOKEN`, or `hf auth login`), so
 private and gated repos it can read are served too, to whoever can reach the
 registry: it listens on this host only unless told otherwise.
 
+A public registry, one anyone may reach, uses each client's token instead,
+and never this host's. It answers the distribution spec's token flow:
+`docker login` with a Hugging Face token as the password, or none, to pull
+public repos anonymously. Its home page lists only repos that aren't private.
+
 Outside `/v2/`, the registry serves pages for people: what it is and how
 to pull from it at `/`, and each repo's image at `/ORG/NAME`. `/live` tells
 an open page whether what it shows has changed, so it can show it again.
 """
 
 import argparse
+import base64
+import copy
 import hashlib
 import json
 import re
@@ -52,6 +59,12 @@ SMALL = 1 << 20
 #: Repository names: ORG/NAME, as Hugging Face names repos
 NAME = r"(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*)"
 DIGEST = r"sha256:(?P<hex>[0-9a-f]{64})"
+#: The repository a request to the distribution API names, if it names one
+REPOSITORY = re.compile(rf"^/v2/{NAME}/")
+#: The token a public registry gives clients without a Hugging Face token
+ANONYMOUS = "anonymous"
+#: How long, in seconds, the Hub's answer to who may read a repo is kept
+ACCESS = 300
 TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
 #: A repo's page, for people
 PAGE = re.compile(rf"^/{NAME}/?$")
@@ -73,15 +86,59 @@ class Unknown(Exception):
 
 
 class Hub:
-    """Layouts in Hugging Face repos, read with this host's token."""
+    """Layouts in Hugging Face repos, read with this host's token, or the one
+    `using` gives it."""
 
     def __init__(self, api: HfApi | None = None):
         self.api = api or HfApi()
+        #: When the Hub's answers, by token and question, stop being trusted:
+        #: whether a token is one, a repo readable with it, or a repo private
+        self.answers: dict[tuple[str, str], tuple[float, bool]] = {}
         #: The revisions served by tag, by repo: where a digest is looked for
         #: when the default branch hasn't it
         self.seen: dict[str, set[str]] = {}
         #: The artifacts made of repos that hold a checkpoint, by repo and commit
         self.artifacts: dict[tuple[str, str], Artifact] = {}
+
+    def using(self, token: str | None) -> "Hub":
+        """This Hub, sharing what it has learnt, reading as `token`: a
+        client's token, or no token at all, never this host's."""
+        view = copy.copy(self)
+        view.api = copy.copy(self.api)
+        view.api.token = token or False
+        return view
+
+    def ask(self, question: str, call, *exceptions) -> bool:
+        """Whether `call` succeeds rather than raising one of `exceptions`,
+        as the Hub answered it for this token in the last few minutes."""
+        token = self.api.token or ""
+        key = (hashlib.sha256(token.encode()).hexdigest() if token else "", question)
+        until, answer = self.answers.get(key, (0, False))
+        if until < time.time():
+            try:
+                call()
+                answer = True
+            except exceptions:
+                answer = False
+            self.answers[key] = (time.time() + ACCESS, answer)
+        return answer
+
+    def admit(self, repo: str) -> None:
+        """Raise unless this token may read `repo`'s files: what's kept of
+        repos is served only to those the Hub would serve it to."""
+        # A gated repo is also one not found
+        if not self.ask(f"read {repo.lower()}", lambda: self.api.auth_check(repo), RepositoryNotFoundError):
+            # Ask again, for the error that says why
+            self.api.auth_check(repo)
+
+    def valid(self) -> bool:
+        """Whether this Hub's token is one Hugging Face knows."""
+        return self.ask("whoami", self.api.whoami, HfHubHTTPError)
+
+    def listed(self, repo: str) -> bool:
+        """Whether anyone may see that `repo` exists: it isn't private."""
+        anyone = self.using(None)
+        return anyone.ask(f"see {repo.lower()}", lambda: anyone.api.model_info(repo), RepositoryNotFoundError)
 
     def read(self, repo: str, path: str, rev: str | None) -> bytes:
         return Path(self.api.hf_hub_download(repo, path, revision=rev)).read_bytes()
@@ -192,25 +249,57 @@ class Registry:
     """The distribution API's read side over `hub`: each call returns a
     status, headers and a body."""
 
-    def __init__(self, hub):
+    def __init__(self, hub, public: bool = False):
         self.hub = hub
+        #: Whether each client reads as itself, with its own Hugging Face
+        #: token, rather than as this host
+        self.public = public
         #: What the home page shows of the repos served, by repo
         self.served: dict[str, dict] = {}
         #: Pulls, and the bytes of blobs redirected to the Hub and sent from here
         self.stats = {"pulls": 0, "redirected": 0, "sent": 0}
 
-    def base(self, match) -> tuple[HTTPStatus, dict, bytes]:
+    def base(self, hub, match) -> tuple[HTTPStatus, dict, bytes]:
         return HTTPStatus.OK, {"Content-Type": "application/json"}, b"{}"
 
-    def manifest(self, match) -> tuple[HTTPStatus, dict, bytes]:
+    def token(self, authorization: str) -> tuple[HTTPStatus, dict, bytes]:
+        """A public registry's token for a client: the Hugging Face token it
+        logged in with, once the Hub knows it, or else the anonymous one."""
+        secret = credential(authorization)
+        if secret and not self.hub.using(secret).valid():
+            raise Unknown("UNAUTHORIZED", "Hugging Face knows no such token", HTTPStatus.UNAUTHORIZED)
+        token = secret or ANONYMOUS
+        body = json.dumps({"token": token, "access_token": token, "expires_in": 3600}).encode()
+        return HTTPStatus.OK, {"Content-Type": "application/json"}, body
+
+    def admit(self, hub, route: str, match, authorization: str) -> None:
+        """Let a public registry's client in, or ask it to log in: for a
+        token, at first, anonymous or not, and then for a token of its own
+        to read a repo the anonymous may not."""
+        login = Unknown("UNAUTHORIZED", "log in with a Hugging Face token, or none", HTTPStatus.UNAUTHORIZED)
+        anonymous = not credential(authorization)
+        if route == "base":
+            if not authorization:
+                raise login
+            return
+        try:
+            hub.admit(match["name"])
+        except RepositoryNotFoundError:
+            # Gated repos too: a client that logs in may read them
+            if not anonymous:
+                raise
+            raise login from None
+
+    def manifest(self, hub, match) -> tuple[HTTPStatus, dict, bytes]:
         name = match["name"]
         if match["hex"]:
-            data = self.hub.blob(name, match["hex"])
+            data = hub.blob(name, match["hex"])
             kind = media_type(data, "application/vnd.oci.image.manifest.v1+json")
         else:
-            entry = self.hub.entry(name, match["tag"])
-            data = self.hub.blob(name, entry["digest"].removeprefix("sha256:"))
-            self.pulled(name, match["tag"], data)
+            entry = hub.entry(name, match["tag"])
+            data = hub.blob(name, entry["digest"].removeprefix("sha256:"))
+            if not self.public or self.hub.listed(name):
+                self.pulled(name, match["tag"], data)
             kind = entry.get("mediaType") or media_type(data, "application/vnd.oci.image.manifest.v1+json")
         digest = "sha256:" + hashlib.sha256(data).hexdigest()
         if match["hex"] and digest != f"sha256:{match['hex']}":
@@ -233,22 +322,22 @@ class Registry:
         if "layers" in data:
             summary["size"] = sum(layer.get("size", 0) for layer in data["layers"])
 
-    def blob(self, match) -> tuple[HTTPStatus, dict, bytes]:
+    def blob(self, hub, match) -> tuple[HTTPStatus, dict, bytes]:
         name, hex = match["name"], match["hex"]
-        size, location = self.hub.locate(name, hex)
+        size, location = hub.locate(name, hex)
         headers = {"Docker-Content-Digest": f"sha256:{hex}"}
         if location and size > SMALL:
             self.stats["redirected"] += size
             return HTTPStatus.TEMPORARY_REDIRECT, headers | {"Location": location}, b""
-        data = self.hub.blob(name, hex)
+        data = hub.blob(name, hex)
         self.stats["sent"] += len(data)
         return HTTPStatus.OK, headers | {"Content-Type": "application/octet-stream"}, data
 
-    def tags(self, match) -> tuple[HTTPStatus, dict, bytes]:
-        body = json.dumps({"name": match["name"], "tags": self.hub.tags(match["name"])}).encode()
+    def tags(self, hub, match) -> tuple[HTTPStatus, dict, bytes]:
+        body = json.dumps({"name": match["name"], "tags": hub.tags(match["name"])}).encode()
         return HTTPStatus.OK, {"Content-Type": "application/json"}, body
 
-    def page(self, path: str, query: dict[str, list[str]], host: str) -> tuple[HTTPStatus, dict, bytes]:
+    def page(self, hub, path: str, query: dict[str, list[str]], host: str) -> tuple[HTTPStatus, dict, bytes]:
         """A page for people: the home page, or a repo's."""
         html = {"Content-Type": "text/html; charset=utf-8"}
         if path == "/":
@@ -257,7 +346,7 @@ class Registry:
             repo, tag = (query.get("repo") or [""])[0], (query.get("tag") or ["latest"])[0]
             if repo and not (PAGE.match(f"/{repo}") and TAG.fullmatch(tag)):
                 raise Unknown("NAME_INVALID", f"{repo}:{tag} is no repo and tag")
-            version = self.hub.commit(repo, tag) if repo else self.version()
+            version = hub.commit(repo, tag) if repo else self.version()
             return HTTPStatus.OK, {"Content-Type": "application/json"}, json.dumps({"version": version}).encode()
         if path == "/go":
             repo = (query.get("repo") or [""])[0].strip().strip("/").removeprefix("hf.co/")
@@ -268,8 +357,13 @@ class Registry:
             tag = (query.get("tag") or ["latest"])[0]
             if not TAG.fullmatch(tag):
                 raise Unknown("TAG_INVALID", f"{tag!r} is no tag")
-            summary = self.served.setdefault(match["name"], {})
-            return HTTPStatus.OK, html, pages.repo_page(self.hub, host, match["name"], tag, summary)
+            if self.public:
+                hub.admit(match["name"])
+            # Listed once it shows, so a repo that fails to isn't
+            summary = dict(self.served.get(match["name"], {}))
+            body = pages.repo_page(hub, host, match["name"], tag, summary)
+            self.served[match["name"]] = summary
+            return HTTPStatus.OK, html, body
         raise Unknown("NAME_INVALID", f"no such page {path}")
 
     def version(self) -> str:
@@ -277,20 +371,33 @@ class Registry:
         text = json.dumps([self.served, self.stats], sort_keys=True, default=sorted)
         return hashlib.sha256(text.encode()).hexdigest()[:16]
 
-    def handle(self, target: str, host: str = "localhost:5000") -> tuple[HTTPStatus, dict, bytes]:
+    def handle(
+        self, target: str, host: str = "localhost:5000", authorization: str = "", scheme: str = "http"
+    ) -> tuple[HTTPStatus, dict, bytes]:
+        """Answer a GET of `target`, sent to `host` over `scheme`, with
+        `authorization`, the request's header of that name."""
         path, _, query = target.partition("?")
-        api = path.startswith("/v2")
+        api = path.startswith("/v2") or (self.public and path == "/token")
+        token = credential(authorization) if api else None
+        hub = self.hub.using(token) if self.public else self.hub
         try:
+            if self.public and path == "/token":
+                return self.token(authorization)
             if not api:
-                return self.page(path, urllib.parse.parse_qs(query), host)
+                return self.page(hub, path, urllib.parse.parse_qs(query), host)
             for pattern, route in ROUTES:
                 if match := pattern.match(path):
-                    return getattr(self, route)(match)
+                    if self.public:
+                        self.admit(hub, route, match, authorization)
+                    return getattr(self, route)(hub, match)
             raise Unknown("NAME_INVALID", f"no such endpoint {path}")
         except Exception as error:
             status, code, message = failure(error, path)
             if api:
-                return status, *errors(code, message)
+                headers, body = errors(code, message)
+                if status == HTTPStatus.UNAUTHORIZED and path.startswith("/v2"):
+                    headers["WWW-Authenticate"] = challenge(scheme, host, path)
+                return status, headers, body
             body = pages.page("shem registry", f"<h1>{status.value} {status.phrase}</h1><p>{pages.e(message)}</p>")
             return status, {"Content-Type": "text/html; charset=utf-8"}, body
 
@@ -302,7 +409,7 @@ def failure(error: Exception, path: str) -> tuple[HTTPStatus, str, str]:
             return error.status, error.code, str(error)
         # A gated repo is also one not found
         case GatedRepoError():
-            return HTTPStatus.FORBIDDEN, "DENIED", "a gated repo: this host's token has no access to it"
+            return HTTPStatus.FORBIDDEN, "DENIED", "a gated repo, and no access to it with this token"
         case RepositoryNotFoundError():
             return HTTPStatus.NOT_FOUND, "NAME_UNKNOWN", "no such repo, or no access to it"
         case RevisionNotFoundError():
@@ -316,6 +423,30 @@ def failure(error: Exception, path: str) -> tuple[HTTPStatus, str, str]:
     return HTTPStatus.INTERNAL_SERVER_ERROR, "UNKNOWN", f"the registry failed: {error}"
 
 
+def credential(authorization: str) -> str | None:
+    """The Hugging Face token an Authorization header carries: a bearer
+    token this registry gave, or the password of a basic one."""
+    scheme, _, value = authorization.strip().partition(" ")
+    if scheme.lower() == "bearer":
+        token = value.strip()
+    elif scheme.lower() == "basic":
+        try:
+            token = base64.b64decode(value.strip()).decode().partition(":")[2]
+        except ValueError:
+            return None
+    else:
+        return None
+    return None if token in ("", ANONYMOUS) else token
+
+
+def challenge(scheme: str, host: str, path: str) -> str:
+    """Where a client gets a token to pull what `path` names, and for what."""
+    found = f'Bearer realm="{scheme}://{host}/token",service="{host}"'
+    if match := REPOSITORY.match(path):
+        found += f',scope="repository:{match["name"]}:pull"'
+    return found
+
+
 def errors(code: str, message: str) -> tuple[dict, bytes]:
     body = json.dumps({"errors": [{"code": code, "message": message}]}).encode()
     return {"Content-Type": "application/json"}, body
@@ -327,7 +458,13 @@ def handler(registry: Registry) -> type[BaseHTTPRequestHandler]:
         protocol_version = "HTTP/1.1"
 
         def respond(self, body: bool) -> None:
-            status, headers, data = registry.handle(self.path, self.headers.get("Host") or "localhost:5000")
+            status, headers, data = registry.handle(
+                self.path,
+                self.headers.get("Host") or "localhost:5000",
+                self.headers.get("Authorization") or "",
+                # As a proxy in front of it, such as a Space's, says it was asked
+                self.headers.get("X-Forwarded-Proto") or "http",
+            )
             self.send_response(status)
             headers = {"Docker-Distribution-API-Version": "registry/2.0", "Content-Length": str(len(data))} | headers
             for key, value in headers.items():
@@ -358,19 +495,26 @@ def handler(registry: Registry) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-def serve(address: tuple[str, int], hub=None) -> ThreadingHTTPServer:
-    """A registry over `hub` (Hugging Face's, by default) at `address`, not yet serving."""
-    return ThreadingHTTPServer(address, handler(Registry(hub or Hub())))
+def serve(address: tuple[str, int], hub=None, public: bool = False) -> ThreadingHTTPServer:
+    """A registry over `hub` (Hugging Face's, by default) at `address`, not
+    yet serving: a public one, if `public`, reading with clients' tokens."""
+    return ThreadingHTTPServer(address, handler(Registry(hub or Hub(), public)))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--host", default="127.0.0.1", help="the address to listen at (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=5000, help="the port to listen at (default 5000)")
+    parser.add_argument(
+        "--public", action="store_true", help="read repos with each client's Hugging Face token, never this host's"
+    )
     args = parser.parse_args()
-    server = serve((args.host, args.port))
+    server = serve((args.host, args.port), public=args.public)
+    whose = "each client's token" if args.public else "this host's token"
     print(
-        f"shem registry: serving Hugging Face repos at {args.host}:{args.port}, read-only", file=sys.stderr, flush=True
+        f"shem registry: serving Hugging Face repos at {args.host}:{args.port}, read-only, with {whose}",
+        file=sys.stderr,
+        flush=True,
     )
     try:
         server.serve_forever()
