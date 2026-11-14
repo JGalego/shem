@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
-use super::{Image, Store, parse_reference};
+use super::{Image, REF_NAME, Store, parse_reference};
 
 impl Store {
     /// The references `name` stands for: an image's reference, as
@@ -38,6 +38,37 @@ impl Store {
                 .collect()),
             n => bail!("{name}: the start of {n} images' IDs; give more of it"),
         }
+    }
+
+    /// Store the image in the layout `source` as `target` too, as `docker
+    /// tag` does, in place of any image that was `target`. The copy links
+    /// to the source's blobs where it can.
+    pub fn tag(&self, source: &Path, target: &str) -> anyhow::Result<()> {
+        let (_, tag) = parse_reference(target)?;
+        let dir = self.path(target)?;
+        if dir.canonicalize().ok() == Some(source.canonicalize()?) {
+            return Ok(());
+        }
+        let tmp = self.cache("tmp");
+        std::fs::create_dir_all(&tmp)?;
+        let staging = tempfile::tempdir_in(&tmp)?;
+        let copy = staging.path().join("layout");
+        link_tree(source, &copy)?;
+        // The index names the tag
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source.join("index.json"))?)?;
+        for entry in index["manifests"].as_array_mut().into_iter().flatten() {
+            entry["annotations"][REF_NAME] = tag.into();
+        }
+        // A new file, not one linked to the source's index
+        std::fs::remove_file(copy.join("index.json"))?;
+        std::fs::write(copy.join("index.json"), serde_json::to_vec(&index)?)?;
+        if dir.exists() {
+            self.discard(&dir)?;
+        }
+        std::fs::create_dir_all(dir.parent().context("no parent")?)?;
+        std::fs::rename(&copy, &dir)?;
+        Ok(())
     }
 
     /// Untag `reference`, and if no other reference holds its image, delete
@@ -124,6 +155,22 @@ impl Store {
         staging.close()?;
         Ok(())
     }
+}
+
+/// Copy the directory `from` to `to`, hard-linking its files where it can.
+fn link_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            link_tree(&entry.path(), &target)?;
+        } else if std::fs::hard_link(entry.path(), &target).is_err() {
+            std::fs::copy(entry.path(), &target)
+                .with_context(|| format!("copying {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The entries of `dir` that are not left over from making one: a staging

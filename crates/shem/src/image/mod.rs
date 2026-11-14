@@ -10,6 +10,7 @@
 
 mod build;
 mod docker;
+mod inspect;
 mod layer;
 pub mod model;
 pub mod modelpack;
@@ -27,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 pub use build::{BuildOptions, CONTAINER_MEM, VM_MEM, build};
 pub use docker::WARM_DIR;
+pub use inspect::{Step, history, inspect};
 pub use layer::unpack;
 pub use registry::{copy_to_layout, is_local, pull, push, registry_host};
 
@@ -88,13 +90,23 @@ impl Config {
         if !self.workdir.is_empty() {
             process["WorkingDir"] = self.workdir.clone().into();
         }
-        serde_json::json!({
+        // History that says what made each layer, or none at all
+        let made = self.history.iter().filter(|h| !h.empty_layer).count();
+        let history = match made == diff_ids.len() {
+            true => self.history.clone(),
+            false => Vec::new(),
+        };
+        let mut oci = serde_json::json!({
             "created": "1970-01-01T00:00:00Z",
             "architecture": "riscv32",
             "os": "linux",
             "config": process,
             "rootfs": { "type": "layers", "diff_ids": diff_ids },
-        })
+        });
+        if !history.is_empty() {
+            oci["history"] = serde_json::to_value(history).unwrap_or_default();
+        }
+        oci
     }
 
     fn from_oci(oci: &serde_json::Value) -> anyhow::Result<Self> {
@@ -127,6 +139,7 @@ impl Config {
             kernel,
             bootargs,
             model,
+            history: serde_json::from_value(oci["history"].clone()).unwrap_or_default(),
         })
     }
 }
@@ -153,6 +166,36 @@ pub struct Config {
     /// A model image's model: the directory holding its `shem.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The steps that made the image, oldest first: one for each layer, in
+    /// order, and those that made none between them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<History>,
+}
+
+/// A step that made an image, as an OCI config's `history` records it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    /// The instruction, such as `COPY hello /bin/hello`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Whether the step made no layer, as `ENV` makes none
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub empty_layer: bool,
+}
+
+impl History {
+    /// The step `created_by`, which made a layer unless `empty`.
+    pub fn by(created_by: &str, empty: bool) -> Self {
+        Self {
+            created_by: Some(created_by.into()),
+            empty_layer: empty,
+            ..Self::default()
+        }
+    }
 }
 
 /// A layer: its kind (a filesystem layer or shem's state) and its tar.

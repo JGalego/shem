@@ -7,6 +7,9 @@ just toolchain
 shem build -t hello examples/hello            # build into the local image store
 shem run hello                                # run it
 shem images                                   # list the store
+shem tag hello hello:1.0                      # store it under another name too
+shem inspect hello                            # its ID, settings and layers, as JSON
+shem history hello                            # the instruction behind each layer
 shem build -o hello.oci examples/hello        # or write an OCI image layout directory
 shem push hello ghcr.io/your-user/hello:1.0   # push to an OCI registry
 shem pull ghcr.io/your-user/hello:1.0         # pull into the store, and run it by that name
@@ -15,7 +18,7 @@ shem rmi hello                                # remove it from the store
 shem prune                                    # delete unpacked copies of images no longer stored
 ```
 
-`shem images --format` takes `json`, or a Go template as `docker images --format` does, such as `'{{.Repository}}:{{.Tag}} {{.Size}}'`, after `table ` for aligned columns with headers. Its fields are `.Repository`, `.Tag`, `.ID`, `.Digest`, `.Kind` (`program`, `vm` or `model`), `.Size` and `.Bytes`, and its functions Docker's `json`, `upper`, `lower`, `title`, `truncate`, `pad`, `join`, `split` and `len`. `shem images -q` prints the IDs alone, which `shem rmi` takes as well as names: an ID tagged more than once needs `-f` to remove every tag.
+`shem images --format` takes `json`, or a Go template as `docker images --format` does, such as `'{{.Repository}}:{{.Tag}} {{.Size}}'`, after `table ` for aligned columns with headers. Its fields are `.Repository`, `.Tag`, `.ID`, `.Digest`, `.Kind` (`program`, `vm` or `model`), `.Size` and `.Bytes`, and its functions Docker's `json`, `upper`, `lower`, `title`, `truncate`, `pad`, `join`, `split` and `len`. `shem images -q` prints the IDs alone, which `shem rmi` takes as well as names: an ID tagged more than once needs `-f` to remove every tag. `tag`, `inspect` and `history` take IDs too, or an OCI layout directory. `shem history` takes `--format` as well, with the fields `.ID`, `.Digest`, `.CreatedBy`, `.Comment`, `.Size` and `.Bytes`, and `shem inspect -f` a template over the JSON it prints, such as `'{{.Config.Entrypoint}}'`.
 
 ## With docker build
 
@@ -178,7 +181,7 @@ A shem image is a standard [OCI image](https://github.com/opencontainers/image-s
 | `dev.shem.kernel`, `dev.shem.bootargs` | VM kernel path and command line |
 | `dev.shem.model` | Model directory |
 
-A warm image's last layer holds its state under `/.shem`.
+A warm image's last layer holds its state under `/.shem`. The config's `history` records the Shemfile line behind each layer, and the instructions that made none between them, as `shem history` and `docker history` show it. The `WARM` that made the state layer comes last, commented `state`, even when later lines added layers before it.
 
 Layouts in shem's earlier format, with these media types, can still be read:
 

@@ -41,6 +41,13 @@ enum Command {
     /// Delete the copies of images the store unpacked to run, for images
     /// it no longer holds
     Prune(PruneArgs),
+    /// Store an image under another reference too
+    Tag(TagArgs),
+    /// Show images' IDs, settings and layers, as JSON
+    Inspect(InspectArgs),
+    /// Show the steps that made an image, newest first: the instruction
+    /// behind each layer, and those that made none
+    History(HistoryArgs),
     /// Push an image to an OCI registry (uses oras), or to a Hugging Face
     /// repo as hf.co/ORG/NAME[:BRANCH]
     Push(PushArgs),
@@ -234,6 +241,44 @@ struct RmiArgs {
 }
 
 #[derive(Args)]
+struct TagArgs {
+    /// The image: a reference or ID in the store, or an OCI layout directory
+    source: String,
+    /// The reference to store it as too, such as hello:1.0
+    target: String,
+}
+
+#[derive(Args)]
+struct InspectArgs {
+    /// A Go template to print each image with, such as
+    /// '{{.Config.Entrypoint}}', instead of the JSON. Fields: .Id .RepoTags
+    /// .Kind .Size .Created .Architecture .Os .Config .ConfigMediaType
+    /// .Layers .Subject
+    #[arg(short, long, value_name = "FORMAT")]
+    format: Option<String>,
+    /// The images: references or IDs in the store, or OCI layout directories
+    #[arg(required = true, value_name = "IMAGE")]
+    images: Vec<String>,
+}
+
+#[derive(Args)]
+struct HistoryArgs {
+    /// Print only the IDs of layers
+    #[arg(short, long)]
+    quiet: bool,
+    /// Show whole layer IDs and instructions
+    #[arg(long)]
+    no_trunc: bool,
+    /// `table` (the default), `json` for an object a line, or a Go template
+    /// as for `shem images`, after `table ` for columns with headers.
+    /// Fields: .ID .Digest .CreatedBy .Comment .Size .Bytes
+    #[arg(long, value_name = "FORMAT")]
+    format: Option<String>,
+    /// The image: a reference or ID in the store, or an OCI layout directory
+    image: String,
+}
+
+#[derive(Args)]
 struct PruneArgs {
     /// Delete every copy, of the images the store holds and of ModelPack
     /// artifacts run from a directory too: each is made again when next run
@@ -316,6 +361,9 @@ fn main() -> ExitCode {
         Command::Images(args) => images(args),
         Command::Rmi(args) => rmi(args),
         Command::Prune(args) => prune(args),
+        Command::Tag(args) => tag(args),
+        Command::Inspect(args) => inspect(args),
+        Command::History(args) => history(args),
         Command::Push(args) => push(args),
         Command::Pull(args) => pull(args),
         Command::Save(args) => save(args),
@@ -743,7 +791,6 @@ const IMAGE_FIELDS: [(&str, &str); 7] = [
 /// size. On a terminal, and unless NO_COLOR is set, the header is bold and
 /// the tag and ID dim.
 fn images(args: ImagesArgs) -> anyhow::Result<u8> {
-    use std::io::IsTerminal;
     let store = Store::open()?;
     let mut records = Vec::new();
     for (reference, digest) in store.list()? {
@@ -776,12 +823,7 @@ fn images(args: ImagesArgs) -> anyhow::Result<u8> {
     let format = args.format.as_deref().unwrap_or("table").trim();
     match format {
         "table" => {
-            let style = std::io::stdout().is_terminal()
-                && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-            let paint = |code: &str, text: &str| match style {
-                true => format!("\x1b[{code}m{text}\x1b[0m"),
-                false => text.to_string(),
-            };
+            let paint = painter();
             let mut rows = vec![
                 ["IMAGE", "ID", "KIND", "SIZE"]
                     .map(|h| paint("1", h))
@@ -802,38 +844,194 @@ fn images(args: ImagesArgs) -> anyhow::Result<u8> {
             }
             print_columns(&rows, &[3]);
         }
-        "json" => {
-            for record in &records {
-                println!("{record}");
+        _ => print_records(format, &records, &IMAGE_FIELDS)?,
+    }
+    Ok(0)
+}
+
+/// A function that styles text with an SGR `code`, such as `1` for bold, on
+/// a terminal unless NO_COLOR is set, and leaves it as it is otherwise.
+fn painter() -> impl Fn(&str, &str) -> String {
+    use std::io::IsTerminal;
+    let style = std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    move |code: &str, text: &str| match style {
+        true => format!("\x1b[{code}m{text}\x1b[0m"),
+        false => text.to_string(),
+    }
+}
+
+/// Print `records` as a `--format` other than the default table asks:
+/// `json`, an object a line, or a Go template for each, which after `table `
+/// prints aligned columns under a row of the headers of `fields`.
+fn print_records(
+    format: &str,
+    records: &[serde_json::Value],
+    fields: &[(&str, &str)],
+) -> anyhow::Result<()> {
+    if format == "json" {
+        for record in records {
+            println!("{record}");
+        }
+        return Ok(());
+    }
+    let (table, source) = match format.strip_prefix("table") {
+        Some(rest) if rest.starts_with(char::is_whitespace) => (true, rest.trim_start()),
+        _ => (false, format),
+    };
+    let template = Template::parse(source).context("in --format")?;
+    let mut lines = Vec::new();
+    if table {
+        let headers: serde_json::Map<_, _> = fields
+            .iter()
+            .map(|(field, header)| (field.to_string(), (*header).into()))
+            .collect();
+        lines.push(template.render(&headers.into())?);
+    }
+    for record in records {
+        lines.push(template.render(record).context("in --format")?);
+    }
+    match table {
+        true => {
+            let rows: Vec<Vec<String>> = (lines.iter().flat_map(|l| l.lines()))
+                .map(|line| line.split('\t').map(String::from).collect())
+                .collect();
+            print_columns(&rows, &[]);
+        }
+        false => lines.iter().for_each(|line| println!("{line}")),
+    }
+    Ok(())
+}
+
+/// The layout of the image `name`: an OCI layout directory, or an image in
+/// the store by reference or ID, with every reference the store holds it by.
+fn find_image(name: &str) -> anyhow::Result<(PathBuf, Vec<String>)> {
+    if Path::new(name).join("oci-layout").is_file() {
+        return Ok((image_dir(name)?, Vec::new()));
+    }
+    let store = Store::open()?;
+    let references = store.resolve(name)?;
+    let dir = store.path(&references[0])?;
+    let digest = Image::layout_digest(&dir)?;
+    let all = (store.list()?.into_iter())
+        .filter(|(_, d)| *d == digest)
+        .map(|(reference, _)| reference)
+        .collect();
+    Ok((dir, all))
+}
+
+fn tag(args: TagArgs) -> anyhow::Result<u8> {
+    let (dir, _) = find_image(&args.source)?;
+    Store::open()?.tag(&dir, &args.target)?;
+    Ok(0)
+}
+
+/// Print images as `docker inspect` does: a JSON array of them, or each by a
+/// template, going on past those it cannot find.
+fn inspect(args: InspectArgs) -> anyhow::Result<u8> {
+    let template = args
+        .format
+        .as_deref()
+        .map(Template::parse)
+        .transpose()
+        .context("in --format")?;
+    let mut found = Vec::new();
+    let mut status = 0;
+    for name in &args.images {
+        match find_image(name).and_then(|(dir, references)| image::inspect(&dir, &references)) {
+            Ok(details) => found.push(details),
+            Err(err) => {
+                eprintln!("shem: {err:#}");
+                status = 1;
             }
         }
-        _ => {
-            let (table, source) = match format.strip_prefix("table") {
-                Some(rest) if rest.starts_with(char::is_whitespace) => (true, rest.trim_start()),
-                _ => (false, format),
-            };
-            let template = Template::parse(source).context("in --format")?;
-            let mut lines = Vec::new();
-            if table {
-                let headers: serde_json::Map<_, _> = IMAGE_FIELDS
-                    .iter()
-                    .map(|(field, header)| (field.to_string(), (*header).into()))
-                    .collect();
-                lines.push(template.render(&headers.into())?);
-            }
-            for record in &records {
-                lines.push(template.render(record).context("in --format")?);
-            }
-            match table {
-                true => {
-                    let rows: Vec<Vec<String>> = (lines.iter().flat_map(|l| l.lines()))
-                        .map(|line| line.split('\t').map(String::from).collect())
-                        .collect();
-                    print_columns(&rows, &[]);
-                }
-                false => lines.iter().for_each(|line| println!("{line}")),
+    }
+    match &template {
+        Some(template) => {
+            for details in &found {
+                println!("{}", template.render(details).context("in --format")?);
             }
         }
+        None => println!("{}", serde_json::to_string_pretty(&found)?),
+    }
+    Ok(status)
+}
+
+/// The fields a `shem history --format` template can use, and their headers
+/// in a table.
+const HISTORY_FIELDS: [(&str, &str); 6] = [
+    ("ID", "LAYER"),
+    ("Digest", "DIGEST"),
+    ("CreatedBy", "CREATED BY"),
+    ("Comment", "COMMENT"),
+    ("Size", "SIZE"),
+    ("Bytes", "BYTES"),
+];
+
+/// How much of an instruction `shem history` shows, as `docker history` does.
+const CREATED_BY_WIDTH: usize = 45;
+
+/// List the steps that made an image, newest first, as `docker history`
+/// does: by default a column each for the layer's short ID, the instruction
+/// that made it, its stored size and any comment.
+fn history(args: HistoryArgs) -> anyhow::Result<u8> {
+    let (dir, _) = find_image(&args.image)?;
+    let mut records = Vec::new();
+    for step in image::history(&dir)?.into_iter().rev() {
+        let (digest, size) = match &step.layer {
+            Some(layer) => (layer.digest.clone(), layer.size),
+            None => (String::new(), 0),
+        };
+        let hex = digest.trim_start_matches("sha256:");
+        let id = match (args.no_trunc, hex.is_empty()) {
+            (_, true) => "-".to_string(),
+            (true, false) => digest.clone(),
+            (false, false) => hex[..12.min(hex.len())].to_string(),
+        };
+        let created_by = match args.no_trunc || step.created_by.chars().count() <= CREATED_BY_WIDTH
+        {
+            true => step.created_by.clone(),
+            false => {
+                let cut: String = step.created_by.chars().take(CREATED_BY_WIDTH - 1).collect();
+                format!("{cut}…")
+            }
+        };
+        records.push(serde_json::json!({
+            "ID": id,
+            "Digest": digest,
+            "CreatedBy": created_by,
+            "Comment": step.comment,
+            "Size": human_size(size),
+            "Bytes": size,
+        }));
+    }
+    if args.quiet {
+        for record in records.iter().filter(|r| r["Digest"] != "") {
+            println!("{}", record["ID"].as_str().unwrap_or_default());
+        }
+        return Ok(0);
+    }
+    let format = args.format.as_deref().unwrap_or("table").trim();
+    match format {
+        "table" => {
+            let paint = painter();
+            let mut rows = vec![
+                ["LAYER", "CREATED BY", "SIZE", "COMMENT"]
+                    .map(|h| paint("1", h))
+                    .to_vec(),
+            ];
+            for record in &records {
+                let field = |name: &str| record[name].as_str().unwrap_or_default().to_string();
+                rows.push(vec![
+                    paint("2", &field("ID")),
+                    field("CreatedBy"),
+                    field("Size"),
+                    field("Comment"),
+                ]);
+            }
+            print_columns(&rows, &[2]);
+        }
+        _ => print_records(format, &records, &HISTORY_FIELDS)?,
     }
     Ok(0)
 }
@@ -878,7 +1076,7 @@ fn print_columns(rows: &[Vec<String>], right: &[usize]) {
                 line.push_str("   ");
             }
         }
-        println!("{line}");
+        println!("{}", line.trim_end());
     }
 }
 

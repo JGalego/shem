@@ -527,6 +527,93 @@ fn pruning_deletes_the_copies_of_images_the_store_no_longer_holds() {
 }
 
 #[test]
+fn tags_store_an_image_under_another_reference_sharing_its_blobs() {
+    let home = tempfile::tempdir().unwrap();
+    let (store, a, b) = two_images(home.path());
+    let one = store.path("one").unwrap();
+    store.tag(&one, "copy:2").unwrap();
+    let copy = store.path("copy:2").unwrap();
+    assert_eq!(Image::layout_digest(&copy).unwrap(), a);
+    let index = fs::read_to_string(copy.join("index.json")).unwrap();
+    assert!(
+        index.contains(r#""org.opencontainers.image.ref.name":"2""#),
+        "{index}"
+    );
+    let original = fs::read_to_string(one.join("index.json")).unwrap();
+    assert!(original.contains(r#"ref.name":"latest""#), "{original}");
+    let blob = |dir: &Path| {
+        use std::os::unix::fs::MetadataExt;
+        let hex = &a["sha256:".len()..];
+        fs::metadata(dir.join("blobs/sha256").join(hex))
+            .unwrap()
+            .ino()
+    };
+    assert_eq!(blob(&copy), blob(&one), "linked, not copied");
+
+    // A tag in use moves to the image tagged, and tagging an image as
+    // itself changes nothing
+    store.tag(&store.path("three").unwrap(), "copy:2").unwrap();
+    assert_eq!(Image::layout_digest(&copy).unwrap(), b);
+    store.tag(&copy, "copy:2").unwrap();
+    assert_eq!(Image::layout_digest(&copy).unwrap(), b);
+    assert_eq!(store.remove("three").unwrap(), None, "copy:2 holds it");
+    assert!(store.tag(&one, "bad name").is_err());
+}
+
+#[test]
+fn builds_record_the_step_behind_each_layer() {
+    let out = tempfile::tempdir().unwrap();
+    let steps = |dir: &Path| -> Vec<(String, bool, String)> {
+        image::history(dir)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.created_by, s.layer.is_some(), s.comment))
+            .collect()
+    };
+    let step = |by: &str, layer: bool, comment: &str| (by.to_string(), layer, comment.to_string());
+    // A COPY after WARM goes before the state layer, which stays last
+    let ctx = context(
+        "FROM scratch\nCOPY echo /bin/echo\nENTRYPOINT [\"/bin/echo\"]\n\
+         WARM --until=syscall:read\nCOPY hello /bin/hello\n",
+        &[("echo", echo()), ("hello", hello())],
+    );
+    let warm = out.path().join("warm");
+    build(ctx.path())
+        .unwrap()
+        .write_layout(&warm, "latest")
+        .unwrap();
+    let base = vec![
+        step("COPY echo /bin/echo", true, ""),
+        step("ENTRYPOINT [\"/bin/echo\"]", false, ""),
+        step("COPY hello /bin/hello", true, ""),
+        step("WARM --until=syscall:read", true, "state"),
+    ];
+    assert_eq!(steps(&warm), base);
+
+    // An image built on it goes on from its history
+    let ctx = context("FROM base\nENV X=1\nCOPY hello /bin/again\n", &[]);
+    fs::rename(&warm, ctx.path().join("base")).unwrap();
+    let on = out.path().join("on");
+    fs::write(ctx.path().join("hello"), hello()).unwrap();
+    build(ctx.path())
+        .unwrap()
+        .write_layout(&on, "latest")
+        .unwrap();
+    let mut expected = base[..3].to_vec();
+    expected.push(step("ENV X=1", false, ""));
+    expected.push(step("COPY hello /bin/again", true, ""));
+    expected.push(base[3].clone());
+    assert_eq!(steps(&on), expected);
+
+    let details = image::inspect(&on, &["on:latest".into()]).unwrap();
+    assert_eq!(details["Id"], Image::layout_digest(&on).unwrap());
+    assert_eq!(details["RepoTags"], serde_json::json!(["on:latest"]));
+    assert_eq!(details["Kind"], "program");
+    assert_eq!(details["Config"]["Env"], serde_json::json!(["X=1"]));
+    assert_eq!(details["Layers"].as_array().unwrap().len(), 4);
+}
+
+#[test]
 fn images_can_be_listed_under_other_platforms_too() {
     let ctx = context(
         "FROM scratch\nCOPY hello /bin/hello\nENTRYPOINT [\"/bin/hello\"]\n",

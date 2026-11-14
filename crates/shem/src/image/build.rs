@@ -17,7 +17,8 @@ use anyhow::{Context, bail};
 use super::modelpack::{self, Artifact};
 use super::shemfile::{self, Instruction, Stage, Until};
 use super::{
-    Config, Image, Layer, ROOTFS_TYPE, STATE_TYPE, Store, find_program, layer, model, registry_host,
+    Config, History, Image, Layer, ROOTFS_TYPE, STATE_TYPE, Store, find_program, layer, model,
+    registry_host,
 };
 use crate::container::{Container, Frozen, Pause, Stop};
 use crate::linux::{RootFs, Stdio};
@@ -69,12 +70,28 @@ pub fn build(options: &BuildOptions) -> anyhow::Result<Image> {
         frozen: None,
         frozen_vm: None,
         docker: BTreeMap::new(),
+        step: last.lines[0].clone(),
+        history: Vec::new(),
+        state: None,
     };
     builder.from(base)?;
-    for instruction in &last.instructions {
+    // A stage's lines are its FROM and then one for each instruction
+    for (instruction, line) in last.instructions.iter().zip(&last.lines[1..]) {
+        builder.step = line.clone();
+        let (made, before) = (builder.history.len(), builder.state.take());
         builder.apply(instruction)?;
+        let warmed = builder.state.is_some();
+        if !warmed {
+            builder.state = before;
+        }
+        if builder.history.len() == made && !warmed {
+            builder.history.push(History::by(line, true));
+        }
     }
-    Ok(builder.image)
+    let mut image = builder.image;
+    image.config.history = builder.history;
+    image.config.history.extend(builder.state);
+    Ok(image)
 }
 
 /// The base a shem stage starts from: nothing, an image's layout directory,
@@ -143,6 +160,12 @@ struct Builder<'a> {
     frozen_vm: Option<vm::Frozen>,
     /// Docker stages built so far, by name, with their exported files.
     docker: BTreeMap<String, tempfile::TempDir>,
+    /// The line of the instruction being applied, as the history records it
+    step: String,
+    /// The steps so far, but for the one that made the state layer, which is
+    /// always last
+    history: Vec<History>,
+    state: Option<History>,
 }
 
 impl Builder<'_> {
@@ -174,9 +197,11 @@ impl Builder<'_> {
             Base::ModelPack { dir, name } => {
                 let artifact = Artifact::read(&dir)?.context("not a ModelPack artifact")?;
                 self.image = artifact.twin(&name, &self.root)?;
+                self.adopt_history();
             }
             Base::Image(dir) => {
                 self.image = Image::read_layout(&dir)?;
+                self.adopt_history();
                 // An image built on another is not the other's twin
                 self.image.subject = None;
                 self.image.unpack_rootfs(&self.root)?;
@@ -199,6 +224,36 @@ impl Builder<'_> {
             self.vars.insert(key.into(), value.into());
         }
         Ok(())
+    }
+
+    /// Take the base image's history as the start of this one's, or where it
+    /// has none that fits its layers, a step for each layer: this `FROM`.
+    fn adopt_history(&mut self) {
+        let mut history = std::mem::take(&mut self.image.config.history);
+        let layers = self.image.layers.len();
+        if history.iter().filter(|h| !h.empty_layer).count() != layers {
+            history = vec![History::by(&self.step, false); layers];
+        }
+        if self
+            .image
+            .layers
+            .last()
+            .is_some_and(|l| l.media_type == STATE_TYPE)
+            && let Some(at) = history.iter().rposition(|h| !h.empty_layer)
+        {
+            self.state = Some(history.remove(at));
+        }
+        self.history = history;
+    }
+
+    /// Make `state` the image's state layer, in place of any it had.
+    fn set_state(&mut self, state: Vec<u8>) {
+        self.image.layers.retain(|l| l.media_type != STATE_TYPE);
+        self.image.layers.push(Layer::new(STATE_TYPE, state));
+        self.state = Some(History {
+            comment: Some("state".into()),
+            ..History::by(&self.step, false)
+        });
     }
 
     fn apply(&mut self, instruction: &Instruction) -> anyhow::Result<()> {
@@ -445,6 +500,7 @@ impl Builder<'_> {
             .position(|l| l.media_type == STATE_TYPE)
             .unwrap_or(self.image.layers.len());
         self.image.layers.insert(at, Layer::new(ROOTFS_TYPE, data));
+        self.history.push(History::by(&self.step, false));
         Ok(())
     }
 
@@ -505,8 +561,7 @@ impl Builder<'_> {
         let host = serde_json::to_vec(&frozen.host)?;
         let machine = frozen.machine.encode();
         let state = layer::from_files(&[("container.json", &host), ("machine.state", &machine)])?;
-        self.image.layers.retain(|l| l.media_type != STATE_TYPE);
-        self.image.layers.push(Layer::new(STATE_TYPE, state));
+        self.set_state(state);
         self.image.config.memory = Some(frozen.machine.mem.len() as u32);
         self.frozen = Some(frozen);
         Ok(())
@@ -553,8 +608,7 @@ impl Builder<'_> {
         let host = serde_json::to_vec(&frozen.host)?;
         let state = frozen.machine.encode();
         let state = layer::from_files(&[("machine.state", &state), ("vm.json", &host)])?;
-        self.image.layers.retain(|l| l.media_type != STATE_TYPE);
-        self.image.layers.push(Layer::new(STATE_TYPE, state));
+        self.set_state(state);
         self.image.config.memory = Some(frozen.machine.mem.len() as u32);
         self.frozen_vm = Some(frozen);
         Ok(())
@@ -585,8 +639,7 @@ impl Builder<'_> {
         }
         let files: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (*n, d.as_slice())).collect();
         let state = layer::from_files(&files)?;
-        self.image.layers.retain(|l| l.media_type != STATE_TYPE);
-        self.image.layers.push(Layer::new(STATE_TYPE, state));
+        self.set_state(state);
         Ok(())
     }
 
