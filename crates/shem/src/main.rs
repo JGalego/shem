@@ -35,6 +35,12 @@ enum Command {
     Build(BuildArgs),
     /// List the images in the local store
     Images(ImagesArgs),
+    /// Remove images from the store by reference or ID, deleting each one
+    /// no reference holds any more
+    Rmi(RmiArgs),
+    /// Delete the copies of images the store unpacked to run, for images
+    /// it no longer holds
+    Prune(PruneArgs),
     /// Push an image to an OCI registry (uses oras), or to a Hugging Face
     /// repo as hf.co/ORG/NAME[:BRANCH]
     Push(PushArgs),
@@ -217,6 +223,25 @@ struct ImagesArgs {
 }
 
 #[derive(Args)]
+struct RmiArgs {
+    /// Remove an image given by ID under every reference it has
+    #[arg(short, long)]
+    force: bool,
+    /// The images, by reference, such as qwen3:latest, or by ID as `shem
+    /// images` shows it, or the start of one
+    #[arg(required = true, value_name = "IMAGE")]
+    images: Vec<String>,
+}
+
+#[derive(Args)]
+struct PruneArgs {
+    /// Delete every copy, of the images the store holds and of ModelPack
+    /// artifacts run from a directory too: each is made again when next run
+    #[arg(short, long)]
+    all: bool,
+}
+
+#[derive(Args)]
 struct LoadArgs {
     /// Read the archive from this file instead of stdin
     #[arg(short, long, value_name = "FILE")]
@@ -289,6 +314,8 @@ fn main() -> ExitCode {
         Command::Run(args) => run(args),
         Command::Build(args) => build(args),
         Command::Images(args) => images(args),
+        Command::Rmi(args) => rmi(args),
+        Command::Prune(args) => prune(args),
         Command::Push(args) => push(args),
         Command::Pull(args) => pull(args),
         Command::Save(args) => save(args),
@@ -853,6 +880,46 @@ fn print_columns(rows: &[Vec<String>], right: &[usize]) {
         }
         println!("{line}");
     }
+}
+
+/// Untag images, deleting each one no reference holds any more, and go on
+/// past those that cannot be, as `docker rmi` does.
+fn rmi(args: RmiArgs) -> anyhow::Result<u8> {
+    let store = Store::open()?;
+    let mut status = 0;
+    for name in &args.images {
+        let result = store.resolve(name).and_then(|references| {
+            if references.len() > 1 && !args.force {
+                bail!(
+                    "{name} is the ID of an image tagged {}: remove each by name, or all with -f",
+                    references.join(", ")
+                );
+            }
+            for reference in references {
+                let deleted = store.remove(&reference)?;
+                println!("Untagged: {reference}");
+                if let Some(digest) = deleted {
+                    println!("Deleted: {digest}");
+                }
+            }
+            Ok(())
+        });
+        if let Err(err) = result {
+            eprintln!("shem: {err:#}");
+            status = 1;
+        }
+    }
+    Ok(status)
+}
+
+fn prune(args: PruneArgs) -> anyhow::Result<u8> {
+    let deleted = Store::open()?.prune(args.all)?;
+    for (path, _) in &deleted {
+        println!("Deleted: {}", path.display());
+    }
+    let total = deleted.iter().map(|(_, size)| size).sum();
+    println!("Total reclaimed space: {}", human_size(total));
+    Ok(0)
 }
 
 /// `bytes` in decimal units, as `docker images` shows sizes: 435kB, 1.81MB.

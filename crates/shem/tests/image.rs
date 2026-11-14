@@ -437,6 +437,95 @@ fn layouts_summarize_what_they_run_and_the_bytes_they_take() {
     assert_eq!(summarize(model), image::Kind::Model);
 }
 
+/// A store in `home` holding images whose files are `a` and `b`: `a` as
+/// `one` and `team/two:1`, `b` as `three`. Returns their digests.
+fn two_images(home: &Path) -> (Store, String, String) {
+    let store = Store::at(home);
+    let image = |file: &[u8]| Image {
+        config: Default::default(),
+        layers: vec![image::Layer::new(
+            image::ROOTFS_TYPE,
+            tar_of(&[("f", file)]),
+        )],
+        subject: None,
+    };
+    let (a, b) = (image(b"a"), image(b"b"));
+    a.write_layout(&store.path("one").unwrap(), "latest")
+        .unwrap();
+    let a = a
+        .write_layout(&store.path("team/two:1").unwrap(), "1")
+        .unwrap();
+    let b = b
+        .write_layout(&store.path("three").unwrap(), "latest")
+        .unwrap();
+    (store, a, b)
+}
+
+#[test]
+fn images_resolve_by_reference_or_by_the_start_of_their_id() {
+    let home = tempfile::tempdir().unwrap();
+    let (store, a, b) = two_images(home.path());
+    assert_eq!(store.resolve("one").unwrap(), ["one:latest"]);
+    assert_eq!(store.resolve(&b[..19]).unwrap(), ["three:latest"]);
+    assert_eq!(
+        store.resolve(&a["sha256:".len()..][..12]).unwrap(),
+        ["one:latest", "team/two:1"]
+    );
+    let err = store.resolve("nope").unwrap_err().to_string();
+    assert!(err.contains("no such image"), "{err}");
+    // Both IDs start with one of the 16 hex digits, but not the same one
+    let shared = (0..16)
+        .map(|d| format!("{d:x}"))
+        .find(|d| a[7..].starts_with(d.as_str()) && b[7..].starts_with(d.as_str()));
+    if let Some(digit) = shared {
+        let err = store.resolve(&digit).unwrap_err().to_string();
+        assert!(err.contains("2 images"), "{err}");
+    }
+}
+
+#[test]
+fn removing_the_last_reference_deletes_the_unpacked_image() {
+    let home = tempfile::tempdir().unwrap();
+    let (store, a, _) = two_images(home.path());
+    let unpacked = home.path().join("rootfs").join(&a["sha256:".len()..]);
+    fs::create_dir_all(&unpacked).unwrap();
+
+    assert_eq!(store.remove("team/two:1").unwrap(), None);
+    assert!(unpacked.is_dir(), "`one` still holds the image");
+    assert!(
+        !home.path().join("images/team").exists(),
+        "emptied names go"
+    );
+    assert_eq!(store.remove("one").unwrap(), Some(a));
+    assert!(!unpacked.exists());
+    let names: Vec<String> = store.list().unwrap().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["three:latest"]);
+    assert!(store.remove("one").is_err());
+}
+
+#[test]
+fn pruning_deletes_the_copies_of_images_the_store_no_longer_holds() {
+    let home = tempfile::tempdir().unwrap();
+    let (store, a, _) = two_images(home.path());
+    let rootfs = home.path().join("rootfs");
+    let kept = rootfs.join(&a["sha256:".len()..]);
+    let orphan = rootfs.join("0".repeat(64));
+    let staging = rootfs.join(".tmp123");
+    for dir in [&kept, &orphan, &staging] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(orphan.join("weights"), vec![0; 1000]).unwrap();
+    // A link that stays elsewhere keeps its bytes
+    fs::write(home.path().join("linked"), b"kept").unwrap();
+    fs::hard_link(home.path().join("linked"), orphan.join("linked")).unwrap();
+
+    assert_eq!(store.prune(false).unwrap(), [(orphan.clone(), 1000)]);
+    assert!(kept.is_dir() && staging.is_dir() && !orphan.exists());
+    assert_eq!(store.prune(true).unwrap(), [(kept.clone(), 0)]);
+    assert!(staging.is_dir(), "another shem may be unpacking there");
+    assert_eq!(store.list().unwrap().len(), 3, "pruning keeps images");
+}
+
 #[test]
 fn images_can_be_listed_under_other_platforms_too() {
     let ctx = context(

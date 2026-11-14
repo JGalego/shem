@@ -11,9 +11,11 @@ shem build -o hello.oci examples/hello        # or write an OCI image layout dir
 shem push hello ghcr.io/your-user/hello:1.0   # push to an OCI registry
 shem pull ghcr.io/your-user/hello:1.0         # pull into the store, and run it by that name
 docker save hello | shem load                 # or load an image docker build made
+shem rmi hello                                # remove it from the store
+shem prune                                    # delete unpacked copies of images no longer stored
 ```
 
-`shem images --format` takes `json`, or a Go template as `docker images --format` does, such as `'{{.Repository}}:{{.Tag}} {{.Size}}'`, after `table ` for aligned columns with headers. Its fields are `.Repository`, `.Tag`, `.ID`, `.Digest`, `.Kind` (`program`, `vm` or `model`), `.Size` and `.Bytes`, and its functions Docker's `json`, `upper`, `lower`, `title`, `truncate`, `pad`, `join`, `split` and `len`. `shem images -q` prints the IDs alone.
+`shem images --format` takes `json`, or a Go template as `docker images --format` does, such as `'{{.Repository}}:{{.Tag}} {{.Size}}'`, after `table ` for aligned columns with headers. Its fields are `.Repository`, `.Tag`, `.ID`, `.Digest`, `.Kind` (`program`, `vm` or `model`), `.Size` and `.Bytes`, and its functions Docker's `json`, `upper`, `lower`, `title`, `truncate`, `pad`, `join`, `split` and `len`. `shem images -q` prints the IDs alone, which `shem rmi` takes as well as names: an ID tagged more than once needs `-f` to remove every tag.
 
 ## With docker build
 

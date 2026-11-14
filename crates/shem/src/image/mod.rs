@@ -16,6 +16,7 @@ pub mod modelpack;
 mod registry;
 pub mod session;
 pub mod shemfile;
+mod store;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
