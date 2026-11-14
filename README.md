@@ -172,7 +172,7 @@ neural/         the neural vCPU: ISA table, weight compiler, network, executors,
   src/shem_neural/model/  model images: manifest, block types, importers, tokenizer, the generate driver
   src/shem_neural/hub.py  images in Hugging Face repos, and registry.py, the registry over them
   jobs/gpu.py    GPU differential test and benchmark, for Hugging Face Jobs
-space/          the Hugging Face Space that turns checkpoints into images in the user's repos
+space/          the Hugging Face Spaces that turn checkpoints into images in the user's repos, and check receipts
 toolchain/      the guest toolchain image and the riscv-tests environment
 guests/         C guest programs
 examples/       example Shemfiles and Dockerfiles: models, use cases, programs and VMs

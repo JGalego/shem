@@ -464,7 +464,13 @@ Decoding repeats exactly on one device, while two devices round sums differently
 
 A replay shows that this image gives this reply to this prompt. It does not show who ran it, or when: for that, sign the receipt, as with `cosign sign-blob`. To see what a change to the prompt does, run the changed prompt: nothing is sampled, so any difference in the reply comes from the change.
 
-Receipts come from `shem run` only. Sessions under Docker and the API server write none yet.
+The [shem replay](https://huggingface.co/spaces/jgalego/shem-replay) Space checks a receipt in a browser: paste one, and it pulls the image, replays the prompt, and shows the verdict and each token marked by its margin. It then runs a changed prompt on the same image and shows how the reply differs, a word at a time. It takes receipts of images in public Hugging Face repos, up to 2.5 GB and 512 tokens, whose entrypoints run a model and nothing else: no tools and no server. Its steps are [`space/replay.py`](../space/replay.py), which runs from a terminal too:
+
+```sh
+uv run --project neural python space/replay.py receipt.json --prompt "Who am I?"
+```
+
+Receipts come from `shem run` only. Sessions under Docker and the API server write none yet. A receipt names its image by the reference the run was given, so once a repo is pushed to again, checking an older receipt takes the image it was made with, given to `shem replay RECEIPT IMAGE`.
 
 ## Running
 
