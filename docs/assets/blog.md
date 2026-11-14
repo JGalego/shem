@@ -179,54 +179,34 @@ oras pull jgalego-shem-registry.hf.space/qwen/qwen3-0.6b
 
 ## 🐳 Any checkpoint is an image now
 
-The registry had a gap. Docker and Kubernetes take images, and most repos on the Hub hold a checkpoint, which the registry served as a ModelPack artifact they can't use.
-
-Now it serves every checkpoint as a plain image too. Put `files/` before the repo's name, or a format, such as `safetensors/`, to leave the ONNX exports behind:
+The registry now serves any checkpoint as a plain image, for Docker to pull and Kubernetes to mount as an image volume. Put `files/` before the repo's name, or a format such as `safetensors/`:
 
 ```sh
 docker pull jgalego-shem-registry.hf.space/safetensors/huggingfacetb/smollm2-135m-instruct
 ```
 
-A Dockerfile can copy from it, and a Kubernetes Pod can mount it as an image volume. No init container, no download script, and no copy of the weights in a registry of yours:
-
-```yaml
-volumes:
-- name: model
-  image:
-    reference: jgalego-shem-registry.hf.space/safetensors/huggingfacetb/smollm2-135m-instruct
-```
-
 ![A terminal: docker pull fetches a Hugging Face checkpoint from the shem registry Space as an image, docker run mounts it and lists its files, and the sha256 of the mounted model.safetensors is the one the Hub gives for that file.](https://raw.githubusercontent.com/JGalego/shem/main/docs/assets/shem-registry-files.gif)
-*Figure 6: What Docker mounts is the file the Hub keeps, digest and all*
+*Figure 6: The mounted file matches the Hub's digest*
 
-There is a catch, and it is Docker's. A layer must be a tar, and a tar of a file is not the file, so the Hub doesn't know its digest. The registry reads each file of weights once to learn it, then sends the layer as it reads the file from the Hub again. These weights do pass through the Space, which stores none of them and takes checkpoints up to 16 GB. The Hub, which already has the bytes, could skip the detour.
+An image layer must be a tar, so these weights do pass through the Space, which stores none of them and takes checkpoints up to 16 GB.
 
 <a id="🧾-did-the-model-really-say-that"></a>
 
 ## 🧾 Did the model really say that?
 
-The useful half of shem rests on one claim: the same image and prompt give the same reply. A claim like that should be easy to check.
-
-`shem run --receipt` writes down what a model was asked and what it replied: the image's digest, the prompt, the reply, and every token the model chose, with its margin over the runner-up. `shem replay` runs it again and compares.
+`shem run --receipt` records the image's digest, the prompt, the reply and every token chosen. `shem replay` runs it again and compares:
 
 ```sh
 shem run --receipt receipt.json hf.co/jgalego/smollm2-135m-instruct-shem "Who are you?"
 shem replay receipt.json
 ```
 
-```
-I am a Shem, a golem created by the word of the Lord.
-shem: verified: the model chose the receipt's 18 tokens again
-```
-
-The digest covers the weights, the tokenizer, the system prompt, the primed session and the tools. Edit the reply in the receipt, or the prompt, and the replay says so.
-
-[shem replay](https://huggingface.co/spaces/jgalego/shem-replay) does this in a browser. Paste a receipt, and it pulls the image and replays it. Then change a word of the prompt. Nothing is sampled, so whatever changes in the reply, that word did it.
+[shem replay](https://huggingface.co/spaces/jgalego/shem-replay) does the same in a browser.
 
 ![The shem replay Space: a receipt is replayed and verified, with each token marked by how firmly it was chosen; a changed prompt shows which words of the reply change; and a receipt whose reply was edited comes back as a mismatch.](https://raw.githubusercontent.com/JGalego/shem/main/docs/assets/shem-replay.gif)
-*Figure 7: A receipt verified, a prompt changed, a forgery caught*
+*Figure 7: A receipt verified and an edited one caught*
 
-A screenshot of a chatbot proves nothing. A receipt proves one thing: this model gives this reply to this prompt. It doesn't say who ran it or when, which takes a signature, and it only works for models you can run yourself. Devices also round differently, so a token chosen by a hair can flip on other hardware. The margins say which ones, and a replay that parts there is called undecided, not a mismatch.
+A receipt shows that this model gives this reply to this prompt, not who ran it or when. A token chosen by a narrow margin can flip on other hardware, which the replay reports as undecided rather than a mismatch.
 
 <a id="🧪-try-it"></a>
 
