@@ -80,6 +80,9 @@ class Scripted:
     def say(self, i: int) -> torch.Tensor:
         return torch.nn.functional.one_hot(torch.tensor(min(i, len(self.words) - 1)), len(self.words)).float()
 
+    def choose(self) -> int:
+        return int(self.logits.argmax())
+
     def feed(self, tokens: list[int]) -> None:
         self.read += tokens
         self.logits = self.say(len(self.read))

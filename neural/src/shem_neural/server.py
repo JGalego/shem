@@ -114,9 +114,9 @@ class Models:
 
         args = generate.resolve(generate.options(request.get("argv", []), model=request["model"]))
         # This server may be root, and a container's command line is the
-        # image's: it names no host paths to write or read sessions at
-        if args.warm or args.session:
-            raise ValueError("a container's command line cannot give --warm or --session")
+        # image's: it names no host paths to write or read sessions or receipts at
+        if args.warm or args.session or args.receipt or args.replay:
+            raise ValueError("a container's command line cannot give --warm, --session, --receipt or --replay")
         if request.get("session"):
             args.session = Path(request["session"])
         user = request.get("session_id") or f"run-{uuid.uuid4()}"

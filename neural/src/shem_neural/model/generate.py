@@ -11,7 +11,8 @@ server keeps sessions across turns and saves them for `docker commit`.
 `--system-file PATH` adds a file of the image to the system prompt, such as a
 document to answer from. `--stop TEXT` ends a reply where it reaches TEXT,
 which a base model, with no end of turn of its own, needs. `--serve PORT`
-serves OpenAI's chat completions API instead (see `serve`).
+serves OpenAI's chat completions API instead (see `serve`). `--receipt FILE`
+writes a receipt of the run, and `--replay FILE` checks one (see `receipt`).
 """
 
 import argparse
@@ -23,6 +24,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import load, load_file, save, save_file
 
+from . import receipt
 from .blocks import Model
 from .manifest import locate
 from .tokenizer import Detokenizer, Tokenizer
@@ -52,6 +54,18 @@ class Session:
         self.tools: list[dict] = []
         #: Programs the model can call, run on its compiled layer
         self.runner: Tools | None = None
+        #: Each token the model chose and its margin, when a list is put here
+        self.choices: list[tuple[int, float]] | None = None
+
+    def choose(self) -> int:
+        """The token the session continues with: the likeliest. A session
+        that keeps its choices adds it, with its margin: how far its logit
+        is ahead of the runner-up's."""
+        token = int(self.logits.argmax())
+        if self.choices is not None:
+            first, second = self.logits.float().topk(2).values.tolist()
+            self.choices.append((token, first - second))
+        return token
 
     def feed(self, tokens: list[int]) -> None:
         if tokens:
@@ -236,7 +250,7 @@ def reply(
         return call >= 0 and TOOL_CALL_END not in text[call:]
 
     while len(tokens) < max_tokens or (hold and calling() and len(tokens) < max_tokens + TOOL_CALL_ALLOWANCE):
-        token = int(session.logits.argmax())
+        token = session.choose()
         if token in tokenizer.eos:
             break
         text += detokenizer.push(token)
@@ -300,6 +314,17 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
     parser.add_argument("--warm", type=Path, help="prime a session with the system prompt and save it here")
     parser.add_argument("--session", type=Path, help="continue the session saved here")
     parser.add_argument("--stats", action="store_true", help="print the token rate to stderr")
+    parser.add_argument("--receipt", type=Path, help="write a receipt of the run here, for --replay to check")
+    parser.add_argument(
+        "--replay", type=Path, help="reply to this receipt's prompt, and check that the tokens are the receipt's"
+    )
+    parser.add_argument(
+        "--subject",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="with --receipt, what the run was of, such as image=NAME@DIGEST; may be given again",
+    )
     parser.add_argument("--keep", action="store_true", help="in a container, keep the session open for docker exec")
     parser.add_argument("--device", default="auto", help="cpu, cuda, or auto: a GPU if there is one")
     parser.add_argument(
@@ -385,16 +410,33 @@ def start(
     return session
 
 
-def run(model: Model, tokenizer: Tokenizer, args: argparse.Namespace, prompt: str, out=sys.stdout, err=sys.stderr):
+def run(
+    model: Model, tokenizer: Tokenizer, args: argparse.Namespace, prompt: str, out=sys.stdout, err=sys.stderr
+) -> int:
     """One run of the driver: prime and save a session with `--warm`, or
-    reply to `prompt`, continuing the `--session` if there is one."""
+    reply to `prompt`, continuing the `--session` if there is one. With
+    `--receipt`, the reply is written down, and with `--replay`, `prompt` is
+    a receipt's, which the reply is checked against. Returns the driver's
+    exit status: 0, unless a replay is not the receipt's."""
+    checked = receipt.load(args.replay) if args.replay else None
     session = start(model, tokenizer, args, err)
     if session is None:
-        return
+        return 0
+    if args.receipt or checked:
+        session.choices = []
     started = time.perf_counter()
     replied = converse(session, tokenizer, prompt, args.max_tokens, out, err, args.stop)
     if args.stats:
         print(f"shem: {len(replied)} tokens in {time.perf_counter() - started:.1f} s", file=err)
+    if args.receipt:
+        written = receipt.record(session, prompt, dict(subject.split("=", 1) for subject in args.subject))
+        receipt.save(written, args.receipt)
+        print(f"shem: wrote a receipt of {receipt.summary(written)}, to {args.receipt}", file=err)
+    if checked:
+        status, why = receipt.check(checked, session)
+        print(f"shem: {receipt.VERDICTS[status]}: {why}", file=err)
+        return status
+    return 0
 
 
 def main() -> None:
@@ -407,9 +449,12 @@ def main() -> None:
         primed = Session.load(model, args.session) if args.session else None
         serve_forever(model, tokenizer, args, primed)
         return
-    prompt = " ".join(args.prompt) or ("" if args.warm else sys.stdin.read())
     try:
-        run(model, tokenizer, args, prompt)
+        if args.replay:
+            prompt = receipt.load(args.replay)["prompt"]
+        else:
+            prompt = " ".join(args.prompt) or ("" if args.warm else sys.stdin.read())
+        sys.exit(run(model, tokenizer, args, prompt))
     except ValueError as error:
         raise SystemExit(str(error)) from error
 

@@ -50,7 +50,7 @@ A `shem:` entrypoint selects a host-side driver, not a guest executable.
 | `--keep` | Keep a [Docker session](#sessions-under-docker) open after replying |
 | `--serve [HOST:]PORT` | [Serve OpenAI's chat completions API](#serving-openais-api) instead of replying once |
 
-Decoding is greedy and repeatable for the same model, session, prompt and device.
+Decoding is greedy and repeatable for the same model, session, prompt and device, which a [receipt](#receipts) lets anyone check.
 
 ## Sessions as layers
 
@@ -390,6 +390,51 @@ shem: ran mul 123456789 987654321 on the compiled RV32IM layer, 2,881 instructio
 - `--tools DIR` exposes programs using the chat template's tool format (JSON or `<function=...>` tags). A sibling `NAME.json` defines the description and parameters, mapped to arguments in order; without it, the interface accepts `args` and `stdin`. See [`mul.json`](../examples/tools/mul.json).
 - Calls run through `shem run --vcpu neural` with the image's weights and filesystem. Output returns as a tool reply; the CPU does not share the language model's residual stream.
 - Use a model that calls tools. Qwen3-0.6B does in this example; Qwen3.5-0.8B attempts the multiplication itself and answers incorrectly.
+
+## Receipts
+
+`shem run --receipt` writes down what a model was asked and what it replied. `shem replay` checks it, on any machine that can run the image:
+
+```
+$ shem run --receipt receipt.json hf.co/jgalego/smollm2-135m-instruct-shem "Who are you?"
+I am a Shem, a golem created by the word of the Lord.
+shem: wrote a receipt of 18 tokens, the closest call by 0.0238 at token 14, to receipt.json
+$ shem replay receipt.json
+I am a Shem, a golem created by the word of the Lord.
+shem: verified: the model chose the receipt's 18 tokens again
+```
+
+```json
+{
+ "format": "shem.receipt/v1",
+ "image": "hf.co/jgalego/smollm2-135m-instruct-shem@sha256:5339b1f9226f33bdf3a557e21349dd7a4ad498f29dcebf1a9ef3601dcf9134fd",
+ "prompt": "Who are you?",
+ "reply": "I am a Shem, a golem created by the word of the Lord.",
+ "tokens": [57, 744, 253, 334, 1676, 28, 253, 685, 12164, 2312, 411, 260, 2229, 282, 260, 5151, 30, 2],
+ "margins": [1.468582, 3.081518, 0.482496, 0.352477, 4.440741, 2.73415, 3.147675, 0.110825, 4.741564, 0.202389, 2.020863, 0.145825, 0.144969, 0.023771, 0.029436, 0.159035, 0.954207, 0.645074],
+ "runtime": {"shem": "0.3.0", "torch": "2.15.0+cpu", "device": "cpu", "machine": "x86_64", "precision": "float32", "blocks": {"attention": 1, "mlp": 1}}
+}
+```
+
+- `image` is the reference the run was given and the image's manifest digest. The digest covers everything the reply depends on besides the prompt: the weights, the tokenizer, the system prompt, the primed session, the tools and the compiled CPU they run on. A run with `--state` adds `state`, the session's reference and digest. An OCI layout directory is recorded by its digest alone.
+- `tokens` are the tokens the model chose, in order: each reply's and the token that ended it, tool calls included.
+- `margins` say how firmly: each chosen token's logit less the runner-up's.
+- `runtime` is what computed them: the neural package, torch, the device, the precision and the block versions.
+
+`shem replay RECEIPT [IMAGE]` pulls the image the receipt names if the store lacks it, refuses an image whose digest is not the receipt's, replies to the receipt's prompt and compares each choice. `IMAGE` names the same image somewhere else, such as a mirror or a layout directory, and `--state REF` the same session.
+
+| Status | Verdict | Meaning |
+|---|---|---|
+| 0 | `verified` | The model chose the receipt's tokens again |
+| 1 | `mismatch` | The tokens differ where the choice was firm, or are not the reply the receipt gives: this image does not give that reply to this prompt |
+| 3 | `undecided` | The tokens differ at a close call, which another device may make otherwise: replay on the receipt's device |
+| 125 | | The receipt could not be replayed: no such image, or one with another digest |
+
+Decoding repeats exactly on one device, while two devices round sums differently. A choice holds on any device whose logits are within half its margin of the receipt's. shem calls a choice close under a margin of 0.002 in float32, twice the tolerance [imports are held to](#comparing-an-import-with-transformers) against transformers, and 0.5 in bfloat16. These are rules of thumb, not bounds measured between devices. A receipt's closest call is printed when it is written.
+
+A replay shows that this image gives this reply to this prompt. It does not show who ran it, or when: for that, sign the receipt, as with `cosign sign-blob`. To see what a change to the prompt does, run the changed prompt: nothing is sampled, so any difference in the reply comes from the change.
+
+Receipts come from `shem run` only. Sessions under Docker and the API server write none yet.
 
 ## Running
 

@@ -287,10 +287,12 @@ pub fn is_driver(entrypoint: &[String]) -> bool {
 
 /// Run the driver `entrypoint` for an image whose filesystem is at `root`,
 /// with `args` (the run's arguments, or the image's CMD), continuing the
-/// session in `session`, or else the image's own, if it has one. Returns
-/// the driver's status.
+/// session in `session`, or else the image's own, if it has one. `host` are
+/// options of the host's, after the image's: a receipt to write or check.
+/// Returns the driver's status.
 pub fn run_driver(
     entrypoint: &[String],
+    host: &[std::ffi::OsString],
     args: &[String],
     root: &Path,
     session: Option<&Path>,
@@ -300,7 +302,7 @@ pub fn run_driver(
         "shem:generate" => python("shem_neural.model.generate"),
         other => bail!("unknown driver {other}: shem has shem:generate"),
     };
-    command.args(options);
+    command.args(options).args(host);
     let own = root.join(SESSION_DIR);
     let session = session.or(own.join("session.json").is_file().then_some(own.as_path()));
     if let Some(session) = session {

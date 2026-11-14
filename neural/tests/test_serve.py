@@ -242,8 +242,14 @@ def test_the_model_server_takes_no_session_paths_from_a_container(tmp_path):
     from shem_neural.server import Models
 
     models = Models(device="cpu")
-    for argv in (["--warm", str(tmp_path / "w")], [f"--warm={tmp_path / 'w'}"], ["--session", str(tmp_path)]):
-        with pytest.raises(ValueError, match="--warm or --session"):
+    for argv in (
+        ["--warm", str(tmp_path / "w")],
+        [f"--warm={tmp_path / 'w'}"],
+        ["--session", str(tmp_path)],
+        ["--receipt", str(tmp_path / "w")],
+        ["--replay", str(tmp_path / "w")],
+    ):
+        with pytest.raises(ValueError, match="--warm, --session, --receipt or --replay"):
             models.generate({"model": str(TINY), "argv": [*argv, "--system", "x", "hi"]}, lambda _: None)
     assert not (tmp_path / "w").exists()
     assert not models.loaded

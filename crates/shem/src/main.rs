@@ -31,6 +31,9 @@ struct Cli {
 enum Command {
     /// Run a container from an image, or from a static RV32 Linux executable
     Run(RunArgs),
+    /// Check a receipt that `shem run --receipt` wrote: reply to its prompt
+    /// on its image again, and see that the model chooses the same tokens
+    Replay(ReplayArgs),
     /// Build an image from a Shemfile
     Build(BuildArgs),
     /// List the images in the local store
@@ -138,11 +141,29 @@ struct RunArgs {
     /// published, in a registry or as an OCI layout directory
     #[arg(long, value_name = "REF")]
     state: Option<String>,
+    /// For a model image, write a receipt of the run to this file: the
+    /// image's digest, the prompt, the reply and each token the model
+    /// chose, for `shem replay` to check
+    #[arg(long, value_name = "FILE")]
+    receipt: Option<PathBuf>,
     /// An image (name[:tag] in the store, or an OCI layout directory), or an executable
     target: String,
     /// Arguments: for an image they replace its CMD
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
+}
+
+#[derive(Args)]
+struct ReplayArgs {
+    /// Continue this session rather than the one the receipt names; it
+    /// must be the same one, by its digest
+    #[arg(long, value_name = "REF")]
+    state: Option<String>,
+    /// The receipt, as `shem run --receipt` wrote it
+    receipt: PathBuf,
+    /// The image to replay it on rather than the one the receipt names; it
+    /// must be the same one, by its digest
+    image: Option<String>,
 }
 
 #[derive(Args)]
@@ -361,6 +382,7 @@ struct BootArgs {
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Run(args) => run(args),
+        Command::Replay(args) => replay(args),
         Command::Build(args) => build(args),
         Command::Images(args) => images(args),
         Command::Rmi(args) => rmi(args),
@@ -435,7 +457,15 @@ fn launch<V: Vcpu + Clone>(
         }
         let image = load_image(&args.target)?;
         if image::model::is_driver(&image.config.entrypoint) {
-            return run_model(args, &image);
+            let receipt = match &args.receipt {
+                Some(path) => Receipt::Write(path),
+                None => Receipt::None,
+            };
+            let state = args.state.as_deref().map(|state| (state, None));
+            return run_model(&args.target, &image, state, &args.args, receipt);
+        }
+        if args.receipt.is_some() {
+            bail!("--receipt is for model images: it records what a model was asked and replied");
         }
         if args.state.is_some() {
             bail!(
@@ -591,17 +621,61 @@ fn run_vm<V: Vcpu>(
 
 /// Run an image whose entrypoint is a driver, such as a model's
 /// `shem:generate`, on its filesystem, unpacked once and cached.
-fn run_model(args: &RunArgs, image: &Image) -> anyhow::Result<u8> {
-    let digest = Image::layout_digest(&image_dir(&args.target)?)?;
+/// What a run of a model image does about receipts: nothing, write one of
+/// itself to a file, or check the one in a file.
+enum Receipt<'a> {
+    None,
+    Write(&'a Path),
+    Replay(&'a Path),
+}
+
+/// What a receipt calls an image or a session: its reference and its
+/// digest, as `NAME@DIGEST`, or the digest alone for one with no name
+/// that would mean anything elsewhere, as a layout directory's.
+fn subject(reference: &str, digest: &str) -> String {
+    if Path::new(reference).join("oci-layout").is_file() {
+        return digest.into();
+    }
+    format!("{reference}@{digest}")
+}
+
+/// The reference and the digest in a receipt's `subject`.
+fn parse_subject(subject: &str) -> (Option<&str>, &str) {
+    match subject.rsplit_once('@') {
+        Some((reference, digest)) => (Some(reference), digest),
+        None => (None, subject),
+    }
+}
+
+/// Run the model image `image`, found as `target`, with `args`, or its CMD.
+/// `state` is a published session to continue, and the digest it must have,
+/// if a receipt gave one.
+fn run_model(
+    target: &str,
+    image: &Image,
+    state: Option<(&str, Option<&str>)>,
+    args: &[String],
+    receipt: Receipt,
+) -> anyhow::Result<u8> {
+    let digest = Image::layout_digest(&image_dir(target)?)?;
     let root = Store::open()?.rootfs(image, &digest)?;
-    let input = if args.args.is_empty() {
+    let input = if args.is_empty() {
         &image.config.cmd
     } else {
-        &args.args
+        args
     };
+    let mut options: Vec<std::ffi::OsString> = Vec::new();
+    match receipt {
+        Receipt::None => {}
+        Receipt::Write(path) => {
+            options.extend(["--receipt".into(), path.into(), "--subject".into()]);
+            options.push(format!("image={}", subject(target, &digest)).into());
+        }
+        Receipt::Replay(path) => options.extend(["--replay".into(), path.into()]),
+    }
     // A published session: fetched, checked against this model, and unpacked
     let session = tempfile::tempdir()?;
-    if let Some(state) = &args.state {
+    if let Some((state, expected)) = state {
         let fetched = tempfile::tempdir()?;
         let layout = if Path::new(state).join("oci-layout").is_file() {
             PathBuf::from(state)
@@ -612,11 +686,62 @@ fn run_model(args: &RunArgs, image: &Image) -> anyhow::Result<u8> {
             image::copy_to_layout(state, fetched.path(), image::is_local(host))?;
             fetched.path().to_path_buf()
         };
+        let found = Image::layout_digest(&layout)?;
+        if expected.is_some_and(|expected| expected != found) {
+            bail!(
+                "the session {state} is {found}, not the receipt's {}",
+                expected.unwrap_or_default()
+            );
+        }
+        if let Receipt::Write(_) = receipt {
+            options.push("--subject".into());
+            options.push(format!("state={}", subject(state, &found)).into());
+        }
         let model = image::session::model_digest(&root, image)?;
         image::session::load(&layout, &model, session.path())?;
     }
-    let session = args.state.as_ref().map(|_| session.path());
-    image::model::run_driver(&image.config.entrypoint, input, &root, session)
+    let session = state.map(|_| session.path());
+    image::model::run_driver(&image.config.entrypoint, &options, input, &root, session)
+}
+
+/// Check a receipt: find its image, which must have the digest it names,
+/// and have the driver reply to its prompt again and compare. The status is
+/// the driver's: 0 if the tokens are the receipt's, 1 if they are not, and
+/// 3 if they part at a choice too close to hold on another device.
+fn replay(args: ReplayArgs) -> anyhow::Result<u8> {
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&args.receipt)
+            .with_context(|| format!("reading {}", args.receipt.display()))?,
+    )
+    .with_context(|| format!("{}: not a receipt", args.receipt.display()))?;
+    let (named, digest) = parse_subject(receipt["image"].as_str().with_context(|| {
+        format!(
+            "{}: the receipt names no image: was it written by the driver alone, not `shem run`?",
+            args.receipt.display()
+        )
+    })?);
+    let target = (args.image.as_deref().or(named)).context(
+        "the receipt gives its image's digest and no name: give the image to replay it on",
+    )?;
+    let image = load_image(target)?;
+    if !image::model::is_driver(&image.config.entrypoint) {
+        bail!("{target} is not a model image");
+    }
+    let found = Image::layout_digest(&image_dir(target)?)?;
+    if found != digest {
+        bail!("{target} is {found}, not the receipt's {digest}");
+    }
+    let state = match receipt["state"].as_str().map(parse_subject) {
+        Some((named, digest)) => {
+            let state = (args.state.as_deref().or(named)).context(
+                "the receipt gives its session's digest and no name: give the session with --state",
+            )?;
+            Some((state, Some(digest)))
+        }
+        None if args.state.is_some() => bail!("the receipt's run continued no session"),
+        None => None,
+    };
+    run_model(target, &image, state, &[], Receipt::Replay(&args.receipt))
 }
 
 /// A console on this process's stdin and stdout.

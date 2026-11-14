@@ -691,6 +691,89 @@ fn sessions_publish_beside_their_models_and_resume_on_them() {
 }
 
 #[test]
+#[ignore = "needs uv and the neural package's dev dependencies"]
+fn runs_write_receipts_that_replay_on_their_image_alone() {
+    let home = tempfile::tempdir().unwrap();
+    let (_context, cold, warm) = cold_and_warm(home.path());
+    ok(shem(home.path(), &["tag", warm.to_str().unwrap(), "golem"]));
+    let receipt = home.path().join("receipt.json");
+    let written = |image: &str, state: Option<&str>| -> (String, Value) {
+        let mut args = vec!["run", "--receipt", receipt.to_str().unwrap()];
+        if let Some(state) = state {
+            args.extend(["--state", state]);
+        }
+        args.push(image);
+        args.extend(PROMPT);
+        let reply = ok(shem(home.path(), &args));
+        let held = serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+        (reply, held)
+    };
+    let replay = |args: &[&str]| -> (Option<i32>, String) {
+        let args = [&["replay", receipt.to_str().unwrap()], args].concat();
+        let done = shem(home.path(), &args);
+        (
+            done.status.code(),
+            String::from_utf8_lossy(&done.stderr).into_owned(),
+        )
+    };
+
+    // A named image's receipt names it, and replays by itself
+    let (reply, held) = written("golem", None);
+    let digest = shem::image::Image::layout_digest(&warm).unwrap();
+    assert_eq!(held["image"], format!("golem@{digest}"));
+    assert_eq!(held["prompt"], PROMPT.join(" "));
+    assert_eq!(held["reply"], reply.trim_end());
+    assert_eq!(held["tokens"].as_array().unwrap().len(), 8);
+    let (status, log) = replay(&[]);
+    assert_eq!(status, Some(0), "{log}");
+    assert!(log.contains("verified: the model chose the receipt's 8 tokens again"));
+    // The same image by another name replays it, and no other image does:
+    // not even the same model before it was primed
+    let (status, log) = replay(&[warm.to_str().unwrap()]);
+    assert_eq!(status, Some(0), "{log}");
+    let (status, log) = replay(&[cold.to_str().unwrap()]);
+    assert_ne!(status, Some(0));
+    assert!(log.contains("not the receipt's sha256:"), "{log}");
+    // A receipt that says the model replied otherwise is found out
+    let mut forged = held.clone();
+    forged["tokens"][0] = json!((held["tokens"][0].as_u64().unwrap() + 1) % 32);
+    std::fs::write(&receipt, forged.to_string()).unwrap();
+    let (status, log) = replay(&[]);
+    assert!(
+        matches!(status, Some(1 | 3)),
+        "a mismatch, or a close call: {log}"
+    );
+    assert!(
+        log.contains("parts from the receipt at token 1 of 8"),
+        "{log}"
+    );
+
+    // A layout's receipt gives its digest alone, and its session's: the
+    // replay is told where both are, and the session must be that one
+    let image = shem::image::Image::read_layout(&warm).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    image.unpack_rootfs(root.path()).unwrap();
+    std::fs::create_dir_all(root.path().join(".shem")).unwrap();
+    let state = home.path().join("state");
+    shem::image::session::publish(&image, root.path(), &state, "latest").unwrap();
+    let (_, held) = written(cold.to_str().unwrap(), Some(state.to_str().unwrap()));
+    let cold_digest = shem::image::Image::layout_digest(&cold).unwrap();
+    assert_eq!(held["image"], cold_digest.as_str());
+    assert_eq!(
+        held["state"],
+        shem::image::Image::layout_digest(&state).unwrap().as_str()
+    );
+    let (status, log) = replay(&[]);
+    assert_ne!(status, Some(0));
+    assert!(log.contains("give the image to replay it on"), "{log}");
+    let (status, log) = replay(&[cold.to_str().unwrap()]);
+    assert_ne!(status, Some(0));
+    assert!(log.contains("give the session with --state"), "{log}");
+    let (status, log) = replay(&["--state", state.to_str().unwrap(), cold.to_str().unwrap()]);
+    assert_eq!(status, Some(0), "{log}");
+}
+
+#[test]
 #[ignore = "needs uv, oras and a registry: set SHEM_TEST_REGISTRY"]
 fn sessions_push_with_their_models_and_resume_from_the_registry() {
     let registry = std::env::var("SHEM_TEST_REGISTRY").unwrap_or_else(|_| "localhost:5000".into());
