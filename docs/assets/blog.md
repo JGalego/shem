@@ -3,6 +3,7 @@
 > **Updates**
 >
 > - **2026-11-13**: [shem 0.2.0](https://github.com/JGalego/shem/releases/tag/v0.2.0) imports many more model families, including mixtures of experts, Mamba and GGUF files. It also pushes and runs [ModelPack](https://github.com/modelpack/model-spec) artifacts, publishes sessions as artifacts linked to their models, and mounts model images as Kubernetes image volumes.
+> - **2026-11-14**: [Two Hugging Face Spaces](#update-the-hub-is-a-registry-now): one turns any supported checkpoint into a shem image in your account, the other serves every repo on the Hub as an OCI registry.
 
 I wanted to find out what happens if you take "it's just a container" much too seriously. So I built [shem](https://github.com/JGalego/shem), a container runtime that does two silly things. It runs language models as containers and it runs containers on a CPU made of model weights.
 
@@ -127,6 +128,27 @@ Compiling is deterministic, so every build gets the same CPU weights, and they'r
 The neural vCPU is a toy. A beautiful, very slow toy.
 
 I think the model containers are more useful. A model with its tokenizer, prompt and session becomes one artifact with a digest. You can build it, pin it, push it, run it, exec into it and commit it with existing tools and registries. Decoding is greedy and runs in float32, so the same image, prompt and device give the same reply every time. That beats a README that ends in "pip install these and good luck".
+
+## Update: the Hub is a registry now
+
+A container runtime needs somewhere to keep its images, and models already live on the Hub, so I gave shem two Spaces.
+
+[shem my repo](https://huggingface.co/spaces/jgalego/shem-my-repo) turns a checkpoint into a shem image. Log in, name a model, add a system prompt if you like, and it builds the image, primes the session, checks the logits against transformers and pushes the lot to your account, with a ModelPack artifact on the side.
+
+![The shem my repo Space converts HuggingFaceTB/SmolLM2-135M-Instruct with a system prompt: it builds the image, compares it with transformers, and pushes it and its ModelPack artifact to jgalego/smollm2-135m-instruct-shem with a model card.](https://raw.githubusercontent.com/JGalego/shem/main/docs/assets/shem-my-repo.gif)
+*Figure 4: From checkpoint to verified image in under a minute, for a model this small.*
+
+[shem registry](https://huggingface.co/spaces/jgalego/shem-registry) goes further: it serves every model repo on the Hub as an OCI registry. Repos holding a shem image are that image. Everything else is a ModelPack artifact of its files, made on request. Nothing is mirrored and the weights never pass through the Space: they redirect to the Hub's own storage. Log in with your Hugging Face token and you get exactly what the Hub would give you, gated and private repos included.
+
+```sh
+docker pull --platform linux/riscv32 jgalego-shem-registry.hf.space/jgalego/smollm2-135m-instruct-shem
+oras pull jgalego-shem-registry.hf.space/qwen/qwen3-0.6b
+```
+
+![The shem registry Space: opening Qwen/Qwen3-0.6B shows it as a ModelPack artifact, a shem image's page shows its system prompt, model and comparison with transformers, and the home page counts a docker pull as it happens.](https://raw.githubusercontent.com/JGalego/shem/main/docs/assets/shem-registry.gif)
+*Figure 5: Hundreds of megabytes straight from the Hub, a few hundred kilobytes from the registry.*
+
+Three million models, and not one copy of their weights. Docker still can't tell the difference.
 
 ## Try it
 

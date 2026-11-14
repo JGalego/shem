@@ -261,6 +261,15 @@ shem registry --public --host 0.0.0.0 --port 5000 &
 echo "$HF_TOKEN" | docker login localhost:5000 -u hf --password-stdin   # only for gated and private repos
 ```
 
+The [shem registry](https://huggingface.co/spaces/jgalego/shem-registry) Space runs `shem registry --public` over the whole Hub, at `jgalego-shem-registry.hf.space`:
+
+```sh
+docker pull --platform linux/riscv32 jgalego-shem-registry.hf.space/jgalego/smollm2-135m-instruct-shem
+oras pull jgalego-shem-registry.hf.space/qwen/qwen3-0.6b
+```
+
+![The shem registry Space: opening Qwen/Qwen3-0.6B shows it as a ModelPack artifact, a shem image's page shows its system prompt, model and comparison with transformers, and the home page counts a docker pull as it happens.](assets/shem-registry.gif)
+
 Outside `/v2/`, the registry serves pages for people. `/` has a search box, counts of the repos served, the pulls, and the bytes sent from the Hub and from the registry, and the repos pulled since it started, last pulled first. `/ORG/NAME?tag=TAG` shows an image as a model page: badges for its comparison with transformers (from the repo's `comparison.json`), size, precision, licence and primed session; its system prompt, the model from its `shem.json`, its entrypoint and its layers; and beside them, the commands to use it with shem, oras or Docker, its digest, its source checkpoint and its tags. Open pages stay current: they ask `/live` whether what they show has changed, every 3 seconds for the home page and every 15 for a repo's, which asks the Hub for the revision's commit, and show the new version without reloading.
 
 ### Comparing an import with transformers
@@ -274,6 +283,10 @@ uv run --project neural shem-neural-verify Qwen/Qwen3-0.6B ./model --report comp
 ### The Space
 
 [`space/`](../space/README.md) is a Hugging Face Space that runs these steps for a checkpoint: it checks the architecture and size before downloading, builds the image with an optional system prompt primed by `WARM`, compares it with transformers, pushes it to `YOU/NAME-shem` with a ModelPack artifact on its `modelpack` branch, and writes a model card and `comparison.json`. Its [`convert.py`](../space/convert.py) runs the same steps from a terminal.
+
+It runs at [jgalego/shem-my-repo](https://huggingface.co/spaces/jgalego/shem-my-repo). Log in with Hugging Face, name a checkpoint, and the image lands in your account.
+
+![The shem my repo Space converts HuggingFaceTB/SmolLM2-135M-Instruct with a system prompt: it builds the image, compares it with transformers, and pushes it and its ModelPack artifact to jgalego/smollm2-135m-instruct-shem with a model card.](assets/shem-my-repo.gif)
 
 ## Sessions under Docker
 
