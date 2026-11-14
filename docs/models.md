@@ -289,6 +289,8 @@ COPY --from=localhost:5000/safetensors/huggingfacetb/smollm2-135m-instruct / /mo
 
 The image is listed for `linux/amd64` and `linux/arm64`, and has no entrypoint: it is files, for a Dockerfile to copy, or to mount as a [Kubernetes image volume](kubernetes.md#hugging-face-checkpoints-as-image-volumes) or with `docker run --mount type=image`. A mounted image is not copied into another: the weights stay on the Hub, and no registry keeps a copy of them.
 
+![A terminal: docker pull fetches a Hugging Face checkpoint from the shem registry Space as an image, docker run mounts it and lists its files, and the sha256 of the mounted model.safetensors is the one the Hub gives for that file.](assets/shem-registry-files.gif)
+
 | Name | Files |
 |---|---|
 | `files/ORG/NAME` | All of the repo's but `.gitattributes` |
@@ -469,6 +471,8 @@ The [shem replay](https://huggingface.co/spaces/jgalego/shem-replay) Space check
 ```sh
 uv run --project neural python space/replay.py receipt.json --prompt "Who am I?"
 ```
+
+![The shem replay Space: a receipt is replayed and verified, with each token marked by how firmly it was chosen; a changed prompt shows which words of the reply change; and a receipt whose reply was edited comes back as a mismatch.](assets/shem-replay.gif)
 
 Receipts come from `shem run` only. Sessions under Docker and the API server write none yet. A receipt names its image by the reference the run was given, so once a repo is pushed to again, checking an older receipt takes the image it was made with, given to `shem replay RECEIPT IMAGE`.
 
