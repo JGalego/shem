@@ -77,6 +77,9 @@ class Scripted:
         self.eos: set[int] = set()
         self.logits = self.say(0)
 
+    def room(self) -> int | None:
+        return None
+
     def say(self, i: int) -> torch.Tensor:
         return torch.nn.functional.one_hot(torch.tensor(min(i, len(self.words) - 1)), len(self.words)).float()
 

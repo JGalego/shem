@@ -290,6 +290,8 @@ jobs:
       - name: Build and run a model image as a release does, with shem-neural from its wheel instead of this checkout
         run: |
           cargo build --release --locked -p shem
+          # A cache of target/ from an earlier run may hold what it left here
+          rm -rf target/release-path target/neural-elsewhere
           dir=target/release-path && mkdir -p $dir
           printf 'FROM hf.co/trl-internal-testing/tiny-Qwen3ForCausalLM\n' > $dir/Shemfile
           # With no neural/ next to its source, shem runs shem-neural==VERSION
