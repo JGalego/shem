@@ -39,6 +39,10 @@ TOOL_CALL_END = "</tool_call>"
 TOOL_CALL_ALLOWANCE = 1024
 
 
+class ContextFull(ValueError):
+    """A conversation longer than the model's context window."""
+
+
 class Session:
     """A conversation in progress: its tokens so far, and every block's state
     after reading them, which the host can save and restore."""
@@ -67,7 +71,19 @@ class Session:
             self.choices.append((token, first - second))
         return token
 
+    def room(self) -> int | None:
+        """How many more tokens the session can read before it fills the
+        model's context window, or None if the model has no window."""
+        context = self.model.manifest.context
+        return None if context is None else context - len(self.tokens)
+
     def feed(self, tokens: list[int]) -> None:
+        room = self.room()
+        if room is not None and len(tokens) > room:
+            raise ContextFull(
+                f"the conversation would be {len(self.tokens) + len(tokens)} tokens, "
+                f"past the model's context window of {self.model.manifest.context}"
+            )
         if tokens:
             logits = self.model.forward(torch.tensor([tokens]), self.state, len(self.tokens))
             self.tokens += tokens
@@ -250,6 +266,8 @@ def reply(
         return call >= 0 and TOOL_CALL_END not in text[call:]
 
     while len(tokens) < max_tokens or (hold and calling() and len(tokens) < max_tokens + TOOL_CALL_ALLOWANCE):
+        if (room := session.room()) is not None and room < 1:
+            break  # the window is full: a reply ends where it can read no more
         token = session.choose()
         if token in tokenizer.eos:
             break

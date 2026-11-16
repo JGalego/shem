@@ -78,6 +78,9 @@ class Manifest:
     #: The model's identity, whatever files hold it: the digest of its blocks
     #: and their tensors' contents, which a saved session is checked against
     fingerprint: str | None = None
+    #: The most tokens a session may hold: the model's context window, if it
+    #: has one. A recurrent model such as Mamba has none
+    context: int | None = None
     format: str = FORMAT
 
     def save(self, directory: Path) -> None:
@@ -95,6 +98,8 @@ class Manifest:
             data["precision"] = self.precision
         if self.fingerprint:
             data["fingerprint"] = self.fingerprint
+        if self.context:
+            data["context"] = self.context
         data |= {
             "embed": self.embed.to_json(),
             "blocks": [block.to_json() for block in self.blocks],
@@ -118,6 +123,7 @@ class Manifest:
             parameters=data.get("parameters"),
             precision=data.get("precision", []),
             fingerprint=data.get("fingerprint"),
+            context=data.get("context"),
             format=data["format"],
         )
 

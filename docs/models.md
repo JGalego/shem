@@ -52,6 +52,8 @@ A `shem:` entrypoint selects a host-side driver, not a guest executable.
 
 Decoding is greedy and repeatable for the same model, session, prompt and device, which a [receipt](#receipts) lets anyone check.
 
+A session is held to the model's context window, which the importer records as `context` in `shem.json`: a conversation that would pass it is refused (the API answers `context_length_exceeded`), and a reply stops, as `length`, where the window ends. A model with no window, such as Mamba, has no limit.
+
 ## Sessions as layers
 
 `WARM --until=prompt` primes a session at build time and freezes it into the image ([`examples/golem`](../examples/golem/Shemfile)):

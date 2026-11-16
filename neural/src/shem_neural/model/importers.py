@@ -802,6 +802,16 @@ def import_gguf(location: str, gguf: str, out: Path, source: dict) -> Manifest:
         return import_checkpoint(Path(directory), out, source)
 
 
+def context_window(cfg: dict, config: dict) -> int | None:
+    """The most tokens the model reads at once, from the config of its text
+    model or of the checkpoint as a whole. A model whose blocks are all
+    recurrent (Mamba) states none: its memory does not grow."""
+    value = cfg.get("max_position_embeddings") or config.get("max_position_embeddings")
+    if not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
 def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in_place: bool = False) -> Manifest:
     """Write the checkpoint in `directory` to `out` as a shem model. `source`
     says where it came from, for the manifest. In place, `out` gets only what
@@ -855,6 +865,7 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
         parameters=sum(count for count, _ in infos),
         precision=sorted({PRECISIONS.get(dtype, dtype.lower()) for _, dtype in infos}),
         fingerprint=fingerprint(checkpoint, specs),
+        context=context_window(cfg, checkpoint.config),
     )
     manifest.save(out)
     return manifest

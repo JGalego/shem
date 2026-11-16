@@ -317,6 +317,14 @@ def test_imported_directories_are_checkpoints(imported):
     assert same(logits(loaded, tokens), logits(reference, tokens))
 
 
+def test_manifests_record_the_context_window(imported):
+    """The window sessions are held to is the checkpoint's, which for a
+    vision-language model is its text model's; Mamba has none."""
+    name, _, out, _ = imported
+    context = Manifest.load(out).context
+    assert context == (None if name == "mamba" else 128) or name in VLMS and context
+
+
 def test_manifests_count_the_models_parameters(imported):
     """The parameters and precision the manifest records, which a ModelPack
     config publishes, are those of the tensors the model runs."""

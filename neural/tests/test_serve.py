@@ -14,7 +14,7 @@ import torch
 
 from shem_neural.model import serve
 from shem_neural.model.blocks import Model
-from shem_neural.model.generate import Session
+from shem_neural.model.generate import ContextFull, Session
 from shem_neural.model.tokenizer import Tokenizer
 
 TINY = Path(__file__).parent / "sessions" / "model"
@@ -28,6 +28,9 @@ class Replies:
 
     def __init__(self):
         self.asked = []
+
+    def prompt(self, messages):
+        return [0] * 3
 
     def complete(self, messages, max_tokens=None, stops=(), out=None):
         self.asked.append((messages, max_tokens, list(stops)))
@@ -273,3 +276,37 @@ def test_models_are_kept_per_directory_and_released_with_their_last_container(tm
     models.release("c3")
     models.release("c2")
     assert not models.loaded
+
+
+def test_a_conversation_past_the_context_window_is_refused_and_a_reply_stops_at_its_end():
+    chat = chat_of(max_tokens=50)
+    chat.model.manifest.context = 20
+    long = [{"role": "user", "content": "x" * 30}]
+    with pytest.raises(ContextFull, match="context window is 20"):
+        chat.complete(long)
+    # A reply ends where the window does, saying it ran out of length
+    done = chat.complete([{"role": "user", "content": "Hi"}])
+    assert done["finish"] == "length"
+    assert done["prompt_tokens"] + done["completion_tokens"] <= 20 and done["completion_tokens"] > 0
+
+    server = serve.start(chat, serve.listen("127.0.0.1", 0))
+    host, port = server.server_address
+    try:
+        for stream in (False, True):
+            status, data = call(f"http://{host}:{port}/v1/chat/completions", {"messages": long, "stream": stream})
+            assert status == 400
+            assert json.loads(data)["error"]["code"] == "context_length_exceeded"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_session_refuses_tokens_past_the_window():
+    session = Session(Model(TINY))
+    assert session.room() is None, "the tiny model states no window"
+    session.model.manifest.context = 5
+    session.feed([1, 2, 3])
+    assert session.room() == 2
+    with pytest.raises(ContextFull):
+        session.feed([4, 5, 6])
+    assert session.tokens == [1, 2, 3], "a refused feed changes nothing"

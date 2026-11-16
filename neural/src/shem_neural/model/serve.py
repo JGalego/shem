@@ -26,7 +26,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .generate import Session, reply
+from .generate import ContextFull, Session, reply
 
 
 class Chat:
@@ -44,21 +44,32 @@ class Chat:
         self.primed = primed if primed is not None and primed.tokens else None
         self.lock = threading.Lock()
 
+    def prompt(self, messages: list[dict]) -> list[int]:
+        """The tokens a reply to `messages` starts from, the image's system
+        prompt first unless the request gives its own. Raises `ContextFull`
+        if there is no room in the model's context window to reply."""
+        if self.system and not (messages and messages[0]["role"] == "system"):
+            messages = [{"role": "system", "content": self.system}] + messages
+        tokens = self.tokenizer.chat(messages)
+        context = self.model.manifest.context
+        if context is not None and len(tokens) >= context:
+            raise ContextFull(f"the conversation is {len(tokens)} tokens, and the model's context window is {context}")
+        return tokens
+
     def complete(self, messages: list[dict], max_tokens: int | None = None, stops=(), out=None) -> dict:
         """Reply to `messages`, writing the text to `out` as it comes. Returns
         the reply, why it ended, and how many tokens each side took."""
-        if self.system and not (messages and messages[0]["role"] == "system"):
-            messages = [{"role": "system", "content": self.system}] + messages
-        prompt = self.tokenizer.chat(messages)
+        prompt = self.prompt(messages)
         max_tokens = max_tokens or self.max_tokens
         text = _Text(out)
         with self.lock, self.compute():
             session = self._start(prompt)
             session.feed(prompt[len(session.tokens) :])
             tokens = reply(session, self.tokenizer, max_tokens, text, stops=[*self.stops, *stops])
+            room = session.room()
         return {
             "text": text.value.strip(),
-            "finish": "length" if len(tokens) >= max_tokens else "stop",
+            "finish": "length" if len(tokens) >= max_tokens or (room is not None and room < 1) else "stop",
             "prompt_tokens": len(prompt),
             "completion_tokens": len(tokens),
         }
@@ -150,6 +161,10 @@ def handler(chat: Chat):
                     raise ValueError("n must be 1: replies are greedy, so they would all be the same")
             except (ValueError, KeyError, TypeError, AttributeError) as error:
                 return self._error(400, f"not a chat completion request: {error}")
+            try:
+                chat.prompt(messages)
+            except ContextFull as error:
+                return self._error(400, str(error), "context_length_exceeded")
             if request.get("stream"):
                 self._stream(messages, max_tokens, stops, request.get("stream_options") or {})
                 return
@@ -216,9 +231,9 @@ def handler(chat: Chat):
             self.end_headers()
             self.wfile.write(data)
 
-        def _error(self, status: int, text: str) -> None:
+        def _error(self, status: int, text: str, code: str | None = None) -> None:
             kind = {400: "invalid_request_error", 404: "not_found_error"}.get(status, "server_error")
-            self._json(status, {"error": {"message": text, "type": kind}})
+            self._json(status, {"error": {"message": text, "type": kind, "code": code}})
 
     return Handler
 
