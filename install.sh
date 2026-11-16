@@ -5,13 +5,15 @@
 #
 # It installs the shem binary and, on Linux, the containerd shim that Docker
 # and containerd find by name, checks the download against its SHA-256, and
-# installs uv, which model images need, when it is missing. Settings, as
+# installs uv, which model images need, and ORAS, which pushing and pulling
+# images needs, when they are missing. Settings, as
 # environment variables (pass them to sh: `curl ... | SHEM_VERSION=0.2.0 sh`):
 #
 #   SHEM_VERSION         release to install, such as 0.2.0 (default: the latest)
 #   SHEM_INSTALL_DIR     where the binaries go (default: /usr/local/bin, so
 #                        containerd finds the shim; uses sudo when needed)
 #   SHEM_SKIP_UV         set to 1 to leave uv alone
+#   SHEM_SKIP_ORAS       set to 1 to leave ORAS alone
 #   SHEM_NEURAL_SERVICE  set to 1 to run the model server as a systemd service,
 #                        for model images under Docker (Linux only)
 #
@@ -93,6 +95,38 @@ if [ "${SHEM_SKIP_UV:-0}" != 1 ] && ! command -v uv >/dev/null 2>&1; then
     curl -fsSL https://astral.sh/uv/install.sh | sh -s -- --quiet
 fi
 
+# Pushing and pulling images runs ORAS, so the first command of the quickstart,
+# which pulls an image, needs it
+oras_version=1.3.6
+if [ "${SHEM_SKIP_ORAS:-0}" != 1 ] && ! command -v oras >/dev/null 2>&1; then
+    case "$os/$arch" in
+        Linux/x86_64 | Linux/amd64) oras_target=linux_amd64 ;;
+        Linux/aarch64 | Linux/arm64) oras_target=linux_arm64 ;;
+        Darwin/arm64) oras_target=darwin_arm64 ;;
+        Darwin/x86_64) oras_target=darwin_amd64 ;;
+        *) oras_target= ;;
+    esac
+    if [ -n "$oras_target" ]; then
+        info "Installing ORAS $oras_version, which pushing and pulling images needs"
+        oras_base="https://github.com/oras-project/oras/releases/download/v$oras_version"
+        oras_file="oras_${oras_version}_$oras_target.tar.gz"
+        curl -fsSL -o "$tmp/$oras_file" "$oras_base/$oras_file" || fatal "no ORAS release at $oras_base/$oras_file"
+        curl -fsSL -o "$tmp/oras.sums" "$oras_base/oras_${oras_version}_checksums.txt" || fatal "no ORAS checksums at $oras_base"
+        oras_expected=$(grep " $oras_file\$" "$tmp/oras.sums" | cut -d' ' -f1)
+        if command -v sha256sum >/dev/null 2>&1; then
+            oras_actual=$(sha256sum "$tmp/$oras_file" | cut -d' ' -f1)
+        else
+            oras_actual=$(shasum -a 256 "$tmp/$oras_file" | cut -d' ' -f1)
+        fi
+        [ -n "$oras_expected" ] && [ "$oras_expected" = "$oras_actual" ] || fatal "checksum mismatch for $oras_file"
+        mkdir "$tmp/oras" && tar xzf "$tmp/$oras_file" -C "$tmp/oras" oras
+        $sudo install -m 755 "$tmp/oras/oras" "$install_dir/oras"
+        installed="$installed oras"
+    else
+        info "Pushing and pulling images needs ORAS: https://oras.land/docs/installation"
+    fi
+fi
+
 # The model server for model containers under Docker, which runs as root
 # because it reads the root filesystems containerd mounts
 service=
@@ -142,7 +176,7 @@ case ":$PATH:" in
     *":$install_dir:"*) ;;
     *) info "Add $install_dir to your PATH" ;;
 esac
-command -v oras >/dev/null 2>&1 || info "Pulling and pushing images needs ORAS: https://oras.land/docs/installation"
+command -v oras >/dev/null 2>&1 || [ -x "$install_dir/oras" ] || info "Pulling and pushing images needs ORAS, which was left out: https://oras.land/docs/installation"
 # Docker Desktop, and Docker on macOS, run containerd in a VM, which cannot
 # see the shim: Docker builds images there, and shem runs them
 if [ "$os" = Darwin ] || docker info --format '{{.OperatingSystem}}' 2>/dev/null | grep -q 'Docker Desktop'; then

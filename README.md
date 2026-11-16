@@ -44,7 +44,7 @@ shem build -t qwen3 examples/qwen3
 shem run qwen3 "What is a golem?"
 ```
 
-To share the image, install [🗄️ ORAS](https://oras.land) and log in to your registry:
+To share the image, log in to your registry. Pushing and pulling use [🗄️ ORAS](https://oras.land), which the install script adds when it is missing:
 
 ```sh
 shem push qwen3 ghcr.io/your-user/qwen3:0.6b
