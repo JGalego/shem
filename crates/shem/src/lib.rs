@@ -6,6 +6,7 @@
 
 pub mod container;
 pub mod daemon;
+pub mod doctor;
 pub mod elf;
 pub mod emulate;
 pub mod fdt;

@@ -78,6 +78,21 @@ enum Command {
     Registry(RegistryArgs),
     /// Boot an operating system kernel in VM mode, with its console on stdio
     Boot(BootArgs),
+    /// Check what shem needs to run what you ask of it (uv, ORAS, Docker, the
+    /// shim, the model server, a Hugging Face token, the store), and say what
+    /// to do about what is missing
+    Doctor,
+    /// Print a completion script for a shell, to put where it looks for them:
+    /// `shem completions bash > /etc/bash_completion.d/shem`
+    Completions {
+        /// bash, zsh, fish, elvish or powershell
+        shell: clap_complete::Shell,
+    },
+    /// Write the manual pages, `shem.1` and a page for each command, into a directory
+    Man {
+        /// The directory, made if need be
+        dir: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -467,6 +482,9 @@ fn main() -> ExitCode {
             args.files_limit.as_deref(),
         ),
         Command::Boot(args) => boot(args),
+        Command::Doctor => doctor(),
+        Command::Completions { shell } => completions(shell),
+        Command::Man { dir } => man(&dir),
     };
     match result {
         Ok(status) => ExitCode::from(status),
@@ -488,6 +506,38 @@ fn run(args: RunArgs) -> anyhow::Result<u8> {
             })
         }
     }
+}
+
+fn doctor() -> anyhow::Result<u8> {
+    let (text, healthy) = shem::doctor::report(&shem::doctor::run());
+    print!("{text}");
+    Ok(if healthy { 0 } else { 1 })
+}
+
+fn completions(shell: clap_complete::Shell) -> anyhow::Result<u8> {
+    use clap::CommandFactory;
+    clap_complete::generate(shell, &mut Cli::command(), "shem", &mut std::io::stdout());
+    Ok(0)
+}
+
+/// The manual pages, one for shem and one for each command, as `shem-run.1`.
+fn man(dir: &Path) -> anyhow::Result<u8> {
+    use clap::CommandFactory;
+    std::fs::create_dir_all(dir)?;
+    let command = Cli::command();
+    let mut pages = vec![("shem".to_string(), command.clone())];
+    for sub in command.get_subcommands() {
+        pages.push((
+            format!("shem-{}", sub.get_name()),
+            sub.clone().name(format!("shem-{}", sub.get_name())),
+        ));
+    }
+    for (name, page) in pages {
+        let mut out = Vec::new();
+        clap_mangen::Man::new(page).render(&mut out)?;
+        std::fs::write(dir.join(format!("{name}.1")), out)?;
+    }
+    Ok(0)
 }
 
 /// Run an executable or an image. `vcpu` makes a vCPU with the given memory

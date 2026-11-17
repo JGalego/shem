@@ -74,6 +74,10 @@ jobs:
           name="shem-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
           mkdir "$name"
           cp target/release/shem LICENSE README.md "$name/"
+          # Completions for the shells, and the manual pages, made by the binary they describe
+          mkdir -p "$name/completions"
+          for shell in bash zsh fish; do target/release/shem completions "$shell" > "$name/completions/shem.$shell"; done
+          target/release/shem man "$name/man"
           if [ -f target/release/containerd-shim-shem-v1 ]; then cp target/release/containerd-shim-shem-v1 "$name/"; fi
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"

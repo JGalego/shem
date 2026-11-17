@@ -93,6 +93,8 @@ shem run "$image" "What is a golem?"
 
 For RV32 programs, the [hello Dockerfile](examples/hello/Dockerfile) cross-compiles a static executable and copies it into `FROM scratch`. These use the reference vCPU by default; add `--annotation dev.shem.vcpu=neural` with the [neural vCPU server](docs/neural.md) running to execute on the compiled CPU instead. Language-model images use their session driver, not the vCPU.
 
+`shem doctor` checks that what you want to do has what it needs (uv, ORAS, Docker and the shim, the model server, a Hugging Face token, the store) and says what to install for what is missing. A release's archive has shell completions and manual pages, which `shem completions bash` and `shem man DIR` make from a build too.
+
 ### Cleaning up
 
 Remove the images and their unpacked copies.
