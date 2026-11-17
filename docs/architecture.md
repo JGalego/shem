@@ -40,7 +40,7 @@ The tagline says containers run inside a model's weights. Precisely:
 | Guest runs | Programs, with the host as their kernel | A kernel and its programs |
 | Guest exits on | System calls | Device access, traps, timer ticks |
 | Host provides | Linux system calls ([`linux/`](../crates/shem/src/linux/)) | The machine: CSRs, traps, a timer, a UART and a syscon ([vm.md](vm.md)) |
-| ISA needed | RV32IM (and C, on the reference vCPU, for a program built with it: the ELF header's RVC flag turns it on); the host emulates the A extension | RV32IM too; the host emulates A, the CSRs and traps |
+| ISA needed | RV32IM (and C, for a program built with it: the ELF header's RVC flag turns it on); the host emulates the A extension | RV32IM too; the host emulates A, the CSRs and traps |
 | Start | Load an ELF into memory, or thaw a warm image | Boot a kernel, or thaw a booted VM |
 
 ## The vCPU interface

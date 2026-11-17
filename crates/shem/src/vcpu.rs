@@ -60,8 +60,7 @@ pub trait Vcpu {
     /// runs without compressed instructions until it says otherwise.
     fn reset(&mut self);
     /// Run compressed (16-bit) instructions, as a program built with the C
-    /// extension has, or not. False if this vCPU cannot run them: only the
-    /// reference vCPU does, and the neural vCPU refuses such a program.
+    /// extension has, or not. False if this vCPU cannot run them.
     fn set_compressed(&mut self, on: bool) -> bool {
         !on
     }
@@ -96,8 +95,6 @@ pub enum SnapshotError {
     Truncated,
     #[error("snapshot has {found} bytes of memory, this vCPU has {expected}")]
     MemorySize { expected: usize, found: usize },
-    #[error("this vCPU does not run compressed instructions, which the snapshot's program uses")]
-    Compressed,
 }
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"SHEM";

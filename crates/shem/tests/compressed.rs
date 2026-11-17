@@ -237,3 +237,20 @@ fn a_vcpu_that_cannot_run_compressed_code_refuses_the_program_and_says_so() {
     let plain = elf_with_flags(&[ECALL], &[], 0);
     assert!(elf::load(&mut vcpu, &plain).is_ok());
 }
+
+/// The expansion of every halfword, as the neural vCPU's table has it: the
+/// digest is the one `neural/tests/test_rvc.py` computes with its own port.
+#[test]
+fn the_whole_table_of_expansions_is_the_one_the_neural_vcpu_looks_up() {
+    use sha2::{Digest, Sha256};
+    let mut sha = Sha256::new();
+    for half in 0..=u16::MAX {
+        let word = expand_compressed(half).unwrap_or(u32::MAX);
+        sha.update(word.to_le_bytes());
+    }
+    let hex: String = sha.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        hex,
+        "c0b1867d9cc6c495c3799b9e41bffc9a55d1a0654d6b28b823cd9b875f214270"
+    );
+}

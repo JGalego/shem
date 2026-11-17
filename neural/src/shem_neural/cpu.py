@@ -18,10 +18,14 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from . import isa
+from . import isa, rvc
 from .memory import DeltaMemory, FlatMemory, PagedMemory, PagePool
 
 DTYPE = torch.float64
+#: How a register's bits are stored between instructions: a bit is 0 or 1, so a
+#: byte holds it, and a guest's registers take 1 KiB where float64 takes 8.
+#: They are float64 again while an instruction computes with them.
+REG_DTYPE = torch.uint8
 TWO32 = 2.0**32
 BYTE_PLACES = torch.tensor([1.0, 256.0, 65536.0, 16777216.0], dtype=DTYPE)
 LEVELS = torch.arange(256, dtype=DTYPE)
@@ -52,7 +56,7 @@ def decompose(x: torch.Tensor, n: int) -> torch.Tensor:
 
 def _row(regs: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     """Each guest's register `index[b]`, as a row of bits."""
-    return regs.gather(1, index[:, None, None].expand(-1, 1, regs.shape[2])).squeeze(1)
+    return regs.gather(1, index[:, None, None].expand(-1, 1, regs.shape[2])).squeeze(1).to(DTYPE)
 
 
 @dataclass
@@ -61,10 +65,11 @@ class State:
 
     pc: torch.Tensor  # (B,)
     pc_low: torch.Tensor  # (B, 2): the low bits of pc, for the alignment check
-    regs: torch.Tensor  # (B, 32, 32): one row of bits per register
+    regs: torch.Tensor  # (B, 32, 32): one row of bits per register, as REG_DTYPE
     mem: DeltaMemory | PagedMemory | FlatMemory
     instret: torch.Tensor  # (B,)
     base: torch.Tensor  # (B,): the guest address where memory starts
+    compressed: torch.Tensor  # (B,): 1 for a guest that runs compressed instructions
 
     @classmethod
     def zeros(
@@ -90,10 +95,11 @@ class State:
         return cls(
             pc=zeros(batch),
             pc_low=zeros(batch, 2),
-            regs=zeros(batch, 32, 32),
+            regs=torch.zeros(batch, 32, 32, dtype=REG_DTYPE, device=device),
             mem=mem,
             instret=zeros(batch),
             base=torch.full((batch,), float(base), dtype=DTYPE, device=device),
+            compressed=zeros(batch),
         )
 
     @classmethod
@@ -107,6 +113,7 @@ class State:
             mem=PagedMemory.stack([s.mem for s in states]),
             instret=torch.cat([s.instret for s in states]),
             base=torch.cat([s.base for s in states]),
+            compressed=torch.cat([s.compressed for s in states]),
         )
 
     def unstack(self, states: list["State"]) -> None:
@@ -125,6 +132,7 @@ class State:
             self.mem.clone(),
             self.instret.clone(),
             self.base.clone(),
+            self.compressed.clone(),
         )
 
 
@@ -165,6 +173,12 @@ class NeuralCpu:
             return (x.long()[..., None] >> torch.arange(n, device=x.device) & 1).to(DTYPE)
         return decompose(x, n)
 
+    def expansions(self) -> torch.Tensor:
+        """The table of compressed instructions' expansions, on this CPU's device."""
+        if not hasattr(self, "_expansions"):
+            self._expansions = rvc.table(self.device)
+        return self._expansions
+
     @staticmethod
     def relative(x: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
         """x - base modulo 2**32: an address's offset into memory. Below the
@@ -187,12 +201,28 @@ class NeuralCpu:
         pc = s.pc
         mem_size = float(s.mem.size)
 
-        # Fetch, from memory at the base address
+        # Fetch, from memory at the base address. A guest that runs compressed
+        # instructions reads a halfword first, and if that is one, the instruction is its row of
+        # the table of expansions, 2 bytes long, with no fault for a pc that is 2-aligned
         pc_offset = self.relative(pc, s.base)
-        fetch_fault = clamp01(clamp01(pc_offset + 4 - mem_size) + s.pc_low.sum(-1))
         fetched = s.mem.read(pc_offset, 4)
         ibits = self.byte_bits(fetched).reshape(batch, 32)
         word = fetched @ self.byte_places
+        length: torch.Tensor | int
+        if self.static or s.compressed.any():
+            is16 = s.compressed * (1 - ibits[:, 0] * ibits[:, 1])
+            half = fetched[:, 0] + 256 * fetched[:, 1]
+            expanded = self.expansions()[half.long()].to(DTYPE)
+            ibits = is16[:, None] * expanded + (1 - is16[:, None]) * ibits
+            # An illegal one says its 16 bits, which the table has no word for
+            word = is16 * half + (1 - is16) * word
+            length = 4 - 2 * is16
+            # Only an odd pc is misaligned for a compressed guest, and its instruction must fit in memory
+            alignment = s.pc_low[:, 0] + (1 - s.compressed) * s.pc_low[:, 1]
+            fetch_fault = clamp01(clamp01(pc_offset + length - mem_size) + alignment)
+        else:
+            length = 4
+            fetch_fault = clamp01(clamp01(pc_offset + 4 - mem_size) + s.pc_low.sum(-1))
 
         # Decode
         is_ = torch.relu(1 - (ibits @ w["decode_w"].T + w["decode_c"]))
@@ -203,8 +233,9 @@ class NeuralCpu:
             a_bits, b_bits = _row(s.regs, rs1), _row(s.regs, rs2)
         else:
             rd = self.index(ibits[:, 7:12])
-            a_bits = torch.einsum("br,brk->bk", self.index(ibits[:, 15:20]), s.regs)
-            b_bits = torch.einsum("br,brk->bk", self.index(ibits[:, 20:25]), s.regs)
+            regs = s.regs.to(DTYPE)
+            a_bits = torch.einsum("br,brk->bk", self.index(ibits[:, 15:20]), regs)
+            b_bits = torch.einsum("br,brk->bk", self.index(ibits[:, 20:25]), regs)
         imm_bits = torch.einsum("bf,foi,bi->bo", is_ @ w["format_route"], w["imm_bits"], ibits)
         uses_imm = (is_ @ w["uses_imm"])[:, None]
         o_bits = uses_imm * imm_bits + (1 - uses_imm) * b_bits
@@ -270,7 +301,7 @@ class NeuralCpu:
         # Results, wrapped to 32 bits
         results = torch.stack(
             [
-                imm, pc + imm, pc + 4, add, sub, sll, lt, ltu,
+                imm, pc + imm, pc + length, add, sub, sll, lt, ltu,
                 self.value(xor_bits), srl, sra,
                 self.value(or_bits), self.value(and_bits),
                 mul, mulh, mulhsu, mulhu, div, divu, rem, remu,
@@ -279,7 +310,7 @@ class NeuralCpu:
             -1,
         )  # fmt: skip
         rd_value = (route * results).sum(-1)
-        wrapped = self.wrap_bits(torch.stack([rd_value, pc + 4, pc + imm, add], -1))
+        wrapped = self.wrap_bits(torch.stack([rd_value, pc + length, pc + imm, add], -1))
         rd_bits, seq_bits, relative_bits, jalr_bits = wrapped.unbind(1)
         jalr_bits = jalr_bits * self.clear_bit0
 
@@ -295,11 +326,13 @@ class NeuralCpu:
             # The same write, to the one row it can change
             writes = route.sum(-1) * (rd_index != 0) * commit
             target = rd_index[:, None, None].expand(-1, 1, s.regs.shape[2])
-            old = s.regs.gather(1, target)
-            s.regs = s.regs.scatter(1, target, old + writes[:, None, None] * (rd_bits[:, None, :] - old))
+            old = s.regs.gather(1, target).to(DTYPE)
+            new = old + writes[:, None, None] * (rd_bits[:, None, :] - old)
+            s.regs = s.regs.scatter(1, target, new.to(REG_DTYPE))
         else:
             writes = route.sum(-1) * (1 - rd[:, 0]) * commit
-            s.regs = s.regs + writes[:, None, None] * rd[:, :, None] * (rd_bits[:, None, :] - s.regs)
+            regs = s.regs.to(DTYPE)
+            s.regs = (regs + writes[:, None, None] * rd[:, :, None] * (rd_bits[:, None, :] - regs)).to(REG_DTYPE)
         if self.static or (store_size > 0).any():
             store_bytes = b_bits.reshape(batch, 4, 8) @ self.powers[:8]
             gates = commit[:, None] * clamp01(store_size[:, None] - torch.arange(4, device=self.device))

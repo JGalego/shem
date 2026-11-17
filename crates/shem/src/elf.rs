@@ -36,9 +36,7 @@ pub enum ElfError {
     WrongArch,
     #[error("only static executables are supported (link with -static or -static-pie)")]
     NotStatic,
-    #[error(
-        "this vCPU does not run compressed instructions (build with -march=rv32im, or use the reference vCPU)"
-    )]
+    #[error("this vCPU does not run compressed instructions (build with -march=rv32im)")]
     Compressed,
     #[error("hardware floating-point ABIs are not supported (build with -mabi=ilp32)")]
     FloatAbi,

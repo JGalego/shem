@@ -65,6 +65,7 @@ class Op(IntEnum):
     TURN = 15
     SAVE = 16
     CLOSE = 17
+    SET_COMPRESSED = 18
 
 
 class Status(IntEnum):
@@ -516,6 +517,9 @@ class Registry:
                 return b""
             case Op.RESET:
                 vcpu.reset()
+                return b""
+            case Op.SET_COMPRESSED:
+                vcpu.compressed = bool(args[0])
                 return b""
             case Op.SNAPSHOT:
                 return vcpu.snapshot()

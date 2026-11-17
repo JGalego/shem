@@ -26,6 +26,7 @@ const WRITE_MEM: u8 = 10;
 const RESET: u8 = 11;
 const SNAPSHOT: u8 = 12;
 const RESTORE: u8 = 13;
+const SET_COMPRESSED: u8 = 18;
 
 const OK: u8 = 0;
 const MEMORY_FAULT: u8 = 2;
@@ -249,6 +250,11 @@ impl Vcpu for NeuralVcpu {
         self.expect(RESET, &[]);
     }
 
+    fn set_compressed(&mut self, on: bool) -> bool {
+        self.expect(SET_COMPRESSED, &[u8::from(on)]);
+        true
+    }
+
     fn run(&mut self, budget: u64) -> Exit {
         let reply = self.expect(RUN, &budget.to_le_bytes());
         let word = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
@@ -274,9 +280,6 @@ impl Vcpu for NeuralVcpu {
     }
 
     fn restore(&mut self, state: &MachineState) -> Result<(), SnapshotError> {
-        if state.compressed {
-            return Err(SnapshotError::Compressed);
-        }
         if state.mem.len() != self.mem_size as usize {
             return Err(SnapshotError::MemorySize {
                 expected: self.mem_size as usize,

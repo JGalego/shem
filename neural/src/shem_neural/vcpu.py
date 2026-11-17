@@ -8,7 +8,7 @@ import struct
 import torch
 
 from .compile import compile_weights
-from .cpu import DTYPE, EBREAK, ECALL, FETCH_FAULT, ILLEGAL, MEMORY_FAULT, NeuralCpu, State
+from .cpu import DTYPE, EBREAK, ECALL, FETCH_FAULT, ILLEGAL, MEMORY_FAULT, REG_DTYPE, NeuralCpu, State
 from .memory import PagePool
 
 # Exit reasons on the wire, as `ExitReason` in the host
@@ -23,6 +23,8 @@ _EXIT_CODES = {
 
 SNAPSHOT_MAGIC = b"SHEM"
 SNAPSHOT_VERSION = 1
+#: Version 2 adds a word of flags after the header (bit 0: compressed instructions)
+SNAPSHOT_VERSION_FLAGS = 2
 _SNAPSHOT_HEADER = struct.Struct("<4sII32IQI")
 
 
@@ -76,12 +78,20 @@ class NeuralVcpu:
         self.state.pc[0] = value
         self.state.pc_low[0] = torch.tensor([value & 1, value >> 1 & 1], dtype=DTYPE)
 
+    @property
+    def compressed(self) -> bool:
+        return bool(self.state.compressed[0])
+
+    @compressed.setter
+    def compressed(self, on: bool) -> None:
+        self.state.compressed[0] = float(on)
+
     def reg(self, index: int) -> int:
-        return int(self.cpu.value(self.state.regs[0, index]))
+        return int(self.cpu.value(self.state.regs[0, index].to(DTYPE)))
 
     def set_reg(self, index: int, value: int) -> None:
         if index != 0:
-            self.state.regs[0, index] = _bits(value)
+            self.state.regs[0, index] = _bits(value).to(REG_DTYPE)
 
     def _offset(self, addr: int, length: int) -> int:
         """The offset into memory of `length` bytes at the guest address `addr`."""
@@ -109,28 +119,32 @@ class NeuralVcpu:
         regs = [self.reg(i) for i in range(32)]
         header = _SNAPSHOT_HEADER.pack(
             SNAPSHOT_MAGIC,
-            SNAPSHOT_VERSION,
+            SNAPSHOT_VERSION_FLAGS if self.compressed else SNAPSHOT_VERSION,
             self.pc,
             *regs,
             int(self.state.instret[0]),
             self.mem_size,
         )
-        return header + self.read_mem(self.base, self.mem_size)
+        flags = struct.pack("<I", 1) if self.compressed else b""
+        return header + flags + self.read_mem(self.base, self.mem_size)
 
     def restore(self, snapshot: bytes) -> None:
         """Rebuild the whole state from a canonical snapshot, whichever vCPU took it."""
         magic, version, pc, *rest = _SNAPSHOT_HEADER.unpack_from(snapshot)
         regs, (instret, mem_len) = rest[:32], rest[32:]
-        if magic != SNAPSHOT_MAGIC or version != SNAPSHOT_VERSION:
+        if magic != SNAPSHOT_MAGIC or version not in (SNAPSHOT_VERSION, SNAPSHOT_VERSION_FLAGS):
             raise ValueError("not a shem snapshot of a supported version")
-        if mem_len != self.mem_size or len(snapshot) != _SNAPSHOT_HEADER.size + mem_len:
+        body = _SNAPSHOT_HEADER.size + (4 if version == SNAPSHOT_VERSION_FLAGS else 0)
+        if mem_len != self.mem_size or len(snapshot) != body + mem_len:
             raise ValueError(f"snapshot has {mem_len} bytes of memory, this vCPU has {self.mem_size}")
+        flags = struct.unpack_from("<I", snapshot, _SNAPSHOT_HEADER.size)[0] if version == SNAPSHOT_VERSION_FLAGS else 0
         self.reset()
+        self.compressed = bool(flags & 1)
         self.pc = pc
         for i, value in enumerate(regs):
             self.set_reg(i, value)
         self.state.instret[0] = instret
-        self.write_mem(self.base, snapshot[_SNAPSHOT_HEADER.size :])
+        self.write_mem(self.base, snapshot[body:])
 
     def clone(self) -> "NeuralVcpu":
         """A copy for `fork`: same weights, copied state."""

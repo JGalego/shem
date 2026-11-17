@@ -2,8 +2,7 @@
 # Compile C for shem guests: static RV32IMA Linux executables, soft-float, against musl.
 # musl's riscv32 port needs the A extension; shem emulates it on the host.
 # With RV32_PIE set, a static PIE instead, which relocates itself where shem loads it.
-# With RV32_C set, with compressed instructions too (the C extension), which the
-# reference vCPU runs and the neural vCPU does not yet.
+# With RV32_C set, with compressed instructions too (the C extension).
 cpu=generic_rv32+m+a
 if [ -n "${RV32_C:-}" ]; then
     cpu=$cpu+c

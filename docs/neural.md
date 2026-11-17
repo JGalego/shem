@@ -1,6 +1,6 @@
 # The neural vCPU
 
-The neural vCPU is an RV32IM CPU compiled into network weights. It does not run compressed (C extension) instructions, which the reference vCPU does for a program built with them: it refuses such a program, and a snapshot of one, with an error. One forward pass executes one instruction per guest in a batch. It implements the same [`Vcpu` interface](../crates/shem/src/vcpu.rs) as the reference interpreter, accessed over a Unix socket.
+The neural vCPU is an RV32IM CPU compiled into network weights. For a program built with the C extension, which the ELF header says, its fetch also reads a halfword's row of a 65,536-row table of expansions ([`rvc.py`](../neural/src/shem_neural/rvc.py): a compressed instruction is one instruction of the base set, so no unit is added) and goes on with that, 2 bytes on, as the reference vCPU does; the table is built at run time, and a digest of it, which a Rust test holds the reference's own expansion to, says the two are one. One forward pass executes one instruction per guest in a batch. It implements the same [`Vcpu` interface](../crates/shem/src/vcpu.rs) as the reference interpreter, accessed over a Unix socket.
 
 Like [Qwenputer](https://divagr.com/blog/qwenputer), it uses compiled CPU layers and delta-rule memory. Unlike Qwenputer, it is a standalone network, not part of a pretrained language model.
 
@@ -142,8 +142,9 @@ The host talks to the server ([`server.py`](../neural/src/shem_neural/server.py)
 | 11 `RESET` | | |
 | 12 `SNAPSHOT` | | canonical machine state |
 | 13 `RESTORE` | canonical machine state | |
+| 18 `SET_COMPRESSED` | u8: 1 to run compressed instructions, 0 not to | |
 
-Exit reasons are 0 budget, 1 ecall, 2 ebreak, 3 illegal instruction (detail: the word), and 4 memory fault (detail: the address). Snapshots use the canonical format of `MachineState` in [`vcpu.rs`](../crates/shem/src/vcpu.rs), so a snapshot from either vCPU restores on the other.
+Exit reasons are 0 budget, 1 ecall, 2 ebreak, 3 illegal instruction (detail: the word, or a compressed instruction's 16 bits), and 4 memory fault (detail: the address). Snapshots use the canonical format of `MachineState` in [`vcpu.rs`](../crates/shem/src/vcpu.rs), so a snapshot from either vCPU restores on the other.
 
 ## On GPUs
 
@@ -170,4 +171,4 @@ Instructions per second, with torch 2.15 and CUDA 13.2 (the CPU row is the paged
 
 - Small batches are launch-bound; compilation and graphs reduce launches.
 - Large batches are float64-bound. The A100 reaches 7.4 million instructions/s; the L4 levels off near one million.
-- Register bits currently occupy 8 KiB per guest in float64. Lower-precision storage for bits could reduce memory traffic while retaining float64 arithmetic values.
+- Register bits are stored as bytes between instructions, 1 KiB per guest where float64 took 8, and are float64 again while an instruction computes with them. The arithmetic values stay float64, which the multiplier and divider need to stay exact. The GPU numbers above were measured before this change.

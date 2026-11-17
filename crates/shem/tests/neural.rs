@@ -119,14 +119,6 @@ fn riscv_tests_run_identically_on_both_vcpus() {
     let mut tests: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("build riscv-tests first: just neural-tests")
         .map(|entry| entry.unwrap().path())
-        // rv32uc is compressed code, which only the reference vCPU runs
-        .filter(|path| {
-            !path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("rv32uc")
-        })
         .collect();
     tests.sort();
     assert!(tests.len() >= 60);
@@ -219,6 +211,59 @@ fn random_programs_run_identically_on_both_vcpus() {
             &reference.snapshot(),
             &neural.snapshot(),
         );
+    }
+}
+
+/// Programs of compressed instructions, any form there is, among ordinary
+/// ones at any halfword, run on both vCPUs from registers that mostly point
+/// into memory: they must exit in the same way, at the same pc, with the same
+/// registers and memory.
+#[test]
+#[ignore = "needs uv and PyTorch: run `just neural-tests`"]
+fn compressed_programs_run_identically_on_both_vcpus() {
+    let pool: Vec<u16> = include_str!("data/compressed.txt")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| u16::from_str_radix(line.split_whitespace().next().unwrap(), 16).unwrap())
+        .collect();
+    let server = Server::start();
+    let mut random = Random(0x4352_5643);
+    for n in 0..60 {
+        let mut halves: Vec<u16> = Vec::new();
+        while halves.len() < 300 {
+            if random.below(6) == 0 {
+                let word = random_program(&mut random)[0];
+                halves.extend([word as u16, (word >> 16) as u16]);
+            } else {
+                halves.push(pool[random.below(pool.len() as u32) as usize]);
+            }
+        }
+        // Some that are not an instruction at all, which exit as illegal, and an end that is a breakpoint
+        halves.insert(random.below(300) as usize, 0x0000);
+        halves.extend([0x9002; 4]);
+        let code: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let mut reference = ReferenceVcpu::new(MEM);
+        let mut neural = server.vcpu();
+        for vcpu in [&mut reference as &mut dyn Vcpu, &mut neural] {
+            assert!(vcpu.set_compressed(true));
+            vcpu.write_mem(0, &code).unwrap();
+        }
+        for reg in 1..32 {
+            // Values into the low part of memory, mostly, where the program's own code is not
+            let value = match random.below(4) {
+                0 => random.next(),
+                _ => 0x8000 + (random.next() & 0x7ffc),
+            };
+            reference.set_reg(reg, value);
+            neural.set_reg(reg, value);
+        }
+        assert_eq!(neural.run(3_000), reference.run(3_000), "program {n}: exit");
+        assert_same(
+            &format!("compressed program {n}"),
+            &reference.snapshot(),
+            &neural.snapshot(),
+        );
+        assert!(neural.snapshot().compressed);
     }
 }
 

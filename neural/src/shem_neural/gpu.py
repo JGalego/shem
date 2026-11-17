@@ -50,7 +50,15 @@ class Batch:
 
     def _advance(self, pc, pc_low, regs, mem, instret, halted, exits, info) -> None:
         """One step, written back into the buffers it read."""
-        s = State(pc=pc, pc_low=pc_low, regs=regs, mem=FlatMemory.of(mem), instret=instret, base=self.state.base)
+        s = State(
+            pc=pc,
+            pc_low=pc_low,
+            regs=regs,
+            mem=FlatMemory.of(mem),
+            instret=instret,
+            base=self.state.base,
+            compressed=self.state.compressed,
+        )
         step_exits, step_info = self.cpu.step(s, active=~halted)
         new = (step_exits.sum(-1) > 0) & ~halted
         exits.copy_(torch.where(new[:, None], step_exits, exits))
