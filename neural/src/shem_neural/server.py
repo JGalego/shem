@@ -116,42 +116,53 @@ class Models:
         Containers of images with the same weights share one model: it is
         found by the fingerprint its manifest records, which it was checked
         against as it loaded, so an image that claims another's weights
-        cannot make a model of its own pass for them. Each image's tokenizer
+        cannot make a model of its own pass for them: one whose weights are
+        not the ones its fingerprint names gets a model that is its alone. Each image's tokenizer
         and chat template are its own. A model with no fingerprint (one
         imported before them) is its directory's alone. Loading takes the
         time it takes, and holds up only the others that want that model."""
-        from .model.blocks import Model
+        from .model.blocks import FingerprintMismatch, Model
         from .model.generate import dtype as torch_dtype
         from .model.manifest import Manifest
         from .model.tokenizer import Tokenizer
 
         manifest = Manifest.load(directory)
-        shared = manifest.fingerprint and all(spec.file is None for spec in manifest.blocks)
-        identity = manifest.fingerprint if shared else str(Path(directory).resolve())
-        key = f"{identity}\0{dtype}\0{quantize or ''}\0{[str(a) for a in adapters or []]}"
-        with self.lock:
-            # Claimed first, so that a model being loaded is not released from under its loader
-            self.idle.pop(key, None)
-            self.users.setdefault(key, set()).add(user)
-            loading = self.loading.setdefault(key, threading.Lock())
-        try:
-            with loading:
-                with self.lock:
-                    model = self.loaded.get(key)
-                if model is None:
-                    model = Model(
-                        directory,
-                        dtype=torch_dtype(dtype),
-                        device=self.device,
-                        quantize=quantize,
-                        verify=bool(shared),
-                        adapters=adapters,
-                    )
+        shared = bool(manifest.fingerprint and all(spec.file is None for spec in manifest.blocks))
+
+        def load(shared: bool):
+            identity = manifest.fingerprint if shared else str(Path(directory).resolve())
+            key = f"{identity}\0{dtype}\0{quantize or ''}\0{[str(a) for a in adapters or []]}"
+            with self.lock:
+                # Claimed first, so that a model being loaded is not released from under its loader
+                self.idle.pop(key, None)
+                self.users.setdefault(key, set()).add(user)
+                loading = self.loading.setdefault(key, threading.Lock())
+            try:
+                with loading:
                     with self.lock:
-                        self.loaded[key] = model
-        except BaseException:
-            self.release(user)
-            raise
+                        found = self.loaded.get(key)
+                    if found is None:
+                        found = Model(
+                            directory,
+                            dtype=torch_dtype(dtype),
+                            device=self.device,
+                            quantize=quantize,
+                            verify=shared,
+                            adapters=adapters,
+                        )
+                        with self.lock:
+                            self.loaded[key] = found
+            except BaseException:
+                self.release(user)
+                raise
+            return found
+
+        try:
+            model = load(shared)
+        except FingerprintMismatch:
+            # Not the weights its fingerprint names, or a fingerprint another version made: it runs
+            # what it holds, in a model of its own that no other image can be given
+            model = load(False)
         return model, Tokenizer(directory, manifest.tokenizer)
 
     def release(self, user: str) -> None:

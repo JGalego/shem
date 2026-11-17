@@ -563,6 +563,10 @@ def resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
+class FingerprintMismatch(ValueError):
+    """Weights that are not the ones their manifest's fingerprint names."""
+
+
 class Adapter:
     """A LoRA adapter, as PEFT saves one: low-rank matrices for some of a
     model's weights, `adapter_model.safetensors` and `adapter_config.json` in a
@@ -697,7 +701,9 @@ class Model:
                     f"such as {missing[0]}: is it for another model?"
                 )
         if digest is not None and "sha256:" + digest.hexdigest() != m.fingerprint:
-            raise ValueError(f"{self.directory}: the weights are not the ones the manifest's fingerprint names")
+            raise FingerprintMismatch(
+                f"{self.directory}: the weights are not the ones the manifest's fingerprint names"
+            )
         self.head_norm = head["norm"]
         self.head_weight = self.embed if m.head.params.get("tied") else head["weight"]
         self.head_params = m.head.params

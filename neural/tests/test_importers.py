@@ -598,7 +598,7 @@ def test_a_model_with_other_weights_than_its_fingerprint_names_is_refused(import
         Model(copy, verify=True)
 
 
-def test_containers_of_one_model_share_it_and_a_forgery_does_not_pass_for_it(imported, tmp_path):
+def test_containers_of_one_model_share_it_and_a_forgery_gets_a_model_of_its_own(imported, tmp_path):
     import shutil
 
     from safetensors.torch import load_file, save_file
@@ -627,9 +627,19 @@ def test_containers_of_one_model_share_it_and_a_forgery_does_not_pass_for_it(imp
     assert models.get(twin, "float32", "c4")[0] is legit, "its own files are never loaded: it runs the real weights"
     models.release("c3")
     models.release("c4")
-    with pytest.raises(ValueError, match="fingerprint"):
-        models.get(twin, "float32", "c5")
-    assert not models.loaded and not any(models.users.values()), "the refused one holds nothing"
+    # With none holding the real model, the forgery is checked as it loads, and is not the model it claims:
+    # it runs what its files hold, in a model of its own, which an image of the real one is never given
+    forged = models.get(twin, "float32", "c5")[0]
+    assert forged is not legit
+    real = models.get(out, "float32", "c6")[0]
+    assert real is not forged and len(models.loaded) == 2
+    from shem_neural.model.generate import Session
+
+    one, two = Session(real), Session(forged)
+    one.feed([1, 5, 7])
+    two.feed([1, 5, 7])
+    assert not torch.allclose(one.logits, two.logits), "each runs the weights its own files hold"
+    assert models.get(out, "float32", "c7")[0] is real, "and the real one is shared as before"
 
 
 def test_sessions_read_together_what_they_read_alone(imported):
