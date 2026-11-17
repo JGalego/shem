@@ -681,10 +681,24 @@ fn build(args: BuildArgs) -> anyhow::Result<u8> {
                 dir.display()
             );
         }
-        std::fs::remove_dir_all(&dir)?;
     }
     let (_, tag_name) = image::parse_reference(&tag)?;
-    let digest = built.write_layout(&dir, tag_name)?;
+    let store = Store::open()?;
+    let digest = if store.holds(&dir) {
+        // Written whole beside the store and moved in, so that nothing reads, or builds over, half an image
+        let parent = dir.parent().context("no parent")?;
+        std::fs::create_dir_all(parent)?;
+        let staging = tempfile::tempdir_in(parent)?;
+        let layout = staging.path().join("layout");
+        let digest = built.write_layout(&layout, tag_name)?;
+        store.install(&layout, &dir)?;
+        digest
+    } else {
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        built.write_layout(&dir, tag_name)?
+    };
     eprintln!("shem: built {tag} {digest}");
     Ok(0)
 }

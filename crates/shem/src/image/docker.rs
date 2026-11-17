@@ -180,6 +180,7 @@ impl Store {
             names.push(name);
         }
 
+        let _lock = self.lock()?;
         for (i, (entry, name)) in index.manifests.iter().zip(&names).enumerate() {
             let (_, image_tag) = super::parse_reference(name)?;
             // Each image gets its own layout; they share the archive's blobs

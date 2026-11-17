@@ -196,6 +196,8 @@ New layers use zstd-compressed tars. A booted Linux image is about 2 MB despite 
 
 Images in the local store live under `$SHEM_HOME/images/<name>/<tag>`, by default `~/.local/share/shem/images`. Program and VM runs unpack a fresh filesystem and remove it afterwards. Model images [cache their unpacked filesystem](models.md#running).
 
+A builder, a pull, a load, `shem tag`, `shem rmi` and `shem prune` take a lock on the store while they change it, so processes at once, builds of one tag among them, never leave half an image or remove one a build is storing; a built or pulled image is written whole beside the store and moved in. Reading takes no lock.
+
 Registry transfers use [ORAS](https://oras.land) and preserve manifest digests. Use `--plain-http` for a local registry without TLS.
 
 ## The build cache

@@ -17,7 +17,7 @@ use std::process::Command;
 use anyhow::{Context, bail};
 
 use super::modelpack::Artifact;
-use super::{BuildOptions, Image, build, model, parse_reference};
+use super::{BuildOptions, Image, Store, build, model, parse_reference};
 
 fn oras() -> Command {
     Command::new(std::env::var_os("SHEM_ORAS").unwrap_or_else(|| "oras".into()))
@@ -125,10 +125,15 @@ pub fn pull(remote: &str, dir: &Path, plain_http: bool) -> anyhow::Result<String
             layout
         }
     };
-    if dir.exists() {
-        std::fs::remove_dir_all(dir)?;
+    match Store::open() {
+        Ok(store) if store.holds(dir) => store.install(&layout, dir)?,
+        _ => {
+            if dir.exists() {
+                std::fs::remove_dir_all(dir)?;
+            }
+            std::fs::rename(&layout, dir)?;
+        }
     }
-    std::fs::rename(&layout, dir)?;
     Image::layout_digest(dir)
 }
 

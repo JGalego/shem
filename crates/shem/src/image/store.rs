@@ -9,7 +9,51 @@ use anyhow::{Context, bail};
 
 use super::{Image, REF_NAME, Store, parse_reference};
 
+/// The store's lock, held while an image or a copy is replaced or removed:
+/// released when dropped, or when the process ends.
+pub struct StoreLock(#[allow(dead_code)] std::fs::File);
+
 impl Store {
+    /// Lock the store against other shem processes that change it, so that
+    /// two builds of one tag, a pull racing a `shem rmi`, or a `shem prune`
+    /// under a build do not leave half an image or take one away. Reading
+    /// takes no lock: a layout is moved into place whole.
+    pub fn lock(&self) -> anyhow::Result<StoreLock> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.cache("store.lock");
+        std::fs::create_dir_all(path.parent().context("no store directory")?)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: the descriptor is open for the call
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("locking the store");
+        }
+        Ok(StoreLock(file))
+    }
+
+    /// Whether `dir` is a place in this store.
+    pub fn holds(&self, dir: &Path) -> bool {
+        dir.starts_with(&self.root)
+    }
+
+    /// Put the layout in `staged`, made beside it, in place as `dir`, which
+    /// an image of the same reference leaves to it.
+    pub fn install(&self, staged: &Path, dir: &Path) -> anyhow::Result<()> {
+        let _lock = self.lock()?;
+        if dir.exists() {
+            self.discard(dir)?;
+        }
+        std::fs::create_dir_all(dir.parent().context("no parent")?)?;
+        std::fs::rename(staged, dir).with_context(|| format!("storing {}", dir.display()))?;
+        Ok(())
+    }
+
     /// The references `name` stands for: an image's reference, as
     /// `name[:tag]`, or else a prefix of an image ID, with or without
     /// `sha256:`, and every reference of the image it names.
@@ -44,6 +88,7 @@ impl Store {
     /// tag` does, in place of any image that was `target`. The copy links
     /// to the source's blobs where it can.
     pub fn tag(&self, source: &Path, target: &str) -> anyhow::Result<()> {
+        let _lock = self.lock()?;
         let (_, tag) = parse_reference(target)?;
         let dir = self.path(target)?;
         if dir.canonicalize().ok() == Some(source.canonicalize()?) {
@@ -74,6 +119,7 @@ impl Store {
     /// Untag `reference`, and if no other reference holds its image, delete
     /// the copy of it unpacked to run, returning its digest as deleted.
     pub fn remove(&self, reference: &str) -> anyhow::Result<Option<String>> {
+        let _lock = self.lock()?;
         let dir = self.path(reference)?;
         if !dir.join("oci-layout").is_file() {
             bail!("{reference}: no such image (see `shem images`)");
@@ -105,6 +151,7 @@ impl Store {
     /// alike, to be made again when next run, and the build cache. Returns each path deleted and
     /// the bytes that freed.
     pub fn prune(&self, all: bool) -> anyhow::Result<Vec<(PathBuf, u64)>> {
+        let _lock = self.lock()?;
         let mut kept: HashSet<String> = HashSet::new();
         let mut doomed = Vec::new();
         for twin in entries(&self.cache("twins"))? {
@@ -313,5 +360,46 @@ mod tests {
         );
         assert_eq!(store.prune(true).unwrap().len(), 2);
         assert_eq!(store.cached_warm("k"), None);
+    }
+
+    #[test]
+    fn the_lock_keeps_changes_to_the_store_from_interleaving() {
+        let home = tempfile::tempdir().unwrap();
+        let counter = home.path().join("counter");
+        std::fs::write(&counter, "0").unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (home, counter) = (home.path().to_path_buf(), counter.clone());
+                std::thread::spawn(move || {
+                    let store = Store::at(&home);
+                    for _ in 0..40 {
+                        let _lock = store.lock().unwrap();
+                        let n: u32 = std::fs::read_to_string(&counter).unwrap().parse().unwrap();
+                        std::thread::yield_now();
+                        std::fs::write(&counter, (n + 1).to_string()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "320");
+    }
+
+    #[test]
+    fn an_image_is_installed_whole_and_replaces_the_one_before() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::at(home.path());
+        let dir = store.path("app:1").unwrap();
+        for text in ["first", "second"] {
+            let staged = tempfile::tempdir_in(home.path()).unwrap();
+            let layout = staged.path().join("layout");
+            std::fs::create_dir_all(&layout).unwrap();
+            std::fs::write(layout.join("marker"), text).unwrap();
+            store.install(&layout, &dir).unwrap();
+            assert_eq!(std::fs::read_to_string(dir.join("marker")).unwrap(), text);
+        }
+        assert!(store.holds(&dir) && !store.holds(home.path()));
     }
 }
