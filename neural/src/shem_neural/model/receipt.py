@@ -19,6 +19,11 @@ was primed with, its tools and the CPU they run on. `state` names a
 published session the run continued, the same way. Decoding is greedy, so
 the same image and prompt choose the same tokens.
 
+A run given a `--temperature` draws each token instead, with a seed, which
+the receipt's `sampling` records with the settings; its margins are then in
+probability, how far each draw was from the edge of its token's share (see
+`sampling`), and a replay draws again from the receipt's seed.
+
 `tokens` are the tokens the model chose, in order: each reply's and the one
 that ended it, those of tool calls included. `margins` say how firmly: how
 far ahead of the runner-up's each one's logit was. Devices round sums
@@ -35,6 +40,8 @@ from pathlib import Path
 
 import torch
 
+from . import sampling
+
 FORMAT = "shem.receipt/v1"
 #: The margin under which another device may choose another token, by the
 #: type the model computes in: twice how far apart two devices' logits get.
@@ -45,6 +52,12 @@ CLOSE = {"float32": 2e-3, "bfloat16": 0.5, "float32+int8": 0.5, "bfloat16+int8":
 #: What a replay finds, as the driver's exit status, and in a word
 SAME, DIFFERENT, UNDECIDED = 0, 1, 3
 VERDICTS = {SAME: "verified", DIFFERENT: "mismatch", UNDECIDED: "undecided"}
+
+
+def threshold(precision: str | None, sampled: bool) -> float:
+    """The margin under which another device may choose another token: in
+    logits for greedy decoding, in probability for sampled."""
+    return (sampling.CLOSE if sampled else CLOSE).get(precision or "", 0)
 
 
 def runtime(model) -> dict:
@@ -76,6 +89,7 @@ def record(session, prompt: str, subjects: dict[str, str] | None = None) -> dict
     having kept its choices. `subjects` are what the host knows and the
     driver doesn't: the image's name and digest, and a session's."""
     choices = session.choices or []
+    drawn = session.sampler is not None and not session.sampler.greedy
     return {
         "format": FORMAT,
         **(subjects or {}),
@@ -83,6 +97,8 @@ def record(session, prompt: str, subjects: dict[str, str] | None = None) -> dict
         "reply": replied(session),
         "tokens": [token for token, _ in choices],
         "margins": [round(margin, 6) for _, margin in choices],
+        # How tokens were drawn, when they were not the likeliest: with the seed, enough to draw them again
+        **({"sampling": session.sampler.settings()} if drawn else {}),
         "runtime": runtime(session.model),
     }
 
@@ -119,7 +135,7 @@ def summary(receipt: dict) -> str:
     if call := closest(receipt):
         margin, at = call
         text += f", the closest call by {margin:.3g} at token {at}"
-        if margin < CLOSE.get(receipt["runtime"]["precision"], 0):
+        if margin < threshold(receipt["runtime"]["precision"], "sampling" in receipt):
             text += ", which another device may make otherwise"
     return text
 
@@ -144,7 +160,8 @@ def check(receipt: dict, session) -> tuple[int, str]:
         return DIFFERENT, f"the replay has {len(got)} tokens and the receipt {len(want)}{made}"
     where = f"token {at + 1} of {len(want)}"
     margin = min(margins[at], got[at][1])
-    close = max(CLOSE.get(here["precision"], 0), CLOSE.get(there.get("precision"), 0))
+    sampled = "sampling" in receipt
+    close = max(threshold(here["precision"], sampled), threshold(there.get("precision"), sampled))
     if margin < close:
         return UNDECIDED, (
             f"the replay parts from the receipt at {where}, a close call, by {margin:.3g}, "

@@ -150,6 +150,22 @@ struct RunArgs {
     /// chose, for `shem replay` to check
     #[arg(long, value_name = "FILE")]
     receipt: Option<PathBuf>,
+    /// For a model image, draw each token from the model's distribution,
+    /// sharpened or flattened by this, rather than the likeliest; with a seed,
+    /// the same reply can be drawn again
+    #[arg(long, value_name = "T")]
+    temperature: Option<f32>,
+    /// For a model image, draw only from the likeliest tokens whose
+    /// probabilities add to this, with --temperature
+    #[arg(long, value_name = "P")]
+    top_p: Option<f32>,
+    /// For a model image, draw only from this many likeliest tokens, with
+    /// --temperature
+    #[arg(long, value_name = "K")]
+    top_k: Option<u32>,
+    /// For a model image, start the draws from this number: a receipt records it
+    #[arg(long, value_name = "N")]
+    seed: Option<u64>,
     /// For a model image, have a conversation: each line of input is a turn,
     /// until its end or `/exit`, after the prompt if there is one, and the
     /// image's own CMD does not count as one
@@ -493,6 +509,7 @@ fn launch<V: Vcpu + Clone>(
                 &args.args,
                 receipt,
                 args.interactive,
+                &drawing(args),
             );
         }
         if args.interactive {
@@ -686,6 +703,24 @@ fn parse_subject(subject: &str) -> (Option<&str>, &str) {
 /// Run the model image `image`, found as `target`, with `args`, or its CMD.
 /// `state` is a published session to continue, and the digest it must have,
 /// if a receipt gave one.
+/// The driver's options that say how to draw tokens, from the ones `shem run` was given.
+fn drawing(args: &RunArgs) -> Vec<String> {
+    let mut options = Vec::new();
+    if let Some(temperature) = args.temperature {
+        options.extend(["--temperature".to_string(), temperature.to_string()]);
+    }
+    if let Some(top_p) = args.top_p {
+        options.extend(["--top-p".to_string(), top_p.to_string()]);
+    }
+    if let Some(top_k) = args.top_k {
+        options.extend(["--top-k".to_string(), top_k.to_string()]);
+    }
+    if let Some(seed) = args.seed {
+        options.extend(["--seed".to_string(), seed.to_string()]);
+    }
+    options
+}
+
 fn run_model(
     target: &str,
     image: &Image,
@@ -693,6 +728,7 @@ fn run_model(
     args: &[String],
     receipt: Receipt,
     interactive: bool,
+    drawing: &[String],
 ) -> anyhow::Result<u8> {
     let digest = Image::layout_digest(&image_dir(target)?)?;
     let root = Store::open()?.rootfs(image, &digest)?;
@@ -743,14 +779,10 @@ fn run_model(
     }
     let session = state.map(|_| session.path());
     let log = Store::open()?.home().join("server.log");
-    image::model::run_driver(
-        &image.config.entrypoint,
-        &options,
-        input,
-        &root,
-        session,
-        &log,
-    )
+    // The options given on the command line come after the image's, which they override
+    let mut entrypoint = image.config.entrypoint.clone();
+    entrypoint.extend(drawing.iter().cloned());
+    image::model::run_driver(&entrypoint, &options, input, &root, session, &log)
 }
 
 /// Check a receipt: find its image, which must have the digest it names,
@@ -797,6 +829,7 @@ fn replay(args: ReplayArgs) -> anyhow::Result<u8> {
         &[],
         Receipt::Replay(&args.receipt),
         false,
+        &[],
     )
 }
 

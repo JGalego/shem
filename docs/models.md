@@ -46,6 +46,7 @@ A `shem:` entrypoint selects a host-side driver, not a guest executable.
 | `--max-tokens N` | Maximum reply length; default 256 |
 | `--dtype bfloat16` | Compute in bfloat16, which halves the memory weights and sessions take and is faster on GPUs; default `float32` |
 | `--quantize int8` | Hold the projections' weights as int8 with a scale for each output row, a quarter of float32's memory and half of bfloat16's, applied with PyTorch's int8 kernel on a CPU; embeddings stay as they are. Sessions and receipts record it (`float32+int8`), so they are not mixed with unquantized ones |
+| `--temperature T`, `--top-p P`, `--top-k K`, `--seed N` | Draw tokens, seeded, rather than take the likeliest: see above; defaults greedy, 1, all, random |
 | `--system TEXT` | System prompt |
 | `--system-file PATH` | Append a file from the image to the system prompt |
 | `--stop TEXT` | End the reply at this text; useful for [base models](../examples/mamba/Shemfile) |
@@ -55,6 +56,8 @@ A `shem:` entrypoint selects a host-side driver, not a guest executable.
 | `--serve [HOST:]PORT` | [Serve OpenAI's chat completions API](#serving-openais-api) instead of replying once |
 
 Decoding is greedy and repeatable for the same model, session, prompt and device, which a [receipt](#receipts) lets anyone check.
+
+`--temperature T` draws each token from the model's distribution instead, sharpened or flattened by `T`, cut by `--top-k K` and `--top-p P`, with numbers from a generator `--seed N` starts. The generator runs on the CPU and takes one number a token, so the same seed draws the same reply on any device that computes the same logits, and a [receipt](#receipts) records the settings and the seed (a random one if none was given), to draw again. `shem run --temperature 0.8 --seed 7 qwen3 "Tell me a story"` takes them on the command line, the image's `ENTRYPOINT` can set them, and the [API](#serving-openais-api) takes `temperature`, `top_p`, `top_k` and `seed` in a request.
 
 A session is held to the model's context window, which the importer records as `context` in `shem.json`: a conversation that would pass it is refused (the API answers `context_length_exceeded`), and a reply stops, as `length`, where the window ends. A model with no window, such as Mamba, has no limit.
 
@@ -395,7 +398,7 @@ docker run -d -p 8000:8000 --runtime io.containerd.shem.v1 --platform linux/risc
 | `GET /v1/models` | The model, by the repository it came from |
 | `GET /health` | 200 once the model is loaded |
 
-- Replies are greedy, as the driver's are: sampling settings are accepted and ignored, and `n` must be 1. `max_tokens` and `stop` apply.
+- Replies are greedy, as the driver's are, unless the image or a request gives a `temperature`; then `top_p`, `top_k` and `seed` apply too, and the same seed draws the same reply. `n` must be 1. `max_tokens` and `stop` apply.
 - The image's system prompt comes first unless a request gives its own, and a conversation that starts with the image's [primed session](#sessions-as-layers) goes on from it rather than reading it again.
 - Requests take turns on the model, up to 32 waiting, after which the API answers `429` with `Retry-After`. Messages are text; tools in requests, and images, are not understood yet.
 - It listens on `127.0.0.1` unless given `--host`. Set `SHEM_API_KEY` in the environment, and every request but `/health` must send `Authorization: Bearer KEY`; under Docker, the model server's environment is the one that counts. A key is read from the environment, not an option, so that `ps` does not show it.
@@ -459,7 +462,7 @@ shem: verified: the model chose the receipt's 18 tokens again
 
 - `image` is the reference the run was given and the image's manifest digest. The digest covers everything the reply depends on besides the prompt: the weights, the tokenizer, the system prompt, the primed session, the tools and the compiled CPU they run on. A run with `--state` adds `state`, the session's reference and digest. An OCI layout directory is recorded by its digest alone.
 - `tokens` are the tokens the model chose, in order: each reply's and the token that ended it, tool calls included.
-- `margins` say how firmly: each chosen token's logit less the runner-up's.
+- `margins` say how firmly: each chosen token's logit less the runner-up's. For a run that drew its tokens, a `sampling` field holds the settings and the seed, and each margin is how far the draw was, in probability, from the edge of its token's share; `shem replay` draws again from the seed.
 - `runtime` is what computed them: the neural package, torch, the device, the precision and the block versions.
 
 `shem replay RECEIPT [IMAGE]` pulls the image the receipt names if the store lacks it, refuses an image whose digest is not the receipt's, replies to the receipt's prompt and compares each choice. `IMAGE` names the same image somewhere else, such as a mirror or a layout directory, and `--state REF` the same session.

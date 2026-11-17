@@ -11,11 +11,13 @@ elsewhere may call the API only from an origin `--cors-origin` allows; a
 body is at most `MAX_BODY` bytes; and at most `MAX_WAITING` requests wait
 their turn on the model, the rest being told to try again.
 
-Replies are greedy, as the driver's are, so sampling settings are accepted
-and ignored. Requests take turns on the model. The image's system prompt
-comes first unless a request gives its own, and a conversation that starts
-with the image's primed session, token for token, goes on from it rather
-than reading those tokens again.
+Replies are greedy, as the driver's are, unless the image's options or the
+request give a `temperature`: then, with `top_p`, `top_k` and `seed`, each
+token is drawn (see `sampling`), and the same seed draws the same reply.
+Requests take turns on the model. The image's system prompt comes first
+unless a request gives its own, and a conversation that starts with the
+image's primed session, token for token, goes on from it rather than
+reading those tokens again.
 
 `shem serve IMAGE` serves on the host. In a container, `--serve PORT`
 serves in the container's network, where `docker run -p` publishes it.
@@ -34,6 +36,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .generate import ContextFull, Session, reply
+from .sampling import Sampler
 
 #: The largest request body taken, in bytes: a long conversation is a few hundred kilobytes
 MAX_BODY = 8 << 20
@@ -55,6 +58,12 @@ class Chat:
         self.max_tokens = args.max_tokens
         self.stops = list(args.stop)
         self.system = args.system
+        #: How tokens are drawn unless a request says otherwise: the image's options
+        self.draw = {
+            key: getattr(args, key)
+            for key in ("temperature", "top_p", "top_k", "seed")
+            if getattr(args, key, None) is not None
+        }
         #: The key requests must carry, from the environment, never the command line, where `ps` shows it
         self.api_key = os.environ.get("SHEM_API_KEY") or None
         #: Origins whose pages may call the API, or `*` for any
@@ -75,14 +84,22 @@ class Chat:
             raise ContextFull(f"the conversation is {len(tokens)} tokens, and the model's context window is {context}")
         return tokens
 
-    def complete(self, messages: list[dict], max_tokens: int | None = None, stops=(), out=None) -> dict:
-        """Reply to `messages`, writing the text to `out` as it comes. Returns
-        the reply, why it ended, and how many tokens each side took."""
+    def complete(
+        self, messages: list[dict], max_tokens: int | None = None, stops=(), out=None, draw: dict | None = None
+    ) -> dict:
+        """Reply to `messages`, writing the text to `out` as it comes, drawing
+        tokens as `draw` says over the image's own settings. Returns the
+        reply, why it ended, and how many tokens each side took."""
         prompt = self.prompt(messages)
+        sampler = None
+        if settings := {**self.draw, **(draw or {})}:
+            if settings.get("temperature"):
+                sampler = Sampler(**settings)
         max_tokens = max_tokens or self.max_tokens
         text = _Text(out)
         with self.lock, self.compute():
             session = self._start(prompt)
+            session.sampler = sampler
             session.feed(prompt[len(session.tokens) :])
             tokens = reply(session, self.tokenizer, max_tokens, text, stops=[*self.stops, *stops])
             room = session.room()
@@ -228,7 +245,15 @@ def handler(chat: Chat):
                 stops = request.get("stop") or []
                 stops = [stops] if isinstance(stops, str) else list(stops)
                 if request.get("n", 1) != 1:
-                    raise ValueError("n must be 1: replies are greedy, so they would all be the same")
+                    raise ValueError("n must be 1: a reply is one draw from one seed")
+                draw = {}
+                for key, kind in (("temperature", float), ("top_p", float), ("top_k", int), ("seed", int)):
+                    if request.get(key) is not None:
+                        if isinstance(request[key], bool) or not isinstance(request[key], int | float):
+                            raise ValueError(f"{key} must be a number")
+                        draw[key] = kind(request[key])
+                if draw.get("temperature"):
+                    Sampler(**draw)  # its settings, checked before the headers of a stream go out
             except (ValueError, KeyError, TypeError, AttributeError) as error:
                 return self._error(400, f"not a chat completion request: {error}")
             try:
@@ -239,10 +264,10 @@ def handler(chat: Chat):
                 return self._error(429, f"{MAX_WAITING} requests are waiting for the model: try again", "busy", retry=5)
             try:
                 if request.get("stream"):
-                    self._stream(messages, max_tokens, stops, request.get("stream_options") or {})
+                    self._stream(messages, max_tokens, stops, request.get("stream_options") or {}, draw)
                     return
                 try:
-                    done = chat.complete(messages, max_tokens, stops)
+                    done = chat.complete(messages, max_tokens, stops, draw=draw)
                 except Exception as error:  # the template, say, refusing the conversation
                     return self._error(500, f"no reply: {error}")
                 self._json(200, self._completion(done))
@@ -268,7 +293,7 @@ def handler(chat: Chat):
                 "usage": _usage(done),
             }
 
-        def _stream(self, messages, max_tokens, stops, options) -> None:
+        def _stream(self, messages, max_tokens, stops, options, draw) -> None:
             """Server-sent events: a chunk for each piece of the reply as it
             comes, then one that says why it ended, then [DONE]."""
             self.send_response(200)
@@ -293,7 +318,7 @@ def handler(chat: Chat):
 
             send({"role": "assistant", "content": ""})
             try:
-                done = chat.complete(messages, max_tokens, stops, out=lambda text: send({"content": text}))
+                done = chat.complete(messages, max_tokens, stops, out=lambda text: send({"content": text}), draw=draw)
             except (BrokenPipeError, ConnectionError):
                 return  # the client left
             except Exception as error:  # after the headers, an error is an event, as OpenAI sends one

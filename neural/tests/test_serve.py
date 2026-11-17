@@ -36,8 +36,9 @@ class Replies:
     def prompt(self, messages):
         return [0] * 3
 
-    def complete(self, messages, max_tokens=None, stops=(), out=None):
+    def complete(self, messages, max_tokens=None, stops=(), out=None, draw=None):
         self.asked.append((messages, max_tokens, list(stops)))
+        self.drew = draw
         if self.fail:
             raise RuntimeError(self.fail)
         for piece in ("Hel", "lo"):

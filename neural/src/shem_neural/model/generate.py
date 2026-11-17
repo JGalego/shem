@@ -27,6 +27,7 @@ from safetensors.torch import load, load_file, save, save_file
 from . import receipt
 from .blocks import Model
 from .manifest import locate
+from .sampling import Sampler
 from .tokenizer import Detokenizer, Tokenizer
 from .tools import Tools, compiled_layers, tool_calls
 
@@ -60,11 +61,18 @@ class Session:
         self.runner: Tools | None = None
         #: Each token the model chose and its margin, when a list is put here
         self.choices: list[tuple[int, float]] | None = None
+        #: How the next token is drawn, if not the likeliest
+        self.sampler: Sampler | None = None
 
     def choose(self) -> int:
         """The token the session continues with: the likeliest. A session
         that keeps its choices adds it, with its margin: how far its logit
         is ahead of the runner-up's."""
+        if self.sampler is not None and not self.sampler.greedy:
+            token, margin = self.sampler.draw(self.logits)
+            if self.choices is not None:
+                self.choices.append((token, margin))
+            return token
         token = int(self.logits.argmax())
         if self.choices is not None:
             first, second = self.logits.float().topk(2).values.tolist()
@@ -369,6 +377,22 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
         choices=["int8"],
         help="hold the projections' weights as int8, a quarter of float32's memory (embeddings stay as they are)",
     )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="draw each token from the model's distribution, sharpened or flattened by this; 0 is greedy",
+    )
+    parser.add_argument(
+        "--top-p", type=float, default=1.0, help="draw only from the likeliest tokens whose probabilities add to this"
+    )
+    parser.add_argument("--top-k", type=int, default=0, help="draw only from this many likeliest tokens; 0 is all")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="start the draws from this number, so that the reply can be drawn again (default: random, "
+        "and recorded in a receipt)",
+    )
     parser.add_argument("--tools", help="offer the programs in this directory of the image to the model as tools")
     parser.add_argument(
         "--serve",
@@ -419,6 +443,17 @@ def system_file(root: Path, path: str) -> str:
     return target.read_text().strip()
 
 
+def sampler(args: argparse.Namespace) -> Sampler | None:
+    """How the options say to draw tokens, if not greedily."""
+    if not args.temperature:
+        if args.top_p != 1 or args.top_k or args.seed is not None:
+            raise ValueError(
+                "--top-p, --top-k and --seed need a --temperature above 0: without one, decoding is greedy"
+            )
+        return None
+    return Sampler(args.temperature, args.top_p, args.top_k, args.seed)
+
+
 def start(
     model: Model, tokenizer: Tokenizer, args: argparse.Namespace, err=sys.stderr, vcpu_socket: Path | None = None
 ) -> Session | None:
@@ -443,6 +478,7 @@ def start(
     if not session.messages:
         session.messages, session.tools = system, tools
     session.runner = runner
+    session.sampler = sampler(args)
     return session
 
 
@@ -460,6 +496,9 @@ def run(
         return 0
     if args.receipt or checked:
         session.choices = []
+    if checked and checked.get("sampling"):
+        # Drawn tokens are checked by drawing them again: from the receipt's seed
+        session.sampler = Sampler(**checked["sampling"])
     started = time.perf_counter()
     replied = converse(session, tokenizer, prompt, args.max_tokens, out, err, args.stop)
     if args.stats:
