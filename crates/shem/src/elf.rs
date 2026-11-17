@@ -6,6 +6,9 @@ use crate::vcpu::{MemoryFault, Vcpu};
 
 const EM_RISCV: u16 = 243;
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
+/// Where a position-independent executable is loaded: above the first page, which stays unmapped
+const PIE_BASE: u32 = 0x1_0000;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 const EF_RISCV_RVC: u32 = 0x1;
@@ -30,7 +33,7 @@ pub enum ElfError {
     NotElf,
     #[error("not a 32-bit little-endian RISC-V executable")]
     WrongArch,
-    #[error("only static, non-PIE executables are supported (link with -static -no-pie)")]
+    #[error("only static executables are supported (link with -static or -static-pie)")]
     NotStatic,
     #[error("compressed instructions are not supported (build with -march=rv32im)")]
     Compressed,
@@ -71,9 +74,13 @@ pub fn parse(data: &[u8], mem_size: u32) -> Result<Image, ElfError> {
     if data.get(4..6) != Some([1, 1].as_slice()) || u16_at(data, 18)? != EM_RISCV {
         return Err(ElfError::WrongArch);
     }
-    if u16_at(data, 16)? != ET_EXEC {
-        return Err(ElfError::NotStatic);
-    }
+    // A static PIE (ET_DYN with no interpreter) relocates itself, once the
+    // loader has put it at a base address; a dynamic one needs a linker shem has none of
+    let bias = match u16_at(data, 16)? {
+        ET_EXEC => 0,
+        ET_DYN => PIE_BASE,
+        _ => return Err(ElfError::NotStatic),
+    };
     let flags = u32_at(data, 36)?;
     if flags & EF_RISCV_RVC != 0 {
         return Err(ElfError::Compressed);
@@ -82,7 +89,9 @@ pub fn parse(data: &[u8], mem_size: u32) -> Result<Image, ElfError> {
         return Err(ElfError::FloatAbi);
     }
 
-    let entry = u32_at(data, 24)?;
+    let entry = u32_at(data, 24)?
+        .checked_add(bias)
+        .ok_or(ElfError::Malformed)?;
     let phoff = u32_at(data, 28)?;
     let phentsize = u16_at(data, 42)? as u32;
     let phnum = u16_at(data, 44)? as u32;
@@ -104,6 +113,7 @@ pub fn parse(data: &[u8], mem_size: u32) -> Result<Image, ElfError> {
             _ => continue,
         }
         let (offset, vaddr, filesz, memsz) = (offset?, vaddr?, filesz?, memsz?);
+        let vaddr = vaddr.checked_add(bias).ok_or(ElfError::Malformed)?;
         if memsz < filesz || data.len() < offset as usize + filesz as usize {
             return Err(ElfError::Malformed);
         }

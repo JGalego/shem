@@ -1,0 +1,17 @@
+# Lua 5.4, the language, compiled for RV32 in an ordinary Docker stage with the
+# guest toolchain (`just toolchain` builds shem-toolchain), and shipped in a
+# shem image: an interpreter running on the reference vCPU, or, slowly, on the
+# neural one. Its source is the release from lua.org, checked against its digest.
+FROM shem-toolchain AS build
+WORKDIR /src
+RUN curl -fsSL -o lua.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \
+ && echo "9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30  lua.tar.gz" | sha256sum -c - \
+ && tar xzf lua.tar.gz --strip-components=1
+WORKDIR /src/src
+RUN rv32-cc -O2 -DLUA_32BITS -o /lua $(ls *.c | grep -v luac.c) -lm
+
+FROM scratch
+COPY --from=build /lua /bin/lua
+LABEL org.opencontainers.image.licenses="MIT"
+ENTRYPOINT ["/bin/lua"]
+CMD ["-e", "print(_VERSION, 6 * 7)"]

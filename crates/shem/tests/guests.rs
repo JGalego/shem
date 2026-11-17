@@ -93,6 +93,18 @@ fn c_program_runs_against_musl() {
 
 #[test]
 #[ignore = "needs guest binaries: run `just guest-tests`"]
+fn a_static_pie_relocates_itself_where_it_is_loaded() {
+    let pie = run(&built("guests/hello-pie"), &["hello-pie", "x"]);
+    assert_eq!(pie.result, Ok(2), "argc as its status");
+    assert!(
+        pie.stdout
+            .contains("sum of squares below 100000 = 333328333350000")
+    );
+    assert_eq!(pie.unsupported, [] as [u32; 0], "unsupported system calls");
+}
+
+#[test]
+#[ignore = "needs guest binaries: run `just guest-tests`"]
 fn pthreads_share_memory_and_take_turns() {
     let path = built("guests/threads");
     let elf = std::fs::read(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
@@ -292,6 +304,15 @@ fn example_images_build_and_run() {
     assert_eq!(
         run_image(&hello, &["again"], b""),
         (0, "hello again\n".into())
+    );
+
+    // A language's interpreter, compiled from its source: Lua runs scripts on the vCPU
+    let lua = build_example("lua");
+    assert_eq!(run_image(&lua, &[], b""), (0, "Lua 5.4\t42\n".into()));
+    let script = "local t = {} for i = 1, 5 do t[#t + 1] = i * i end print(table.concat(t, ','))";
+    assert_eq!(
+        run_image(&lua, &["-e", script], b""),
+        (0, "1,4,9,16,25\n".into())
     );
 
     let shell = build_example("warm-shell");

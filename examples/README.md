@@ -38,6 +38,7 @@ Model examples also include Dockerfiles for the [BuildKit frontend](../docs/shem
 | Example | What it shows |
 |---|---|
 | [`hello`](hello/Shemfile) | A C program cross-compiled for RV32 in a Docker stage, shipped `FROM scratch` |
+| [`lua`](lua/Shemfile) | Lua 5.4 compiled from source for RV32 in a Docker stage, an interpreter running scripts on the vCPU |
 | [`warm-shell`](warm-shell/Shemfile) | A BusyBox shell started at build time and frozen just before it reads its script |
 | [`linux`](linux/Shemfile) | Linux booted once at build time and frozen at its prompt |
 | [`kubernetes/hello.yaml`](kubernetes/hello.yaml) | An RV32 program in a Pod, on shem's RuntimeClass |
