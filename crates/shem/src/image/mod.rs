@@ -982,16 +982,21 @@ impl Store {
         }
     }
 
+    /// An overlay of the unpacked copy of `image` (whose manifest digest is
+    /// `digest`) for something to write to, if the system can mount one.
+    /// `shem doctor` says why not.
+    pub fn overlay_of(&self, image: &Image, digest: &str) -> Option<overlay::Mounted> {
+        overlay::enter().ok()?;
+        let lower = self.rootfs(image, digest).ok()?;
+        let scratch = self.root.with_file_name("tmp");
+        std::fs::create_dir_all(&scratch).ok()?;
+        overlay::mount(&lower, &scratch).ok()
+    }
+
     fn run_dir(&self, image: &Image, digest: &str) -> anyhow::Result<(Held, PathBuf)> {
-        // Where it cannot be done the run unpacks the image, and `shem doctor` says why
-        if overlay::enter().is_ok() {
-            let lower = self.rootfs(image, digest)?;
-            let scratch = self.root.with_file_name("tmp");
-            std::fs::create_dir_all(&scratch)?;
-            if let Ok(mounted) = overlay::mount(&lower, &scratch) {
-                let dir = mounted.path().to_path_buf();
-                return Ok((Held::Overlay(mounted), dir));
-            }
+        if let Some(mounted) = self.overlay_of(image, digest) {
+            let dir = mounted.path().to_path_buf();
+            return Ok((Held::Overlay(mounted), dir));
         }
         let dir = tempfile::tempdir()?;
         image.unpack_rootfs(dir.path())?;

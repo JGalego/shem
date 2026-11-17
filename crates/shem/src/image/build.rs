@@ -77,6 +77,7 @@ pub fn build(options: &BuildOptions) -> anyhow::Result<Image> {
         step: last.lines[0].clone(),
         history: Vec::new(),
         state: None,
+        overlay: None,
     };
     builder.from(base)?;
     // A stage's lines are its FROM and then one for each instruction
@@ -170,6 +171,9 @@ struct Builder<'a> {
     /// always last
     history: Vec<History>,
     state: Option<History>,
+    /// The overlay `root` is, when the base image's files were not unpacked:
+    /// it goes before the directory it is in
+    overlay: Option<super::overlay::Mounted>,
 }
 
 impl Builder<'_> {
@@ -204,7 +208,9 @@ impl Builder<'_> {
                 self.adopt_history();
                 // An image built on another is not the other's twin
                 self.image.subject = None;
-                self.image.unpack_rootfs(&self.root)?;
+                if !self.mount_base(&dir)? {
+                    self.image.unpack_rootfs(&self.root)?;
+                }
                 if self.image.config.model.is_some() {
                     // A model's session is rebuilt by its own WARM, if any
                 } else if self.image.config.kernel.is_some() {
@@ -224,6 +230,31 @@ impl Builder<'_> {
             self.vars.insert(key.into(), value.into());
         }
         Ok(())
+    }
+
+    /// Have the base image's files below the build's as an overlay, instead of
+    /// unpacked into it: the build's own steps (COPY, a WARM's changes) are what
+    /// is written, and a base of gigabytes is unpacked once, for every build
+    /// and run on it. False where the system cannot mount one, or where the
+    /// build has Docker stages, which are run as programs of this process, in
+    /// the namespaces an overlay is mounted in, that may not reach Docker.
+    fn mount_base(&mut self, dir: &Path) -> anyhow::Result<bool> {
+        if self.stages.len() > 1 {
+            return Ok(false);
+        }
+        let digest = Image::layout_digest(dir)?;
+        let Some(mounted) = self.store()?.overlay_of(&self.image, &digest) else {
+            return Ok(false);
+        };
+        // A model image's primed session is in the copy kept for running it, and is
+        // not among the files of its layers, which are what a build starts from
+        let state = mounted.path().join(model::SESSION_DIR);
+        if state.exists() {
+            std::fs::remove_dir_all(&state)?;
+        }
+        self.root = mounted.path().to_path_buf();
+        self.overlay = Some(mounted);
+        Ok(true)
     }
 
     /// Take the base image's history as the start of this one's, or where it

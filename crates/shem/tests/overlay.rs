@@ -53,23 +53,32 @@ fn guest() -> Vec<u8> {
     let write = |text: u32, len: i32| {
         // The descriptor `open` returned is still in a0
         program![
+            addi(T1, A0, 0),
             li(A1, text),
             addi(A2, ZERO, len),
             addi(A7, ZERO, 64),
             ECALL,
             // The bytes written: an error would change the status
             add(S0, S0, A0),
+            // Nothing is left open, which a WARM could not freeze
+            addi(A0, T1, 0),
+            addi(A7, ZERO, 57),
+            ECALL,
         ]
     };
     let code = [
         open(keep, 0),
         program![
+            addi(T2, A0, 0),
             li(A1, buf),
             addi(A2, ZERO, 1),
             addi(A7, ZERO, 63),
             ECALL,
             li(T0, buf),
             lbu(S0, T0, 0),
+            addi(A0, T2, 0),
+            addi(A7, ZERO, 57),
+            ECALL,
             // unlinkat(AT_FDCWD, "/gone", 0)
             li(A0, AT_FDCWD),
             li(A1, gone),
@@ -91,6 +100,11 @@ fn guest() -> Vec<u8> {
 
 /// A store in `home` holding the image `guest` runs as, with the files it works on.
 fn installed(home: &Path) -> (String, std::path::PathBuf) {
+    installed_as(home, "prog")
+}
+
+/// As `installed`, under the name `name`.
+fn installed_as(home: &Path, name: &str) -> (String, std::path::PathBuf) {
     let context = tempfile::tempdir().unwrap();
     let files: [(&str, Vec<u8>); 4] = [
         ("prog", guest()),
@@ -118,7 +132,7 @@ fn installed(home: &Path) -> (String, std::path::PathBuf) {
     .unwrap();
     let store = Store::at(home);
     let digest = image
-        .write_layout(&store.path("prog").unwrap(), "latest")
+        .write_layout(&store.path(name).unwrap(), "latest")
         .unwrap();
     (
         digest.clone(),
@@ -187,4 +201,57 @@ fn a_run_with_the_overlay_does_what_one_without_does() {
     let with = run(home.path(), true);
     assert_eq!(with.status.code(), without.status.code());
     assert_eq!(with.stdout, without.stdout);
+}
+
+/// `shem build` of `context` in the store at `home`: the digest it says it made.
+fn build(home: &Path, context: &Path, overlay: bool) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shem"));
+    command
+        .args(["build", "-t", "made"])
+        .arg(context)
+        .env("SHEM_HOME", home);
+    if !overlay {
+        command.env("SHEM_NO_OVERLAY", "1");
+    }
+    let output = command.output().unwrap();
+    let said = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{said}");
+    said.split_whitespace()
+        .find(|word| word.starts_with("sha256:"))
+        .unwrap_or_else(|| panic!("{said}"))
+        .to_string()
+}
+
+#[test]
+fn a_build_on_an_overlay_of_its_base_makes_the_image_one_that_unpacks_it_does() {
+    let base = "example.com/team/prog";
+    let context = tempfile::tempdir().unwrap();
+    fs::write(context.path().join("extra"), b"extra file").unwrap();
+    fs::write(
+        context.path().join("Shemfile"),
+        format!(
+            "FROM {base}:latest\nCOPY extra /extra\nENV BUILT=yes\nWARM --until=syscall:exit\n"
+        ),
+    )
+    .unwrap();
+    let (with, without) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (_, unpacked) = installed_as(with.path(), base);
+    installed_as(without.path(), base);
+    // The guest deletes, rewrites and creates files while the build warms it: the
+    // layer that makes holds what changed, and is the same whichever way the base is there
+    let on = build(with.path(), context.path(), true);
+    let off = build(without.path(), context.path(), false);
+    assert_eq!(on, off, "the same image, however the base's files were");
+    // Where the build was on an overlay, the unpacked base is what it began with, still
+    if unpacked.is_dir() {
+        assert_eq!(fs::read(unpacked.join("gone")).unwrap(), b"Gone");
+        assert_eq!(
+            fs::read(unpacked.join("mod")).unwrap(),
+            b"Original contents"
+        );
+        assert!(!unpacked.join("new").exists());
+        assert!(!unpacked.join("extra").exists());
+    }
+    let left = fs::read_dir(with.path().join("tmp")).map_or(0, Iterator::count);
+    assert_eq!(left, 0, "the build's own directory is removed");
 }
