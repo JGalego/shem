@@ -335,15 +335,15 @@ To start it yourself, give `sudo` the full path of each program, since its `PATH
 ```sh
 sudo env SHEM_BIN="$(command -v shem)" "$(command -v uv)" tool run \
   --from "shem-neural==$(shem --version | cut -d' ' -f2)" \
-  shem-neural-server --socket /tmp/shem-neural.sock
+  shem-neural-server
 ```
 
-From a repository checkout, run the checkout's own:
+Run as root, it listens at `/run/shem/neural.sock`, where the shim looks. From a repository checkout, run the checkout's own:
 
 ```sh
 uv sync --project neural
 sudo env SHEM_BIN="$(command -v shem)" \
-  neural/.venv/bin/shem-neural-server --socket /tmp/shem-neural.sock
+  neural/.venv/bin/shem-neural-server
 ```
 
 The socket is accessible only to its owner and root. In another terminal:
@@ -483,7 +483,7 @@ Receipts come from `shem run` only. Sessions under Docker and the API server wri
 The server defaults to `--device auto`; use `--device cpu` or `--device cuda` to select explicitly:
 
 ```sh
-uv run --project neural shem-neural-server --socket /tmp/shem-neural.sock --device cuda
+uv run --project neural shem-neural-server --device cuda
 ```
 
 Recorded results from [`jobs/models_gpu.py`](../neural/jobs/models_gpu.py):

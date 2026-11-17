@@ -501,3 +501,19 @@ fn threads_run_identically_on_both_vcpus() {
     );
     assert_eq!(neural, reference);
 }
+
+#[test]
+fn the_default_socket_is_not_a_fixed_path_in_tmp() {
+    let socket = shem::neural::default_socket();
+    assert!(socket.is_absolute());
+    assert_ne!(socket, Path::new("/tmp/shem-neural.sock"));
+}
+
+#[test]
+fn a_server_run_by_this_user_is_connected_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("neural.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    shem::neural::connect_stream(&path).expect("a socket of this user's own");
+    assert!(shem::neural::connect_stream(&dir.path().join("none.sock")).is_err());
+}

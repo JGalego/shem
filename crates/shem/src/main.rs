@@ -88,7 +88,8 @@ struct VcpuArgs {
     /// Which vCPU runs the guest
     #[arg(long = "vcpu", value_enum, default_value = "reference")]
     kind: VcpuKind,
-    /// Unix socket of a running neural vCPU server (python -m shem_neural.server)
+    /// Unix socket of a running neural vCPU server (shem-neural-server); by default
+    /// the one it listens at when not given a socket either
     #[arg(long, value_name = "PATH", env = "SHEM_NEURAL_SOCKET")]
     neural_socket: Option<PathBuf>,
     /// A compiled CPU layer for the neural vCPU, such as a model image's
@@ -99,8 +100,10 @@ struct VcpuArgs {
 
 impl VcpuArgs {
     fn socket(&self) -> anyhow::Result<PathBuf> {
-        (self.neural_socket.clone())
-            .context("--vcpu neural needs --neural-socket or SHEM_NEURAL_SOCKET")
+        Ok(self
+            .neural_socket
+            .clone()
+            .unwrap_or_else(shem::neural::default_socket))
     }
 }
 

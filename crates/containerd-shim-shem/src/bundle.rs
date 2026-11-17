@@ -30,7 +30,7 @@ pub const DEFAULT_MEMORY: u32 = 64 << 20;
 /// second on the reference vCPU, and a second on a neural one.
 const SLICE: u64 = 1 << 20;
 const NEURAL_SLICE: u64 = 1 << 10;
-pub const DEFAULT_NEURAL_SOCKET: &str = "/tmp/shem-neural.sock";
+pub const DEFAULT_NEURAL_SOCKET: &str = "/run/shem/neural.sock";
 
 /// Which vCPU runs the container.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -33,7 +33,7 @@ pub struct Server {
 
 impl Server {
     pub fn connect(socket: &Path) -> anyhow::Result<Self> {
-        let stream = UnixStream::connect(socket)
+        let stream = shem::neural::connect_stream(socket)
             .with_context(|| format!("connecting to the model server at {}", socket.display()))?;
         Ok(Self { stream })
     }

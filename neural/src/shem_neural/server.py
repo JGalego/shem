@@ -7,7 +7,7 @@ on the selected model device.
 Frames are a little-endian u32 length followed by a payload. Requests start
 with an op byte, responses with a `Status` byte. See `docs/neural.md`.
 
-    uv run python -m shem_neural.server --socket /tmp/shem-neural.sock
+    uv run python -m shem_neural.server [--socket PATH]
 """
 
 import argparse
@@ -29,6 +29,20 @@ from .compile import compile_weights
 from .cpu import DTYPE, NeuralCpu, State
 from .memory import PagePool
 from .vcpu import _EXIT_CODES, BUDGET, MemoryFault, NeuralVcpu
+
+
+def default_socket() -> Path:
+    """Where the server listens when not told: for root, as the containerd
+    shim runs, `/run/shem/neural.sock`; for a user, in their runtime
+    directory, or else under `/tmp` by their ID. Not a fixed path in a
+    directory everyone can write to, where another user could listen first.
+    The same as `shem::neural::default_socket`, which clients try."""
+    uid = os.geteuid()
+    if uid == 0:
+        return Path("/run/shem/neural.sock")
+    if runtime := os.environ.get("XDG_RUNTIME_DIR"):
+        return Path(runtime) / "shem" / "neural.sock"
+    return Path(f"/tmp/shem-neural-{uid}.sock")
 
 
 class Op(IntEnum):
@@ -491,6 +505,8 @@ def make_server(
     # Listen under a temporary name, then move the socket into place, so that
     # clients waiting for it to appear never find it before it accepts them
     staging = socket_path.with_name(f".{socket_path.name}.{os.getpid()}")
+    if not socket_path.parent.exists():
+        socket_path.parent.mkdir(mode=0o755 if os.geteuid() == 0 else 0o700, parents=True, exist_ok=True)
     staging.unlink(missing_ok=True)
     server = socketserver.ThreadingUnixStreamServer(str(staging), Handler)
     server.daemon_threads = True
@@ -509,12 +525,17 @@ def serve(socket_path: Path, dense: bool = False, device: str = "auto") -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--socket", type=Path, required=True, help="Unix socket to listen on")
+    parser.add_argument(
+        "--socket",
+        type=Path,
+        default=None,
+        help="Unix socket to listen on (default: root's /run/shem/neural.sock, else the user's)",
+    )
     parser.add_argument("--dense", action="store_true", help="run the network densely, without fused kernels")
     parser.add_argument("--device", default="auto", help="where models run: cpu, cuda, or auto (a GPU if there is one)")
     args = parser.parse_args()
     try:
-        serve(args.socket, args.dense, args.device)
+        serve(args.socket or default_socket(), args.dense, args.device)
     except KeyboardInterrupt:
         pass
 

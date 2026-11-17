@@ -22,7 +22,7 @@ set -eu
 
 repo=JGalego/shem
 install_dir=${SHEM_INSTALL_DIR:-/usr/local/bin}
-socket=/tmp/shem-neural.sock
+socket=/run/shem/neural.sock
 
 info() { printf '\033[1m[shem]\033[0m %s\n' "$*"; }
 fatal() { printf '\033[1;31m[shem]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -144,6 +144,7 @@ Description=shem model server
 After=network-online.target
 
 [Service]
+RuntimeDirectory=shem
 ExecStart=/usr/local/bin/uv tool run --from shem-neural==$version shem-neural-server --socket $socket
 Restart=on-failure
 

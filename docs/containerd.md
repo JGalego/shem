@@ -16,12 +16,11 @@ docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 shem-he
 
 Docker 23+ accepts the shim name directly as `--runtime`; no daemon configuration is needed. The hello program exits with its argument count: 3 here.
 
-To use the neural vCPU, start the [neural server](neural.md#running-it) and add:
+To use the neural vCPU, start the [neural server](neural.md#running-it) as root, so that it listens where the shim looks, `/run/shem/neural.sock`, and add:
 
 ```sh
 docker run --rm --runtime io.containerd.shem.v1 --platform linux/riscv32 \
-  --annotation dev.shem.vcpu=neural \
-  --annotation dev.shem.neural-socket=/tmp/shem-neural.sock shem-hello one two
+  --annotation dev.shem.vcpu=neural shem-hello one two
 ```
 
 With `-t`, a program gets a terminal of its own, which echoes what is typed and lets the program set it up, as a shell does to edit lines. `Ctrl-C`, `Ctrl-\` and `Ctrl-Z` send their signals to the program's foreground processes, init included, and the window takes the size of the terminal `docker run -it` runs in.

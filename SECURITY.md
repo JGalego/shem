@@ -8,7 +8,7 @@ Please report vulnerabilities privately, through GitHub's [Report a vulnerabilit
 
 - **Guests are untrusted.** A guest program or kernel runs on a vCPU, so it cannot execute host instructions. Its system calls are serviced by the host, and its paths are resolved inside its root filesystem (`crates/shem/src/linux/rootfs.rs`). Any way for a guest to reach host files outside its root, or to crash or hang the host, is a vulnerability.
 - **Images are untrusted input.** Layers are unpacked with whiteouts and paths checked, and blobs are verified against their digests. A layer or config that escapes the unpack directory is a vulnerability.
-- **The model server is local.** `shem-neural-server` listens on a Unix socket that only its user (and root, as the containerd shim runs) can open. Anyone who can connect can run models and vCPUs on it.
+- **The model server is local.** `shem-neural-server` listens on a Unix socket that only its user (and root, as the containerd shim runs) can open, by default in `/run/shem` for root and the user's runtime directory otherwise, not at a fixed path in `/tmp`. Anyone who can connect can run models and vCPUs on it. shem and the shim check who listens at a socket before they send it a guest or a prompt, and refuse one that a user other than their own, or root, made.
 - **Models run as data.** Model images hold weights in safetensors and a JSON manifest; nothing in them is executed as code.
 
 ## Supported versions

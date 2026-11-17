@@ -44,8 +44,8 @@ Nothing here is learned. The weight compiler turns the instruction set, {count} 
 ## Use
 
 ```sh
-uvx --from shem-neural shem-neural-server --socket /tmp/shem-neural.sock &
-shem run --vcpu neural --neural-socket /tmp/shem-neural.sock program
+uvx --from shem-neural shem-neural-server &
+shem run --vcpu neural program
 ```
 
 The server compiles these same weights itself; this repository is the published copy, for inspection and for images that carry their CPU as a layer.

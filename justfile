@@ -66,8 +66,8 @@ neural-tests: toolchain linux-image
     cargo test --release --test neural -- --ignored
 
 # Serve neural vCPUs on a Unix socket, for `shem run --vcpu neural`
-neural-server socket="/tmp/shem-neural.sock":
-    uv run --project neural python -m shem_neural.server --socket {{ socket }}
+neural-server *args:
+    uv run --project neural python -m shem_neural.server {{ args }}
 
 # Test and benchmark the neural vCPU on a GPU with Hugging Face Jobs, at the pushed HEAD; needs `hf auth login`
 gpu-job flavor="l4x1":
@@ -225,9 +225,9 @@ model-containers-test:
     uv sync -q --project neural
     # As root, to read the containers' root filesystems, which containerd mounts
     # SHEM_BIN runs tools' programs on the model's compiled layer
-    sudo env SHEM_BIN="$PWD/target/release/shem" neural/.venv/bin/python -m shem_neural.server --socket /tmp/shem-neural.sock > target/model-server.log 2>&1 &
+    sudo env SHEM_BIN="$PWD/target/release/shem" neural/.venv/bin/python -m shem_neural.server > target/model-server.log 2>&1 &
     trap 'sudo pkill -f "shem_neural[.]server" || true' EXIT
-    until [ -S /tmp/shem-neural.sock ]; do sleep 1; done
+    until sudo test -S /run/shem/neural.sock; do sleep 1; done
     target/release/shem build -t qwen3 examples/qwen3
     target/release/shem save qwen3 | docker load
     run="docker run --runtime io.containerd.shem.v1 --platform linux/riscv32"

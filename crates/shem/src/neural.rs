@@ -8,7 +8,7 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::vcpu::{Exit, ExitReason, MachineState, MemoryFault, SnapshotError, Vcpu};
@@ -29,6 +29,80 @@ const RESTORE: u8 = 13;
 
 const OK: u8 = 0;
 const MEMORY_FAULT: u8 = 2;
+
+/// Where a neural server listens when no socket is given: for root, as the
+/// containerd shim runs, `/run/shem/neural.sock`; for a user, in their runtime
+/// directory, or else under `/tmp` by their ID. Not a fixed path in a
+/// directory everyone can write to, where another user could listen first.
+pub fn default_socket() -> PathBuf {
+    // SAFETY: geteuid has no arguments and cannot fail
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 {
+        return PathBuf::from("/run/shem/neural.sock");
+    }
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join("shem/neural.sock"),
+        None => PathBuf::from(format!("/tmp/shem-neural-{uid}.sock")),
+    }
+}
+
+/// The user ID of the process at the other end of `stream`.
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `cred` and `size` are valid for the call, and `size` is cred's size
+        let status = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &mut size,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(cred.uid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let (mut uid, mut gid) = (0, 0);
+        // SAFETY: both pointers are valid for the call
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(uid)
+    }
+}
+
+/// Connect to the neural server at `socket`, if it is run by this user or by
+/// root. Whoever listens at a path in a shared directory such as `/tmp` gets
+/// the guest's memory and a model's prompts, so a socket that anyone else
+/// made is refused.
+pub fn connect_stream(socket: &Path) -> io::Result<UnixStream> {
+    let stream = UnixStream::connect(socket)?;
+    let peer = peer_uid(&stream)?;
+    // SAFETY: geteuid has no arguments and cannot fail
+    let me = unsafe { libc::geteuid() };
+    if peer != me && peer != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is listened at by user {peer}, not by this user or root: refusing to send it a guest or a prompt",
+                socket.display()
+            ),
+        ));
+    }
+    Ok(stream)
+}
 
 pub struct NeuralVcpu {
     conn: Arc<Mutex<UnixStream>>,

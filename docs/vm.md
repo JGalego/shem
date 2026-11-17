@@ -81,7 +81,7 @@ Then resume the `linux` image built above:
 
 ```sh
 printf 'echo $((6 * 7))\npoweroff\n' | \
-  shem run --vcpu neural --neural-socket /tmp/shem-neural.sock linux
+  shem run --vcpu neural linux
 ```
 
 VM RAM starts at `0x80000000`; the network uses this base for [fetches, loads and stores](neural.md#one-forward-pass). `shem boot --vcpu neural` also works, but does not skip the cold boot.

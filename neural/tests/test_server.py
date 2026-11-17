@@ -124,3 +124,26 @@ def test_a_run_that_fails_fails_alone(server):
     client.call(Op.WRITE_MEM, struct.pack("<II", good, 0) + sum_to(10))
     reason, _, _, steps = struct.unpack("<BIIQ", client.call(Op.RUN, struct.pack("<IQ", good, 1000)))
     assert (reason, steps) == (EXIT_EBREAK, 33)
+
+
+def test_the_default_socket_is_per_user_not_a_fixed_path_in_tmp(monkeypatch, tmp_path):
+    from shem_neural.server import default_socket
+
+    monkeypatch.setattr("os.geteuid", lambda: 0)
+    assert default_socket() == Path("/run/shem/neural.sock")
+    monkeypatch.setattr("os.geteuid", lambda: 1234)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    assert default_socket() == tmp_path / "shem" / "neural.sock"
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+    assert default_socket() == Path("/tmp/shem-neural-1234.sock")
+
+
+def test_the_server_makes_the_directory_of_its_socket(tmp_path):
+    from shem_neural.server import make_server
+
+    socket_path = tmp_path / "shem" / "neural.sock"
+    server, _ = make_server(socket_path)
+    try:
+        assert socket_path.is_socket() and oct(socket_path.stat().st_mode & 0o777) == "0o600"
+    finally:
+        server.server_close()

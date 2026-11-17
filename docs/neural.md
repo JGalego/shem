@@ -9,8 +9,10 @@ Like [Qwenputer](https://divagr.com/blog/qwenputer), it uses compiled CPU layers
 With uv installed, start the server from the `shem-neural` release that matches shem:
 
 ```sh
-uvx --from "shem-neural==$(shem --version | cut -d' ' -f2)" shem-neural-server --socket /tmp/shem-neural.sock
+uvx --from "shem-neural==$(shem --version | cut -d' ' -f2)" shem-neural-server
 ```
+
+It listens at `$XDG_RUNTIME_DIR/shem/neural.sock` (`/tmp/shem-neural-UID.sock` without one), or `/run/shem/neural.sock` as root, which is where `shem` and the containerd shim look; `--socket PATH` and `--neural-socket PATH` choose another. `shem` refuses a socket that a user other than its own, or root, listens at, so another user cannot take the path in `/tmp` and read a guest.
 
 From a repository checkout, `just neural-server` runs the checkout's own.
 
@@ -18,7 +20,7 @@ In another terminal, compile and run a guest (compilation needs Docker):
 
 ```sh
 just cc -O2 -o hello guests/hello.c
-shem run --vcpu neural --neural-socket /tmp/shem-neural.sock hello
+shem run --vcpu neural hello
 ```
 
 The server uses the CPU. GPU execution is currently available only through the [benchmark harness](#on-gpus).

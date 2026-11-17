@@ -8,13 +8,13 @@ From this directory, with [uv](https://docs.astral.sh/uv/) installed:
 
 ```sh
 uv run pytest
-uv run python -m shem_neural.server --socket /tmp/shem.sock
+uv run python -m shem_neural.server
 ```
 
 Then, in another terminal:
 
 ```sh
-shem run --vcpu neural --neural-socket /tmp/shem.sock /path/to/rv32-program
+shem run --vcpu neural /path/to/rv32-program
 ```
 
 See the [neural vCPU guide](https://github.com/JGalego/shem/blob/main/docs/neural.md) for the network, protocol and benchmarks.
