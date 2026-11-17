@@ -340,6 +340,21 @@ fn example_images_build_and_run() {
         (0, "1,4,9,16,25\n".into())
     );
 
+    // Rust, standard library and all, built from source for a target of its own: compressed
+    // instructions, soft float, musl
+    let rust = build_example("rust");
+    let (status, said) = run_image(&rust, &[], b"");
+    assert_eq!(status, 2, "the number of its arguments, from rust");
+    assert!(said.contains("args = [\"from\", \"rust\"]\n"), "{said}");
+    assert!(
+        said.contains("sum of squares below 1000 = 332833500\n"),
+        "{said}"
+    );
+    assert!(
+        said.contains("most common letter = Some(('o', 3))\n"),
+        "{said}"
+    );
+
     let shell = build_example("warm-shell");
     assert!(shell.warm_state().unwrap().is_some());
     let script = b"echo hello from a warm shell\nuname -m\necho $((6 * 7))\n";

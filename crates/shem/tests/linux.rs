@@ -1276,3 +1276,16 @@ fn making_the_root_or_what_exists_says_it_exists_and_directories_nest() {
     let missing = g.cstr("/nowhere/a");
     assert_eq!(g.call(MKDIRAT, &[AT_FDCWD, missing, 0o755]), ENOENT);
 }
+
+#[test]
+fn sigaltstack_is_taken_and_says_there_was_no_stack_before() {
+    // Rust's runtime asks for one at start-up
+    const SIGALTSTACK: u32 = 132;
+    let mut g = Guest::new();
+    let old = g.put(&[0xff; 12]);
+    assert_eq!(g.call(SIGALTSTACK, &[0, old]), 0);
+    // stack_t: ss_sp 0, ss_flags SS_DISABLE, ss_size 0
+    assert_eq!(g.get(old, 12), [0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
+    let new = g.put(&[0; 12]);
+    assert_eq!(g.call(SIGALTSTACK, &[new, 0]), 0);
+}

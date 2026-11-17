@@ -1,0 +1,28 @@
+{
+  "arch": "riscv32",
+  "code-model": "medium",
+  "cpu": "generic-rv32",
+  "crt-static-respected": true,
+  "crt-static-default": true,
+  "data-layout": "e-m:e-p:32:32-i64:64-n32-S128",
+  "default-uwtable": true,
+  "dynamic-linking": false,
+  "env": "musl",
+  "features": "+m,+a,+c",
+  "has-rpath": false,
+  "has-thread-local": true,
+  "linker-flavor": "gnu-cc",
+  "llvm-abiname": "ilp32",
+  "llvm-target": "riscv32-unknown-linux-musl",
+  "max-atomic-width": 32,
+  "metadata": {
+    "description": "RISC-V RV32IMAC Linux, musl, soft-float: what shem runs",
+    "host_tools": false,
+    "std": true,
+    "tier": 3
+  },
+  "os": "linux",
+  "position-independent-executables": false,
+  "target-family": ["unix"],
+  "target-pointer-width": 32
+}

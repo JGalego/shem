@@ -482,6 +482,18 @@ impl Linux {
                 };
             }
             nr::RT_SIGPROCMASK => p.sigprocmask(vcpu, a[0], a[1], a[2]),
+            // Taken, and not used: signals are delivered on the stack the program is on. The old
+            // stack is said to be none (SS_DISABLE), as it is until one is set. Rust's runtime
+            // asks for one at start-up, to report a stack overflow with a message.
+            nr::SIGALTSTACK => (|| -> Result<u32, Errno> {
+                if a[1] != 0 {
+                    const SS_DISABLE: u32 = 2;
+                    let mut old = [0u8; 12]; // stack_t: ss_sp, ss_flags, ss_size
+                    old[4..8].copy_from_slice(&SS_DISABLE.to_le_bytes());
+                    vcpu.write_mem(a[1], &old)?;
+                }
+                Ok(0)
+            })(),
             nr::PRLIMIT64 => prlimit(vcpu, a[1], a[3]),
             nr::SCHED_GETAFFINITY => sched_getaffinity(vcpu, a[1], a[2]),
             nr::SET_TID_ADDRESS => {

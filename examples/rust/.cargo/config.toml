@@ -1,0 +1,2 @@
+[target.riscv32imac-shem-linux-musl]
+linker = "/usr/local/bin/rv32-link"

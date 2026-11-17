@@ -41,6 +41,7 @@ pub mod nr {
     pub const KILL: u32 = 129;
     pub const TKILL: u32 = 130;
     pub const TGKILL: u32 = 131;
+    pub const SIGALTSTACK: u32 = 132;
     pub const RT_SIGSUSPEND: u32 = 133;
     pub const RT_SIGACTION: u32 = 134;
     pub const RT_SIGPROCMASK: u32 = 135;
