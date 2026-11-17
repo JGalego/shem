@@ -457,7 +457,11 @@ def decoder(w: Writer, family: "Family") -> tuple[BlockSpec, BlockSpec, dict]:
     embed_names = {"weight": prefix + "embed_tokens.weight"}
     embed = BlockSpec("embedding", embed_params, w.file("embed.safetensors", embed_names))
     decoder_layers(w, cfg, prefix, family.offset)
-    head = "lm_head.weight"
+    # Beside the layers' `model.`, or at the top: where a checkpoint put the head depends on how it was saved
+    head = next(
+        (name for name in (prefix.removesuffix("model.") + "lm_head.weight", "lm_head.weight") if w.ckpt.has(name)),
+        "lm_head.weight",
+    )
     tied = cfg.get("tie_word_embeddings")
     if tied is None:
         tied = not w.ckpt.has(head)
@@ -558,6 +562,135 @@ def smolvlm_vision(w: Writer, directory: Path) -> tuple[BlockSpec, dict]:
         "tile": vision["image_size"],
         "split": split,
     }
+    return BlockSpec("vision", params, w.file("vision.safetensors", names)), section
+
+
+#: Vision towers by the model type their config names: the defaults a config leaves out
+CLIP_TOWERS = {
+    "clip_vision_model": {"act": "quick_gelu", "eps": 1e-5},
+    "siglip_vision_model": {"act": "gelu_pytorch_tanh", "eps": 1e-6},
+}
+#: How the image processors that LLaVA's go with the model resample, by PIL's number for each
+BICUBIC = 3
+
+
+def llava_vision(w: Writer, directory: Path) -> tuple[BlockSpec, dict]:
+    """LLaVA's encoder: a CLIP or SigLIP vision transformer, the layer of it the
+    config reads, and the two-layer projector to the language model's width.
+    Returns the block, and the tokenizer's `image` section: the image token and
+    how many of them a picture takes."""
+    config, ckpt = w.ckpt.config, w.ckpt
+    vision = config["vision_config"]
+    kind = vision.get("model_type", "clip_vision_model")
+    if kind not in CLIP_TOWERS:
+        raise SystemExit(f"{directory}: no importer for the vision tower {kind}; shem has {sorted(CLIP_TOWERS)}")
+    for key in ("hidden_size", "image_size", "patch_size", "num_hidden_layers", "num_attention_heads"):
+        if key not in vision:
+            raise SystemExit(f"{directory}: the vision config has no {key}")
+    feature = config.get("vision_feature_layer", -2)
+    select = config.get("vision_feature_select_strategy", "default")
+    if not isinstance(feature, int) or select not in ("default", "full"):
+        raise SystemExit(f"{directory}: shem reads one layer of the encoder, as the default or the full select")
+    total = vision["num_hidden_layers"]
+    # hidden_states[0] is what the layers read, and hidden_states[n] what layer n made
+    layers = feature if feature >= 0 else total + 1 + feature
+    if not 0 <= layers <= total:
+        raise SystemExit(f"{directory}: vision_feature_layer {feature} is not one of the encoder's {total} layers")
+    # Where the tower is, with the level `vision_model` that the Hub's checkpoints have or without it
+    bases = [f"{p}{inner}" for p in ("model.vision_tower.", "vision_tower.") for inner in ("vision_model.", "")]
+    base = next((b for b in bases if ckpt.has(f"{b}embeddings.patch_embedding.weight")), None)
+    projector = next(
+        (p for p in ("model.multi_modal_projector.", "multi_modal_projector.") if ckpt.has(f"{p}linear_1.weight")), None
+    )
+    if base is None or projector is None:
+        raise SystemExit(f"{directory}: no vision tower and projector in the checkpoint's tensors")
+    names = {
+        "patch.weight": f"{base}embeddings.patch_embedding.weight",
+        "position.weight": f"{base}embeddings.position_embedding.weight",
+        "proj1.weight": f"{projector}linear_1.weight",
+        "proj2.weight": f"{projector}linear_2.weight",
+    }
+    optional = {
+        "patch.bias": f"{base}embeddings.patch_embedding.bias",
+        "cls": f"{base}embeddings.class_embedding",
+        "pre_norm.weight": f"{base}pre_layrnorm.weight",
+        "pre_norm.bias": f"{base}pre_layrnorm.bias",
+        "proj1.bias": f"{projector}linear_1.bias",
+        "proj2.bias": f"{projector}linear_2.bias",
+    }
+    names |= {local: name for local, name in optional.items() if ckpt.has(name)}
+    for i in range(layers):
+        layer = f"{base}encoder.layers.{i}."
+        for local, name in (
+            ("q", "self_attn.q_proj"),
+            ("k", "self_attn.k_proj"),
+            ("v", "self_attn.v_proj"),
+            ("out", "self_attn.out_proj"),
+            ("norm1", "layer_norm1"),
+            ("norm2", "layer_norm2"),
+            ("fc1", "mlp.fc1"),
+            ("fc2", "mlp.fc2"),
+        ):
+            names[f"{i}.{local}.weight"] = f"{layer}{name}.weight"
+            names[f"{i}.{local}.bias"] = f"{layer}{name}.bias"
+    side = vision["image_size"] // vision["patch_size"]
+    count = side * side + ("cls" in names) - (select == "default")
+    # The token a picture is written as, from the tokenizer's added tokens
+    listed = json.loads((directory / "tokenizer.json").read_text()).get("added_tokens", [])
+    token_id = config.get("image_token_index", config.get("image_token_id"))
+    image = next((t["content"] for t in listed if t["id"] == token_id), None)
+    if image is None:
+        raise SystemExit(f"{directory}: the tokenizer has no image token with the id {token_id}")
+    # How the processor makes the picture the encoder's size, and what it normalizes by
+    settings = {}
+    if (directory / "preprocessor_config.json").exists():
+        settings = json.loads((directory / "preprocessor_config.json").read_text())
+    size = settings.get("size", {"shortest_edge": vision["image_size"]})
+    if "shortest_edge" in size:
+        resize, edge = "shortest_edge", size["shortest_edge"]
+        crop = settings.get("crop_size", {"height": edge, "width": edge})
+        if not settings.get("do_center_crop", True) or crop.get("height") != edge or crop.get("width") != edge:
+            raise SystemExit(
+                f"{directory}: shem reads a picture resized by its short edge and cropped to a square of it"
+            )
+    elif size.get("height") == size.get("width"):
+        resize, edge = "square", size["height"]
+    else:
+        raise SystemExit(f"{directory}: shem reads pictures resized to a square, not {size}")
+    if edge != vision["image_size"] or settings.get("do_resize", True) is False:
+        raise SystemExit(
+            f"{directory}: the processor makes pictures {edge} wide, and the encoder reads {vision['image_size']}"
+        )
+    clip = [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]
+    default = CLIP_TOWERS[kind]
+    params = {
+        "family": "llava",
+        "image_size": vision["image_size"],
+        "patch_size": vision["patch_size"],
+        "layers": layers,
+        "heads": vision["num_attention_heads"],
+        "eps": vision.get("layer_norm_eps", default["eps"]),
+        "act": vision.get("hidden_act", default["act"]),
+        "select": select,
+        "projector_act": config.get("projector_hidden_act", "gelu"),
+        "resize": resize,
+        "resample": settings.get("resample", BICUBIC),
+        "image_token_id": token_id,
+        "mean": settings.get("image_mean", clip[0]),
+        "std": settings.get("image_std", clip[1]),
+    }
+    section = {"token": image, "id": token_id, "count": count}
+    # The processor tokenizes a prompt as the tokenizer does by default, which may begin it with a
+    # token the chat template leaves out (a Llama tokenizer's `<s>`): the model is read with it
+    from tokenizers import Tokenizer as Hf
+
+    probe = Hf.from_file(str(directory / "tokenizer.json"))
+    with_special, plain = (
+        probe.encode("x", add_special_tokens=True).ids,
+        probe.encode("x", add_special_tokens=False).ids,
+    )
+    if len(with_special) > len(plain) and with_special[1 : 1 + len(plain)] == plain:
+        section["bos"] = with_special[0]
     return BlockSpec("vision", params, w.file("vision.safetensors", names)), section
 
 
@@ -686,6 +819,23 @@ def text_config(config: dict) -> dict:
     return config.get("text_config", config)
 
 
+#: What a language model's config leaves out when it is the default of its type, which
+#: transformers fills in and an older checkpoint's config does not hold
+TEXT_DEFAULTS = {
+    "llama": {"rms_norm_eps": 1e-6, "hidden_act": "silu", "rope_theta": 10000.0},
+    "qwen2": {"rms_norm_eps": 1e-6, "hidden_act": "silu", "rope_theta": 10000.0},
+    "mistral": {"rms_norm_eps": 1e-6, "hidden_act": "silu", "rope_theta": 10000.0},
+}
+
+
+def llava_config(config: dict) -> dict:
+    """LLaVA's language model's config, with the defaults its type has put back."""
+    text = dict(text_config(config))
+    for key, value in TEXT_DEFAULTS.get(text.get("model_type", ""), {}).items():
+        text.setdefault(key, value)
+    return text
+
+
 @dataclass
 class Family:
     """How to read the checkpoints of one architecture."""
@@ -739,6 +889,9 @@ FAMILIES: dict[str, Family] = {
     # SmolVLM is Idefics3 made smaller: the same encoder and connector
     "SmolVLMForConditionalGeneration": Family(text_config, ("model.text_model.",), vision=smolvlm_vision),
     "Idefics3ForConditionalGeneration": Family(text_config, ("model.text_model.",), vision=smolvlm_vision),
+    "LlavaForConditionalGeneration": Family(
+        llava_config, ("model.language_model.", "language_model.model."), vision=llava_vision
+    ),
 }
 
 
@@ -939,8 +1092,14 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
     else:
         config = directory / "tokenizer_config.json"
         settings = json.loads(config.read_text()) if config.exists() else {}
+        # transformers reads a template in a file of its own before the tokenizer's config
+        named = directory / "chat_template.json"
+        found = json.loads(named.read_text()).get("chat_template") if named.exists() else None
+        found = found or settings.get("chat_template")
+        if isinstance(found, list):  # several, by name: the default's, or the first
+            found = next((t["template"] for t in found if t.get("name") == "default"), found[0]["template"])
         # A base model without one gets a template that runs on from its text
-        (out / "chat_template.jinja").write_text(settings.get("chat_template") or PLAIN_TEMPLATE)
+        (out / "chat_template.jinja").write_text(found or PLAIN_TEMPLATE)
     # What the model holds: the tensors it runs, and the vision encoder of a
     # vision-language model's checkpoint only for the families shem reads
     specs = [embed, *writer.blocks, head] + ([vision] if vision else [])

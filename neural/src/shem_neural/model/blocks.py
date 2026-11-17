@@ -30,7 +30,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file
 
 from .manifest import BlockSpec, Manifest
-from .vision import Vision
+from .vision import make
 
 
 def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float, offset: float = 0.0) -> torch.Tensor:
@@ -745,7 +745,7 @@ class Model:
         head = tensors(m.head)
         #: A vision-language model's encoder, which turns pictures into the rows read in place of image tokens
         self.vision = (
-            Vision(m.vision.params, tensors(m.vision), dtype, self.device, m.tokenizer["image"]) if m.vision else None
+            make(m.vision.params, tensors(m.vision), dtype, self.device, m.tokenizer["image"]) if m.vision else None
         )
         for adapter in self.adapters:
             if missing := adapter.unused(used):

@@ -55,7 +55,11 @@ class Tokenizer:
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> list[int]:
         """The tokens of `messages`, ready for the assistant's reply."""
-        return self.encode(self.render(messages, tools))
+        ids = self.encode(self.render(messages, tools))
+        # A vision-language model's processor begins a prompt with the tokenizer's own first token,
+        # which its template may leave out
+        bos = (self.image or {}).get("bos")
+        return [bos, *ids] if bos is not None and ids[:1] != [bos] else ids
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, reply: bool = True) -> str:
         """The text of `messages` in the chat template, offering `tools`, and

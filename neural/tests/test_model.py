@@ -437,3 +437,55 @@ def test_a_vision_language_model_reads_an_image_as_transformers_does(tmp_path):
         session.feed(tokens)
         assert torch.allclose(session.logits, expected, atol=1e-3), (session.logits - expected).abs().max()
         assert session.logits.argmax() == expected.argmax()
+
+
+LLAVA = "llava-hf/llava-interleave-qwen-0.5b-hf"
+
+
+def test_a_llava_model_reads_an_image_as_transformers_does(tmp_path):
+    """A real LLaVA, with a SigLIP encoder and Qwen2 for its language: the
+    processor's tokens and pixels for a picture, and the logits of the whole pass
+    over them, in float32, are shem's."""
+    transformers = pytest.importorskip("transformers")
+    draw = pytest.importorskip("PIL.ImageDraw")
+    from PIL import Image
+
+    from shem_neural.model.generate import Session
+    from shem_neural.model.vision import data_url
+
+    out = tmp_path / "model"
+    import_model(LLAVA, out)
+    picture_ = Image.new("RGB", (640, 480), (200, 30, 30))
+    painter = draw.Draw(picture_)
+    painter.rectangle([320, 0, 640, 480], fill=(30, 60, 200))
+    painter.ellipse([220, 140, 420, 340], fill=(40, 190, 60))
+    buffer = io.BytesIO()
+    picture_.save(buffer, "PNG")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "url": data_url(buffer.getvalue())},
+                {"type": "text", "text": "What colors?"},
+            ],
+        }
+    ]
+    model = Model(out, verify=True)
+    tokenizer = Tokenizer(out, model.manifest.tokenizer)
+    processor = transformers.AutoProcessor.from_pretrained(LLAVA)
+    chat = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What colors?"}]}]
+    text = processor.apply_chat_template(chat, add_generation_prompt=True)
+    theirs = processor(text=text, images=picture_, return_tensors="pt")
+    tokens = tokenizer.chat(messages)
+    assert tokens == theirs["input_ids"][0].tolist()
+    ours = model.vision.views(messages[0]["content"][0])[0]
+    assert torch.allclose(ours, theirs["pixel_values"][0], atol=1e-5), (ours - theirs["pixel_values"][0]).abs().max()
+
+    reference = transformers.AutoModelForImageTextToText.from_pretrained(LLAVA, dtype=torch.float32).eval()
+    with torch.no_grad():
+        expected = reference(**theirs).logits[0, -1]
+    session = Session(model)
+    session.attach_images(messages)
+    session.feed(tokens)
+    assert torch.allclose(session.logits, expected, atol=1e-3), (session.logits - expected).abs().max()
+    assert session.logits.argmax() == expected.argmax()
