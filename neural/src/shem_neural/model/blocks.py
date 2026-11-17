@@ -17,6 +17,8 @@ RMSNorm's weight offset is 0 for ordinary weights and 1 for zero-centred
 weights. Computation defaults to float32; CUDA execution disables TF32.
 """
 
+import hashlib
+import json
 import math
 from collections import defaultdict
 from pathlib import Path
@@ -492,8 +494,16 @@ class Model:
     """A model loaded from its manifest's directory, ready to run sessions."""
 
     def __init__(
-        self, directory: Path, dtype: torch.dtype = torch.float32, device: str = "cpu", quantize: str | None = None
+        self,
+        directory: Path,
+        dtype: torch.dtype = torch.float32,
+        device: str = "cpu",
+        quantize: str | None = None,
+        verify: bool = False,
     ):
+        """The model in `directory`. With `verify`, its tensors are checked
+        against the fingerprint its manifest records, as they are read: a
+        model that several containers share must be the one it says it is."""
         if quantize not in (None, "int8"):
             raise ValueError(f"cannot quantize to {quantize!r}: shem has int8")
         self.directory = Path(directory)
@@ -508,6 +518,7 @@ class Model:
 
         m = self.manifest
         weight_map = m.weight_map(self.directory)
+        digest = hashlib.sha256() if verify and m.fingerprint else None
 
         def tensors(spec: BlockSpec) -> dict[str, torch.Tensor]:
             if spec.file is not None:
@@ -518,11 +529,18 @@ class Model:
                 by_file = defaultdict(list)
                 for local, name in spec.tensors.items():
                     by_file[weight_map[name]].append((local, name))
-                loaded = {}
+                loaded, named = {}, {}
                 for file, names in by_file.items():
                     with safe_open(str(self.directory / file), "pt", device=device) as handle:
                         for local, name in names:
-                            loaded[local] = handle.get_tensor(name)
+                            loaded[local] = named[name] = handle.get_tensor(name)
+                if digest is not None:
+                    # As the importer did when it made the fingerprint
+                    digest.update(json.dumps([spec.type, spec.params, spec.tensors], sort_keys=True).encode())
+                    for name in sorted(set(spec.tensors.values())):
+                        tensor = named[name].cpu().contiguous()
+                        digest.update(f"{name}:{tensor.dtype}:{list(tensor.shape)}".encode())
+                        digest.update(tensor.view(torch.uint8).numpy().tobytes() if tensor.numel() else b"")
             if quantize:
                 # Quantized as loaded, from the checkpoint's own precision
                 return {
@@ -540,6 +558,8 @@ class Model:
                 raise ValueError(f"unknown block type {spec.type!r}: this runtime has {sorted(BLOCKS)}")
             self.blocks.append(BLOCKS[spec.type](spec.params, tensors(spec)))
         head = tensors(m.head)
+        if digest is not None and "sha256:" + digest.hexdigest() != m.fingerprint:
+            raise ValueError(f"{self.directory}: the weights are not the ones the manifest's fingerprint names")
         self.head_norm = head["norm"]
         self.head_weight = self.embed if m.head.params.get("tied") else head["weight"]
         self.head_params = m.head.params

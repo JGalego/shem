@@ -90,9 +90,11 @@ class Models:
         self.linger = linger
         #: When each model nobody uses was last used, on the monotonic clock
         self.idle: dict[str, float] = {}
+        #: A lock for each model being loaded, so that two containers of one model load it once
+        self.loading: dict[str, threading.Lock] = {}
         #: This server's socket, where tools' programs run on its vCPUs
         self.socket = socket
-        self.loaded: dict[str, tuple] = {}
+        self.loaded: dict[str, object] = {}
         self.sessions: dict[str, Live] = {}
         #: Containers' APIs, served in their networks, by the ID the shim gives them
         self.served: dict[str, object] = {}
@@ -102,19 +104,43 @@ class Models:
 
     def get(self, directory: Path, dtype: str = "float32", user: str = "", quantize: str | None = None):
         """The model in `directory`, computing in `dtype`, and its tokenizer,
-        for `user`, a session ID, until `release(user)`."""
+        for `user`, a session ID, until `release(user)`.
+
+        Containers of images with the same weights share one model: it is
+        found by the fingerprint its manifest records, which it was checked
+        against as it loaded, so an image that claims another's weights
+        cannot make a model of its own pass for them. Each image's tokenizer
+        and chat template are its own. A model with no fingerprint (one
+        imported before them) is its directory's alone. Loading takes the
+        time it takes, and holds up only the others that want that model."""
         from .model.blocks import Model
         from .model.generate import dtype as torch_dtype
+        from .model.manifest import Manifest
         from .model.tokenizer import Tokenizer
 
-        key = f"{Path(directory).resolve()}\0{dtype}\0{quantize or ''}"
+        manifest = Manifest.load(directory)
+        shared = manifest.fingerprint and all(spec.file is None for spec in manifest.blocks)
+        identity = manifest.fingerprint if shared else str(Path(directory).resolve())
+        key = f"{identity}\0{dtype}\0{quantize or ''}"
         with self.lock:
+            # Claimed first, so that a model being loaded is not released from under its loader
             self.idle.pop(key, None)
-            if key not in self.loaded:
-                model = Model(directory, dtype=torch_dtype(dtype), device=self.device, quantize=quantize)
-                self.loaded[key] = (model, Tokenizer(directory, model.manifest.tokenizer))
             self.users.setdefault(key, set()).add(user)
-            return self.loaded[key]
+            loading = self.loading.setdefault(key, threading.Lock())
+        try:
+            with loading:
+                with self.lock:
+                    model = self.loaded.get(key)
+                if model is None:
+                    model = Model(
+                        directory, dtype=torch_dtype(dtype), device=self.device, quantize=quantize, verify=bool(shared)
+                    )
+                    with self.lock:
+                        self.loaded[key] = model
+        except BaseException:
+            self.release(user)
+            raise
+        return model, Tokenizer(directory, manifest.tokenizer)
 
     def release(self, user: str) -> None:
         """Forget `user`'s models, and unload those nobody else uses."""
@@ -127,6 +153,7 @@ class Models:
                         self.idle[key] = time.monotonic()
                     else:
                         self.loaded.pop(key, None)
+                        self.loading.pop(key, None)
 
     def evict(self, now: float | None = None) -> list[str]:
         """Unload the models that nobody has used for `linger` seconds, and
@@ -137,6 +164,7 @@ class Models:
             for key in gone:
                 del self.idle[key]
                 self.loaded.pop(key, None)
+                self.loading.pop(key, None)
         return gone
 
     def generate(self, request: dict, write) -> None:

@@ -331,7 +331,7 @@ It runs at [jgalego/shem-my-repo](https://huggingface.co/spaces/jgalego/shem-my-
 
 ## Sessions under Docker
 
-Model sessions run in `shem-neural-server`, keyed by container ID. [Install the shim](containerd.md#with-docker), then start the server as root so it can read containerd-mounted root filesystems. The install script can run it as a systemd service, from the `shem-neural` release that matches shem:
+Model sessions run in `shem-neural-server`, keyed by container ID. Containers of images with the same weights share one loaded model, found by the fingerprint in its `shem.json`, which the server checks against the weights as it loads them (an image that claims another's fingerprint gets the real weights, or an error), and a model loading holds up only the containers that want that model. [Install the shim](containerd.md#with-docker), then start the server as root so it can read containerd-mounted root filesystems. The install script can run it as a systemd service, from the `shem-neural` release that matches shem:
 
 ```sh
 curl -fsSL https://jgalego.github.io/shem/install.sh | SHEM_NEURAL_SERVICE=1 sh

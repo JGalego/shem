@@ -571,3 +571,62 @@ def test_verify_compares_an_import_with_its_checkpoint(tmp_path):
     tensors[name] = tensors[name] + 0.5
     save_file(tensors, str(file), metadata={"format": "pt"})
     assert not verify(str(checkpoint), out, length=8).passed
+
+
+def test_a_model_verifies_its_weights_against_its_fingerprint(imported):
+    name, _, out, _ = imported
+    Model(out, verify=True)  # the digest its loader makes is the importer's, whatever the layout
+
+
+def test_a_model_with_other_weights_than_its_fingerprint_names_is_refused(imported, tmp_path):
+    import shutil
+
+    from safetensors.torch import load_file, save_file
+
+    name, _, out, _ = imported
+    copy = tmp_path / "copy"
+    shutil.copytree(out, copy)
+    index = json.loads((copy / "model.safetensors.index.json").read_text())
+    file = copy / next(iter(index["weight_map"].values()))
+    tensors = load_file(str(file))
+    victim = next(key for key, tensor in tensors.items() if tensor.is_floating_point() and tensor.numel())
+    tensors[victim] = tensors[victim] + 1
+    file.unlink()
+    save_file(tensors, str(file), metadata={"format": "pt"})
+    Model(copy)  # without the check, nothing says so
+    with pytest.raises(ValueError, match="fingerprint"):
+        Model(copy, verify=True)
+
+
+def test_containers_of_one_model_share_it_and_a_forgery_does_not_pass_for_it(imported, tmp_path):
+    import shutil
+
+    from safetensors.torch import load_file, save_file
+
+    from shem_neural.server import Models
+
+    name, _, out, _ = imported
+    twin = tmp_path / "twin"
+    shutil.copytree(out, twin)
+    models = Models(device="cpu")
+    first = models.get(out, "float32", "c1")[0]
+    assert models.get(twin, "float32", "c2")[0] is first, "the same weights are loaded once"
+    models.release("c1")
+    models.release("c2")
+    assert not models.loaded
+
+    # A manifest that claims another model's fingerprint over other weights is not that model's
+    index = json.loads((twin / "model.safetensors.index.json").read_text())
+    file = twin / next(iter(index["weight_map"].values()))
+    tensors = load_file(str(file))
+    victim = next(key for key, tensor in tensors.items() if tensor.is_floating_point() and tensor.numel())
+    tensors[victim] = tensors[victim] * 2 + 1
+    file.unlink()
+    save_file(tensors, str(file), metadata={"format": "pt"})
+    legit = models.get(out, "float32", "c3")[0]
+    assert models.get(twin, "float32", "c4")[0] is legit, "its own files are never loaded: it runs the real weights"
+    models.release("c3")
+    models.release("c4")
+    with pytest.raises(ValueError, match="fingerprint"):
+        models.get(twin, "float32", "c5")
+    assert not models.loaded and not any(models.users.values()), "the refused one holds nothing"

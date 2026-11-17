@@ -273,9 +273,9 @@ def test_the_model_server_takes_no_session_paths_from_a_container(tmp_path):
     assert not models.loaded
 
 
-def test_models_are_kept_per_directory_and_released_with_their_last_container(tmp_path):
-    """Two images may hold the same manifest and different weights: each
-    container's model is its own directory's."""
+def test_models_with_no_fingerprint_are_kept_per_directory_and_released_with_their_last_container(tmp_path):
+    """A model that names no fingerprint cannot be shown to be another's:
+    each container's is its own directory's."""
     import shutil
 
     from shem_neural.server import Models
@@ -445,3 +445,33 @@ def test_a_server_that_nothing_uses_exits_and_leaves_no_socket(tmp_path):
     serve(socket_path, keep_warm=0.5, idle_exit=1.0)  # returns when the server exits by itself
     assert 1.0 <= time.monotonic() - started < 15
     assert not socket_path.exists()
+
+
+def test_a_slow_load_holds_up_only_those_who_want_that_model(tmp_path, monkeypatch):
+    import shutil
+
+    from shem_neural.model import blocks
+    from shem_neural.server import Models
+
+    slow = tmp_path / "slow"
+    shutil.copytree(TINY, slow)
+    release, started = threading.Event(), threading.Event()
+    real = blocks.Model
+
+    def model(directory, **kwargs):
+        if Path(directory) == slow:
+            started.set()
+            assert release.wait(30)
+        return real(directory, **kwargs)
+
+    monkeypatch.setattr(blocks, "Model", model)
+    models = Models(device="cpu")
+    loaded = []
+    loader = threading.Thread(target=lambda: loaded.append(models.get(slow, "float32", "c1")))
+    loader.start()
+    assert started.wait(30)
+    quick = models.get(TINY, "float32", "c2")[0]  # not held up by the other's load
+    assert quick is not None and not loaded
+    release.set()
+    loader.join(30)
+    assert loaded and len(models.loaded) == 2
