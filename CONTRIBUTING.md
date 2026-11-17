@@ -16,7 +16,7 @@ Small, self-contained changes that do not need the whole design in your head, ea
 - **A model family.** Add an importer for an architecture [the list](docs/models.md#imported-models) lacks: a tensor reader in `neural/src/shem_neural/model/importers.py`, a tiny random checkpoint in `neural/tests/test_importers.py`, and a row in the docs.
 - **A system call a guest needs.** Run a program, see `guest made unsupported system call N` on stderr, and add it ([how](#extend-shem)). `sendmsg`, `recvmsg` and `epoll` are not here yet.
 - **An example.** An interpreter or a tool built from source for RV32, as [`examples/lua`](examples/lua/Shemfile) is: SQLite, MicroPython, a small HTTP server using the container's [sockets](docs/architecture.md#isolation).
-- **A fuzz target.** What `shem registry` reads from the Hub, or the Python importers read from a checkpoint's `config.json`, as [`fuzz/`](fuzz/) does for Rust's parsers.
+- **A fuzz target.** The Rust parsers have them in [`fuzz/`](fuzz/), and the Python ones property tests in `neural/tests/test_fuzz.py`; add what `shem registry` reads from the Hub, or the importers read from a checkpoint's `config.json`.
 - **A type error.** `neural/mypy-baseline.txt` lists the type errors that are known; fix one, run `scripts/mypy-ratchet --update`, and the list shrinks.
 - **Docs.** A guide for a task you did that took you longer than it should, or a correction where the docs and what shem does part.
 
