@@ -475,3 +475,101 @@ def test_a_slow_load_holds_up_only_those_who_want_that_model(tmp_path, monkeypat
     release.set()
     loader.join(30)
     assert loaded and len(models.loaded) == 2
+
+
+def prompts():
+    tokenizer = Characters()
+    return [tokenizer.chat([{"role": "user", "content": text}]) for text in ("Hi", "Who are you, golem?", "Say it")]
+
+
+def test_sessions_read_a_token_each_in_one_pass_as_they_do_alone():
+    model = Model(TINY)
+    alone, together = [], []
+    for prompt in prompts():
+        for sessions in (alone, together):
+            session = Session(model)
+            session.feed(prompt)
+            sessions.append(session)
+    tokens = [7, 20, 33]
+    for _ in range(4):
+        for session, token in zip(alone, tokens, strict=True):
+            session.feed([token])
+        Session.feed_batch(together, tokens)
+        tokens = [(t * 5 + 1) % 60 for t in tokens]
+        for a, b in zip(alone, together, strict=True):
+            assert a.tokens == b.tokens
+            assert torch.allclose(a.logits, b.logits, atol=1e-5, rtol=1e-5)
+
+
+def test_replies_made_together_are_the_replies_made_alone():
+    chat = chat_of(max_tokens=10)
+    tokenizer, model = Characters(), chat.model
+    sessions, replies = [], []
+    for prompt in prompts():
+        session = Session(model)
+        session.feed(prompt)
+        sessions.append(session)
+        replies.append(serve.Job())
+        replies[-1].made = serve.Reply(session, tokenizer, 10, serve._Text(replies[-1].pieces.put))
+    active = list(replies)
+    sizes = []
+    while active:
+        active = serve.Batcher._step(active)
+        sizes.append(len(active))
+    assert max(sizes) == 3, "all three read in one pass"
+    alone = []
+    for prompt in prompts():
+        session = Session(model)
+        session.feed(prompt)
+        alone.append(generate_reply(session, tokenizer, 10))
+    assert [job.made.tokens for job in replies] == alone
+
+
+def generate_reply(session, tokenizer, max_tokens):
+    import io
+
+    from shem_neural.model.generate import reply
+
+    return reply(session, tokenizer, max_tokens, io.StringIO())
+
+
+def test_requests_answered_at_once_get_the_replies_they_would_alone():
+    chat = chat_of(max_tokens=8)
+    asked = [[{"role": "user", "content": text}] for text in ("Hi", "Who are you, golem?", "Say it", "Hello there")]
+    alone = [chat.complete(messages) for messages in asked]
+    together = [None] * len(asked)
+
+    def ask(i):
+        together[i] = chat.complete(asked[i])
+
+    threads = [threading.Thread(target=ask, args=(i,)) for i in range(len(asked))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert together == alone
+
+
+def test_a_client_that_goes_away_mid_reply_is_dropped_and_the_others_go_on():
+    chat = chat_of(max_tokens=30)
+    gone = []
+
+    def leaves(text):
+        gone.append(text)
+        raise BrokenPipeError
+
+    with pytest.raises(BrokenPipeError):
+        chat.complete([{"role": "user", "content": "Hi"}], out=leaves)
+    done = chat.complete([{"role": "user", "content": "Hi again"}])
+    assert done["completion_tokens"] == 30 and len(gone) == 1
+
+
+def test_a_reply_that_fails_ends_its_request_with_the_error(monkeypatch):
+    chat = chat_of()
+
+    def broken(*_):
+        raise RuntimeError("no memory")
+
+    monkeypatch.setattr(serve.Session, "feed_batch", staticmethod(broken))
+    with pytest.raises(RuntimeError, match="no memory"):
+        chat.complete([{"role": "user", "content": "Hi"}])

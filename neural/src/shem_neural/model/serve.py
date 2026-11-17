@@ -28,6 +28,7 @@ import copy
 import hmac
 import json
 import os
+import queue
 import socket
 import sys
 import threading
@@ -35,9 +36,11 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .generate import ContextFull, Session, reply
+from .generate import ContextFull, Reply, Session
 from .sampling import Sampler
 
+#: Replies made in one pass over the model's weights, the rest waiting for room
+MAX_BATCH = 16
 #: The largest request body taken, in bytes: a long conversation is a few hundred kilobytes
 MAX_BODY = 8 << 20
 #: Requests that may be waiting for or having their turn on the model; the next is told to retry
@@ -69,8 +72,10 @@ class Chat:
         #: Origins whose pages may call the API, or `*` for any
         self.cors = list(getattr(args, "cors_origin", None) or [])
         self.waiting = threading.BoundedSemaphore(MAX_WAITING)
+        #: Prefill, which reads a prompt in one pass, takes turns; replies are made together
+        self.prefill = threading.Lock()
+        self.batcher = Batcher(compute)
         self.primed = primed if primed is not None and primed.tokens else None
-        self.lock = threading.Lock()
 
     def prompt(self, messages: list[dict]) -> list[int]:
         """The tokens a reply to `messages` starts from, the image's system
@@ -96,13 +101,25 @@ class Chat:
             if settings.get("temperature"):
                 sampler = Sampler(**settings)
         max_tokens = max_tokens or self.max_tokens
-        text = _Text(out)
-        with self.lock, self.compute():
+        job = Job()
+        text = _Text(job.pieces.put)
+        with self.prefill, self.compute():
             session = self._start(prompt)
             session.sampler = sampler
             session.feed(prompt[len(session.tokens) :])
-            tokens = reply(session, self.tokenizer, max_tokens, text, stops=[*self.stops, *stops])
-            room = session.room()
+        job.made = Reply(session, self.tokenizer, max_tokens, text, stops=[*self.stops, *stops])
+        self.batcher.submit(job)
+        try:
+            # What the reply writes is passed on from this request's own thread: a slow client holds up no one else
+            while (piece := job.pieces.get()) is not None:
+                if out is not None:
+                    out(piece)
+        except BaseException:
+            job.cancelled = True
+            raise
+        if job.error is not None:
+            raise job.error
+        tokens, room = job.made.tokens, session.room()
         return {
             "text": text.value.strip(),
             "finish": "length" if len(tokens) >= max_tokens or (room is not None and room < 1) else "stop",
@@ -120,6 +137,83 @@ class Chat:
         session.state = copy.deepcopy(primed.state)
         session.tokens = list(primed.tokens)
         return session
+
+
+class Job:
+    """A reply on its way, for the batcher to step: what it writes goes to
+    `pieces`, which the request that made it reads, and ends with None."""
+
+    def __init__(self):
+        self.made: Reply | None = None
+        self.pieces: queue.Queue = queue.Queue()
+        self.error: BaseException | None = None
+        self.cancelled = False
+
+    def end(self, error: BaseException | None = None) -> None:
+        self.error = error
+        self.pieces.put(None)
+
+
+class Batcher:
+    """Makes the replies of every request being answered together, a token of
+    each at a time in one pass over the model's weights: decoding is bound by
+    reading them, so the more replies share a pass the more tokens a second
+    the model makes. A thread of its own runs it, in the compute context
+    (the model server's gives it every core), and starts with the first
+    reply."""
+
+    def __init__(self, compute=contextlib.nullcontext, size: int | None = None):
+        self.compute, self.size = compute, size or MAX_BATCH
+        self.waiting: queue.Queue = queue.Queue()
+        self.thread: threading.Thread | None = None
+        self.lock = threading.Lock()
+
+    def submit(self, job: Job) -> None:
+        with self.lock:
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._run, daemon=True)
+                self.thread.start()
+        self.waiting.put(job)
+
+    def _run(self) -> None:
+        active: list[Job] = []
+        with self.compute():
+            while True:
+                if not active:
+                    active.append(self.waiting.get())
+                while len(active) < self.size:
+                    try:
+                        active.append(self.waiting.get_nowait())
+                    except queue.Empty:
+                        break
+                active = self._step(active)
+
+    @staticmethod
+    def _step(active: list[Job]) -> list[Job]:
+        """Choose each reply's next token, then read them all in one pass.
+        Replies that end, fail or are given up on leave."""
+        going, tokens = [], []
+        for job in active:
+            if job.cancelled:
+                continue
+            try:
+                token = job.made.next()
+            except Exception as error:
+                job.end(error)
+                continue
+            if token is None:
+                job.end()
+            else:
+                going.append(job)
+                tokens.append(token)
+        if going:
+            try:
+                Session.feed_batch([job.made.session for job in going], tokens)
+            except Exception as error:  # a pass that fails may have read for some and not others: all end
+                for job in going:
+                    job.end(error)
+                return []
+        return going
 
 
 class _Text:

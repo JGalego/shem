@@ -97,6 +97,22 @@ class Session:
             self.tokens += tokens
             self.logits = logits[0, -1]
 
+    @staticmethod
+    def feed_batch(sessions: list["Session"], tokens: list[int]) -> None:
+        """One more token for each of several sessions of one model, read in
+        a single pass that reads the weights once. Each session ends as if
+        `feed([token])` had read its token alone, up to rounding."""
+        if len(sessions) == 1:
+            return sessions[0].feed(tokens)
+        model = sessions[0].model
+        for session in sessions:
+            if (room := session.room()) is not None and room < 1:
+                raise ContextFull("the conversation is at its model's context window")
+        logits = model.forward_batch(tokens, [s.state for s in sessions], [len(s.tokens) for s in sessions])
+        for session, token, row in zip(sessions, tokens, logits, strict=True):
+            session.tokens.append(token)
+            session.logits = row
+
     def tensors(self) -> dict[str, torch.Tensor]:
         return {
             f"{i}.{name}": tensor.contiguous().cpu()
@@ -249,6 +265,77 @@ def converse(
     return replied
 
 
+class Reply:
+    """A reply being made, a token at a time: `next` chooses and writes the
+    model's next token and returns it for the caller to read into the
+    session, which a caller with several sessions of one model can do for all
+    of them at once. `reply` is the caller with one."""
+
+    def __init__(
+        self,
+        session: Session,
+        tokenizer: Tokenizer,
+        max_tokens: int,
+        out=sys.stdout,
+        hold: bool = False,
+        stops: list[str] | None = None,
+    ):
+        self.session, self.tokenizer, self.max_tokens = session, tokenizer, max_tokens
+        self.out, self.hold = out, hold
+        self.stops = [stop for stop in stops or [] if stop]
+        self.detokenizer = Detokenizer(tokenizer)
+        self.tokens: list[int] = []
+        self.text, self.written = "", 0
+        self.done = False
+
+    def _calling(self) -> bool:
+        call = self.text.find(TOOL_CALL)
+        return call >= 0 and TOOL_CALL_END not in self.text[call:]
+
+    def next(self) -> int | None:
+        """The model's next token, written, which is to be read into the
+        session; or None if the reply is over (it has then written its end)."""
+        session, tokens = self.session, self.tokens
+        running = len(tokens) < self.max_tokens or (
+            self.hold and self._calling() and len(tokens) < self.max_tokens + TOOL_CALL_ALLOWANCE
+        )
+        # A full window ends a reply where it can read no more
+        full = (room := session.room()) is not None and room < 1
+        if self.done or not running or full:
+            return self._end()
+        token = session.choose()
+        if token in self.tokenizer.eos:
+            return self._end()
+        self.text += self.detokenizer.push(token)
+        ends = [at for at in (self.text.find(stop) for stop in self.stops) if at >= 0]
+        if ends:
+            self.text = self.text[: min(ends)]
+            return self._end()
+        tokens.append(token)
+        shown = len(self.text)
+        if self.hold:
+            call = self.text.find(TOOL_CALL)
+            shown = call if call >= 0 else len(self.text) - _partial(self.text, TOOL_CALL)
+        if self.stops:
+            shown = min(shown, len(self.text) - max(_partial(self.text, stop) for stop in self.stops))
+        if shown > self.written:
+            self.out.write(self.text[self.written : shown])
+            self.out.flush()
+            self.written = shown
+        return token
+
+    def _end(self) -> None:
+        if not self.done:
+            self.done = True
+            if self.written < len(self.text) and not (self.hold and TOOL_CALL_END in self.text[self.written :]):
+                self.out.write(self.text[self.written :])
+                self.written = len(self.text)
+            if self.written or not self.hold:
+                self.out.write("\n")
+                self.out.flush()
+        return None
+
+
 def reply(
     session: Session,
     tokenizer: Tokenizer,
@@ -265,45 +352,10 @@ def reply(
     first of `stops` it reaches, whose start is held back until it is clear
     whether it is one; the token that completes it is not read, as an end of
     turn isn't. Returns the reply's tokens."""
-    detokenizer = Detokenizer(tokenizer)
-    stops = [stop for stop in stops or [] if stop]
-    tokens = []
-    text, written = "", 0
-
-    def calling() -> bool:
-        call = text.find(TOOL_CALL)
-        return call >= 0 and TOOL_CALL_END not in text[call:]
-
-    while len(tokens) < max_tokens or (hold and calling() and len(tokens) < max_tokens + TOOL_CALL_ALLOWANCE):
-        if (room := session.room()) is not None and room < 1:
-            break  # the window is full: a reply ends where it can read no more
-        token = session.choose()
-        if token in tokenizer.eos:
-            break
-        text += detokenizer.push(token)
-        ends = [at for at in (text.find(stop) for stop in stops) if at >= 0]
-        if ends:
-            text = text[: min(ends)]
-            break
-        tokens.append(token)
-        shown = len(text)
-        if hold:
-            call = text.find(TOOL_CALL)
-            shown = call if call >= 0 else len(text) - _partial(text, TOOL_CALL)
-        if stops:
-            shown = min(shown, len(text) - max(_partial(text, stop) for stop in stops))
-        if shown > written:
-            out.write(text[written:shown])
-            out.flush()
-            written = shown
+    made = Reply(session, tokenizer, max_tokens, out, hold, stops)
+    while (token := made.next()) is not None:
         session.feed([token])
-    if written < len(text) and not (hold and TOOL_CALL_END in text[written:]):
-        out.write(text[written:])
-        written = len(text)
-    if written or not hold:
-        out.write("\n")
-        out.flush()
-    return tokens
+    return made.tokens
 
 
 def _partial(text: str, tag: str) -> int:

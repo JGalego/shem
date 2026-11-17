@@ -192,6 +192,12 @@ class Block:
         whose first token is at position `start`, updating `state`."""
         raise NotImplementedError
 
+    def forward_batch(self, x: torch.Tensor, states: list, starts: list[int]) -> torch.Tensor:
+        """One token of each of several sessions, `x` (sessions, 1, hidden),
+        whose positions are `starts` and whose states are `states`. This
+        steps them one after the other; a block that can do it at once says so."""
+        return torch.cat([self.forward(x[i : i + 1], states[i], starts[i]) for i in range(len(states))], dim=0)
+
 
 class Attention(Block):
     def __init__(self, params, tensors):
@@ -242,7 +248,10 @@ class Attention(Block):
         buffers[0][:, :, n : n + length], buffers[1][:, :, n : n + length] = k, v
         state["k"], state["v"] = buffers[0][:, :, : n + length], buffers[1][:, :, : n + length]
 
-    def forward(self, x, state, start):
+    def _split(self, x):
+        """The queries, keys and values of `x` (batch, tokens, hidden), each
+        by head and before their rotary positions, and the output gate if
+        the block has one."""
         p, t = self.p, self.t
         batch, length, _ = x.shape
         heads, kv_heads, head_dim = p["heads"], p["kv_heads"], p["head_dim"]
@@ -268,26 +277,61 @@ class Attention(Block):
         v = v.reshape(batch, length, kv_heads, head_dim)
         if "q_norm" in t and per_head:
             q, k = rmsnorm(q, t["q_norm"], eps, offset), rmsnorm(k, t["k_norm"], eps, offset)
+        return q, k, v, gate
 
-        # Rotary positions on the first `rotary_dim` dimensions of each head,
-        # if any: a block with none has no positions but the mask (SmolLM3)
-        rotary = p.get("rotary_dim", head_dim)
-        if rotary:
+    def _turn(self, q, k, cos, sin):
+        """Rotary positions on the first `rotary_dim` dimensions of each head,
+        if any: a block with none has no positions but the mask (SmolLM3)."""
+        rotary = self.p.get("rotary_dim", self.p["head_dim"])
+        if not rotary:
+            return q, k
+
+        def rope(z):
+            turned = z[..., :rotary] * cos + rotate_half(z[..., :rotary]) * sin
+            return torch.cat((turned, z[..., rotary:]), dim=-1)
+
+        return rope(q), rope(k)
+
+    def _attend(self, q, k, v, mask, group):
+        """Attention of `q` over the keys and values, which `mask` (True: see)
+        limits, if it does; `group` queries share each key."""
+        p = self.p
+        scale = p.get("scale", p["head_dim"] ** -0.5)
+        if p.get("softcap"):
+            k = k.repeat_interleave(group, dim=1)
+            v = v.repeat_interleave(group, dim=1)
+            scores = softcap((q @ k.transpose(2, 3)) * scale, p["softcap"])
+            if mask is not None:
+                scores = scores.masked_fill(~mask, float("-inf"))
+            return scores.softmax(-1) @ v
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale, enable_gqa=group > 1)
+
+    def _finish(self, x, out, gate):
+        """The block's output from the attention's, added to the stream `x`."""
+        p, t = self.p, self.t
+        batch, length, _ = x.shape
+        out = out.transpose(1, 2).reshape(batch, length, p["heads"] * p["head_dim"])
+        if gate is not None:
+            out = out * torch.sigmoid(gate)
+        out = project(out, t, "o")
+        if "post_norm" in t:
+            out = rmsnorm(out, t["post_norm"], p["eps"], p.get("norm_offset", 0.0))
+        return x + out * p.get("residual_scale", 1.0)
+
+    def forward(self, x, state, start):
+        p = self.p
+        batch, length, _ = x.shape
+        q, k, v, gate = self._split(x)
+        if p.get("rotary_dim", p["head_dim"]):
             cos, sin = self._rotary(x, start, length)
-
-            def rope(z):
-                turned = z[..., :rotary] * cos + rotate_half(z[..., :rotary]) * sin
-                return torch.cat((turned, z[..., rotary:]), dim=-1)
-
-            q, k = rope(q), rope(k)
+            q, k = self._turn(q, k, cos, sin)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         self._append(state, k, v)
         k, v = state["k"], state["v"]
 
-        group = heads // kv_heads
+        group = p["heads"] // p["kv_heads"]
         total = k.shape[2]
         window = p.get("sliding_window")
-        scale = p.get("scale", head_dim**-0.5)
         if length == 1 and window and total > window:
             # The one query sees only the last `window` keys
             k, v, total = k[:, :, -window:], v[:, :, -window:], window
@@ -301,22 +345,45 @@ class Attention(Block):
             if window:
                 hidden |= keys <= queries - window
             mask = ~hidden
-        if p.get("softcap"):
-            k = k.repeat_interleave(group, dim=1)
-            v = v.repeat_interleave(group, dim=1)
-            scores = softcap((q @ k.transpose(2, 3)) * scale, p["softcap"])
-            if mask is not None:
-                scores = scores.masked_fill(~mask, float("-inf"))
-            out = scores.softmax(-1) @ v
-        else:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale, enable_gqa=group > 1)
-        out = out.transpose(1, 2).reshape(batch, length, heads * head_dim)
-        if gate is not None:
-            out = out * torch.sigmoid(gate)
-        out = project(out, t, "o")
-        if "post_norm" in t:
-            out = rmsnorm(out, t["post_norm"], eps, offset)
-        return x + out * p.get("residual_scale", 1.0)
+        return self._finish(x, self._attend(q, k, v, mask, group), gate)
+
+    def forward_batch(self, x, states, starts):
+        """A token of each of several sessions at once: their queries, keys
+        and values are projected together, and each attends over its own
+        cache, padded to the longest and masked, so that the weights are read
+        once for them all."""
+        p = self.p
+        if (p.get("rope_scaling") or {}).get("type") == "longrope":
+            return super().forward_batch(x, states, starts)  # its frequencies depend on how far each has read
+        count = len(states)
+        q, k, v, gate = self._split(x)
+        if p.get("rotary_dim", p["head_dim"]):
+            key = (x.device, False)
+            if key not in self._freqs:
+                self._freqs[key] = rope_frequencies(p, x.device, max(starts) + 1)
+            inv_freq, scale = self._freqs[key]
+            freqs = torch.tensor(starts, dtype=torch.float32, device=x.device)[:, None] * inv_freq
+            angles = torch.cat((freqs, freqs), dim=-1)
+            cos = (angles.cos() * scale).to(x.dtype)[:, None, None, :]
+            sin = (angles.sin() * scale).to(x.dtype)[:, None, None, :]
+            q, k = self._turn(q, k, cos, sin)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        for i, state in enumerate(states):
+            self._append(state, k[i : i + 1], v[i : i + 1])
+        window = p.get("sliding_window")
+        lengths = [state["k"].shape[2] for state in states]
+        # The keys each session sees: all of them, or the last `window`
+        seen = [min(n, window) if window else n for n in lengths]
+        longest = max(seen)
+        keys = k.new_zeros(count, p["kv_heads"], longest, p["head_dim"])
+        values = v.new_zeros(count, p["kv_heads"], longest, p["head_dim"])
+        mask = torch.zeros(count, 1, 1, longest, dtype=torch.bool, device=x.device)
+        for i, state in enumerate(states):
+            keys[i, :, : seen[i]] = state["k"][0, :, lengths[i] - seen[i] :]
+            values[i, :, : seen[i]] = state["v"][0, :, lengths[i] - seen[i] :]
+            mask[i, :, :, : seen[i]] = True
+        out = self._attend(q, keys, values, mask, p["heads"] // p["kv_heads"])
+        return self._finish(x, out, gate)
 
 
 class GatedDeltaNet(Block):
@@ -372,6 +439,9 @@ class GatedDeltaNet(Block):
 
 
 class MLP(Block):
+    def forward_batch(self, x, states, starts):
+        return self.forward(x, None, 0)  # no state, and no token depends on another
+
     def forward(self, x, state, start):
         p, t = self.p, self.t
         offset, eps = p.get("norm_offset", 0.0), p["eps"]
@@ -396,6 +466,9 @@ class MoE(Block):
     tensors of their own (`gate.E`, `up.E`, `down.E`) or stacked (`gate_up`
     and `down`). A shared expert (`shared_*`), weighed by a sigmoid gate,
     adds to every token's output (Qwen2-MoE)."""
+
+    def forward_batch(self, x, states, starts):
+        return self.forward(x, None, 0)  # no state, and each token is routed on its own
 
     def forward(self, x, state, start):
         p, t = self.p, self.t
@@ -577,6 +650,23 @@ class Model:
         """The type the model computes in, as ModelPack names it, such as `float32`."""
         name = str(self.dtype).removeprefix("torch.")
         return f"{name}+{self.quantize}" if self.quantize else name
+
+    @torch.no_grad()
+    def forward_batch(self, tokens: list[int], states: list[list], starts: list[int]) -> torch.Tensor:
+        """Next-token logits (sessions, vocabulary) for one more token of each
+        of several sessions: `tokens`, which continue sessions at positions
+        `starts`, whose blocks' states are `states`. The sessions' weights are
+        read once, and each session's state is updated as `forward` updates it."""
+        x = self.embed[torch.tensor(tokens, device=self.device)][:, None, :]
+        if self.embed_scale:
+            x = x * self.embed_scale
+        for index, block in enumerate(self.blocks):
+            x = block.forward_batch(x, [state[index] for state in states], starts)
+        p = self.head_params
+        logits = rmsnorm(x[:, 0], self.head_norm, p["eps"], p.get("norm_offset", 0.0)) @ self.head_weight.T
+        if p.get("logit_divisor"):
+            logits = logits / p["logit_divisor"]
+        return softcap(logits, p.get("softcap"))
 
     @torch.no_grad()
     def forward(self, tokens: torch.Tensor, state: list, start: int) -> torch.Tensor:

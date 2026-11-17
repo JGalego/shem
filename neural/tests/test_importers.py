@@ -630,3 +630,29 @@ def test_containers_of_one_model_share_it_and_a_forgery_does_not_pass_for_it(imp
     with pytest.raises(ValueError, match="fingerprint"):
         models.get(twin, "float32", "c5")
     assert not models.loaded and not any(models.users.values()), "the refused one holds nothing"
+
+
+def test_sessions_read_together_what_they_read_alone(imported):
+    """One token of each of several sessions in one pass, over caches of
+    different lengths, gives each its logits and its state as a pass alone does,
+    whatever the family's attention: sliding windows, softcapping, norms on
+    queries and keys, output gates, rotary scaling."""
+    from shem_neural.model.generate import Session
+
+    name, _, out, _ = imported
+    model = Model(out)
+    prompts = [[1, 5, 7], [3, 4, 9, 11, 2, 8, 6, 10, 12], [2]]
+    alone, together = [], []
+    for prompt in prompts:
+        for sessions in (alone, together):
+            session = Session(model)
+            session.feed(prompt)
+            sessions.append(session)
+    tokens = [4, 6, 8]
+    for step in range(6):
+        for session, token in zip(alone, tokens, strict=True):
+            session.feed([token])
+        Session.feed_batch(together, tokens)
+        tokens = [(t * 3 + step) % 60 + 1 for t in tokens]
+        for a, b in zip(alone, together, strict=True):
+            assert torch.allclose(a.logits.float(), b.logits.float(), atol=1e-4, rtol=1e-4), (name, step)
