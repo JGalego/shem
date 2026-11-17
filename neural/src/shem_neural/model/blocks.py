@@ -139,8 +139,53 @@ class Block:
 
 
 class Attention(Block):
+    def __init__(self, params, tensors):
+        super().__init__(params, tensors)
+        #: Rotary frequencies, by device and whether the pass reaches the long ones: they hold for every pass alike
+        self._freqs: dict = {}
+
     def init_state(self, batch):
         return {}
+
+    def _rotary(self, x, start, length):
+        """The cosines and sines for positions `start` to `start + length`."""
+        p = self.p
+        scaling = p.get("rope_scaling") or {}
+        long = scaling.get("type") == "longrope" and start + length > scaling.get("original_max_position_embeddings", 0)
+        key = (x.device, long)
+        if key not in self._freqs:
+            self._freqs[key] = rope_frequencies(p, x.device, start + length)
+        inv_freq, scale = self._freqs[key]
+        positions = torch.arange(start, start + length, dtype=torch.float32, device=x.device)
+        freqs = positions[:, None] * inv_freq
+        angles = torch.cat((freqs, freqs), dim=-1)
+        return (angles.cos() * scale).to(x.dtype)[:, None, :], (angles.sin() * scale).to(x.dtype)[:, None, :]
+
+    @staticmethod
+    def _append(state, k, v):
+        """Add the new keys and values to the cache, which are views of buffers
+        with room to grow, so that a token does not copy the whole cache. The
+        buffers are state a session does not save, as its names start with an
+        underscore; `state["k"]` and `state["v"]` are what it keeps."""
+        length = k.shape[2]
+        n = state["k"].shape[2] if "k" in state else 0
+        buffers = state.get("_buffers")
+        fits = (
+            buffers is not None
+            and buffers[0].shape[2] >= n + length
+            and (n == 0 or buffers[0].data_ptr() == state["k"].data_ptr())
+        )
+        if not fits:
+            room = n + length + max(256, (n + length) // 2)
+            buffers = (
+                k.new_empty(k.shape[0], k.shape[1], room, k.shape[3]),
+                v.new_empty(v.shape[0], v.shape[1], room, v.shape[3]),
+            )
+            if n:
+                buffers[0][:, :, :n], buffers[1][:, :, :n] = state["k"], state["v"]
+            state["_buffers"] = buffers
+        buffers[0][:, :, n : n + length], buffers[1][:, :, n : n + length] = k, v
+        state["k"], state["v"] = buffers[0][:, :, : n + length], buffers[1][:, :, : n + length]
 
     def forward(self, x, state, start):
         p, t = self.p, self.t
@@ -173,12 +218,7 @@ class Attention(Block):
         # if any: a block with none has no positions but the mask (SmolLM3)
         rotary = p.get("rotary_dim", head_dim)
         if rotary:
-            inv_freq, scale = rope_frequencies(p, x.device, start + length)
-            positions = torch.arange(start, start + length, dtype=torch.float32, device=x.device)
-            freqs = positions[:, None] * inv_freq
-            angles = torch.cat((freqs, freqs), dim=-1)
-            cos = (angles.cos() * scale).to(x.dtype)[:, None, :]
-            sin = (angles.sin() * scale).to(x.dtype)[:, None, :]
+            cos, sin = self._rotary(x, start, length)
 
             def rope(z):
                 turned = z[..., :rotary] * cos + rotate_half(z[..., :rotary]) * sin
@@ -186,25 +226,36 @@ class Attention(Block):
 
             q, k = rope(q), rope(k)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        if "k" in state:
-            k = torch.cat((state["k"], k), dim=2)
-            v = torch.cat((state["v"], v), dim=2)
-        state["k"], state["v"] = k, v
+        self._append(state, k, v)
+        k, v = state["k"], state["v"]
 
         group = heads // kv_heads
-        k = k.repeat_interleave(group, dim=1)
-        v = v.repeat_interleave(group, dim=1)
-        scores = softcap((q @ k.transpose(2, 3)) * p.get("scale", head_dim**-0.5), p.get("softcap"))
         total = k.shape[2]
+        window = p.get("sliding_window")
+        scale = p.get("scale", head_dim**-0.5)
+        if length == 1 and window and total > window:
+            # The one query sees only the last `window` keys
+            k, v, total = k[:, :, -window:], v[:, :, -window:], window
         # Each query sees the keys up to its own, or with a sliding window,
-        # only the last `sliding_window` of them
-        keys = torch.arange(total, device=x.device)[None, :]
-        queries = torch.arange(total - length, total, device=x.device)[:, None]
-        hidden = keys > queries
-        if p.get("sliding_window"):
-            hidden |= keys <= queries - p["sliding_window"]
-        scores = scores.masked_fill(hidden, float("-inf"))
-        out = (scores.softmax(-1) @ v).transpose(1, 2).reshape(batch, length, heads * head_dim)
+        # only the last `window` of them. A single query sees all it has
+        mask = None
+        if length > 1:
+            keys = torch.arange(total, device=x.device)[None, :]
+            queries = torch.arange(total - length, total, device=x.device)[:, None]
+            hidden = keys > queries
+            if window:
+                hidden |= keys <= queries - window
+            mask = ~hidden
+        if p.get("softcap"):
+            k = k.repeat_interleave(group, dim=1)
+            v = v.repeat_interleave(group, dim=1)
+            scores = softcap((q @ k.transpose(2, 3)) * scale, p["softcap"])
+            if mask is not None:
+                scores = scores.masked_fill(~mask, float("-inf"))
+            out = scores.softmax(-1) @ v
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale, enable_gqa=group > 1)
+        out = out.transpose(1, 2).reshape(batch, length, heads * head_dim)
         if gate is not None:
             out = out * torch.sigmoid(gate)
         out = project(out, t, "o")

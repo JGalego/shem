@@ -95,6 +95,7 @@ class Session:
             for i, block in enumerate(self.state)
             if block
             for name, tensor in block.items()
+            if not name.startswith("_")
         }
 
     def meta(self) -> dict:

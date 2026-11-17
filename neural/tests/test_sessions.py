@@ -239,3 +239,27 @@ if __name__ == "__main__":
     shutil.rmtree(SAVED, ignore_errors=True)
     save(SAVED)
     print(f"saved {SAVED}")
+
+
+def test_the_cache_grows_in_place_and_a_session_saves_only_what_it_holds(model):
+    """Keys and values are appended to buffers with room to grow, which a
+    session does not save: one token at a time past a buffer's room reads as
+    all at once, and what is saved is exactly the tokens read."""
+    tokens = [(7 * i) % 60 + 1 for i in range(300)]
+    stepwise = Session(model)
+    for token in tokens:
+        stepwise.feed([token])
+    assert same(stepwise.logits, cold(model, tokens))
+    saved = stepwise.tensors()
+    assert not [name for name in saved if "._" in name or name.split(".", 1)[1].startswith("_")]
+    attention = next(i for i, block in enumerate(model.blocks) if type(block).__name__ == "Attention")
+    assert saved[f"{attention}.k"].shape[2] == 300 == saved[f"{attention}.v"].shape[2]
+    # A copy of the session, as the API server makes of a primed one, grows on its own
+    import copy
+
+    again = Session(model)
+    again.state, again.tokens = copy.deepcopy(stepwise.state), list(tokens)
+    again.feed([5])
+    stepwise.feed([6])
+    assert again.state[attention]["k"].shape[2] == 301
+    assert not torch.equal(again.state[attention]["k"][:, :, -1], stepwise.state[attention]["k"][:, :, -1])
