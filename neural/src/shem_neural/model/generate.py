@@ -454,8 +454,9 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--quantize",
-        choices=["int8"],
-        help="hold the projections' weights as int8, a quarter of float32's memory (embeddings stay as they are)",
+        choices=["int8", "int4"],
+        help="hold the projections' weights as int8 (a quarter of float32's memory) or int4 (an eighth, "
+        "in groups of 64 with a scale each; embeddings stay as they are)",
     )
     parser.add_argument(
         "--temperature",

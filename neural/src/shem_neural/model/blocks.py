@@ -22,6 +22,7 @@ import json
 import math
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -141,9 +142,54 @@ class QWeight:
         return F.linear(h, (self.q.to(h.dtype) * self.scale.to(h.dtype)[..., None]))
 
 
+class Q4Weight:
+    """A linear layer's weight as 4-bit integers, two to a byte, with a scale
+    for each group of 64 inputs of each output row: about an eighth of
+    float32's memory. Applied by making the one matrix dense for the call, so
+    the model never is."""
+
+    GROUP = 64
+    __slots__ = ("q", "scale", "k", "shape", "dtype", "device")
+
+    def __init__(self, weight: torch.Tensor, dtype: torch.dtype):
+        w = weight.float()
+        k = w.shape[-1]
+        if pad := -k % self.GROUP:
+            w = F.pad(w, (0, pad))
+        groups = w.reshape(*w.shape[:-1], -1, self.GROUP)
+        scale = groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 7
+        levels = ((groups / scale).round().clamp(-7, 7).to(torch.int8) + 8).to(torch.uint8)
+        levels = levels.reshape(*w.shape[:-1], -1)
+        self.q = levels[..., 0::2] | (levels[..., 1::2] << 4)
+        self.scale = scale.squeeze(-1)
+        self.k, self.shape, self.dtype, self.device = k, weight.shape, dtype, self.q.device
+
+    def __getitem__(self, index) -> "Q4Weight":
+        """One expert of a stack of them."""
+        part = object.__new__(Q4Weight)
+        part.q, part.scale, part.k, part.dtype, part.device = (
+            self.q[index],
+            self.scale[index],
+            self.k,
+            self.dtype,
+            self.device,
+        )
+        part.shape = torch.Size((*part.q.shape[:-1], self.k))
+        return part
+
+    def dense(self, dtype: torch.dtype) -> torch.Tensor:
+        low, high = (self.q & 15).to(torch.int8) - 8, (self.q >> 4).to(torch.int8) - 8
+        levels = torch.stack((low, high), dim=-1).reshape(*self.q.shape[:-1], -1)
+        groups = levels.reshape(*levels.shape[:-1], -1, self.GROUP).float() * self.scale[..., None]
+        return groups.reshape(*levels.shape)[..., : self.k].to(dtype)
+
+    def apply(self, h: torch.Tensor) -> torch.Tensor:
+        return F.linear(h, self.dense(h.dtype))
+
+
 def linear(h: torch.Tensor, weight) -> torch.Tensor:
     """`h` through the weight, quantized or not."""
-    return weight.apply(h) if isinstance(weight, QWeight) else F.linear(h, weight)
+    return weight.apply(h) if isinstance(weight, QWeight | Q4Weight) else F.linear(h, weight)
 
 
 #: The weights quantization applies to: those of each block's projections, not norms, biases or recurrent parameters
@@ -632,8 +678,8 @@ class Model:
         """The model in `directory`. With `verify`, its tensors are checked
         against the fingerprint its manifest records, as they are read: a
         model that several containers share must be the one it says it is."""
-        if quantize not in (None, "int8"):
-            raise ValueError(f"cannot quantize to {quantize!r}: shem has int8")
+        if quantize not in (None, "int8", "int4"):
+            raise ValueError(f"cannot quantize to {quantize!r}: shem has int8 and int4")
         self.directory = Path(directory)
         self.manifest = Manifest.load(self.directory)
         self.dtype = dtype
@@ -651,7 +697,7 @@ class Model:
         weight_map = m.weight_map(self.directory)
         digest = hashlib.sha256() if verify and m.fingerprint else None
 
-        def tensors(spec: BlockSpec) -> dict[str, torch.Tensor]:
+        def tensors(spec: BlockSpec) -> dict[str, Any]:
             if spec.file is not None:
                 # A v1 manifest: the block's file, under its type's names
                 loaded = load_file(str(self.directory / spec.file), device=device)
@@ -680,7 +726,9 @@ class Model:
             if quantize:
                 # Quantized as loaded, from the checkpoint's own precision
                 return {
-                    name: QWeight(tensor, dtype) if quantizable(spec.type, name) else tensor.to(dtype)
+                    name: (Q4Weight if quantize == "int4" else QWeight)(tensor, dtype)
+                    if quantizable(spec.type, name)
+                    else tensor.to(dtype)
                     for name, tensor in loaded.items()
                 }
             return {name: tensor.to(dtype) for name, tensor in loaded.items()}

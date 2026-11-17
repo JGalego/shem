@@ -23,7 +23,14 @@ import torch
 #: Devices' logits part by under the greedy margins' `CLOSE` (see `receipt`), and a logit off by that much moves
 #: no edge of the distribution's cumulative sums by more than it: the same numbers, in probability. A flat
 #: distribution, whose shares are all thinner than that, is close everywhere, as a draw from it should be.
-CLOSE = {"float32": 2e-3, "bfloat16": 0.5, "float32+int8": 0.5, "bfloat16+int8": 0.5}
+CLOSE = {
+    "float32": 2e-3,
+    "bfloat16": 0.5,
+    "float32+int8": 0.5,
+    "bfloat16+int8": 0.5,
+    "float32+int4": 0.5,
+    "bfloat16+int4": 0.5,
+}
 
 
 @dataclass

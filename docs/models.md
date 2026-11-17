@@ -47,6 +47,7 @@ A `shem:` entrypoint selects a host-side driver, not a guest executable.
 | `--dtype bfloat16` | Compute in bfloat16, which halves the memory weights and sessions take and is faster on GPUs; default `float32` |
 | `--adapter PATH` | Merge a LoRA adapter into the weights as the model loads: see [adapters](#adapters-as-layers) |
 | `--quantize int8` | Hold the projections' weights as int8 with a scale for each output row, a quarter of float32's memory and half of bfloat16's, applied with PyTorch's int8 kernel on a CPU; embeddings stay as they are. Sessions and receipts record it (`float32+int8`), so they are not mixed with unquantized ones |
+| `--quantize int4` | As `int8`, in 4 bits: two to a byte, in groups of 64 inputs with a scale each, an eighth of float32's memory. Each matrix is made dense for the one call that uses it, so it is slower than int8, and coarser: check a model's replies before you trust it |
 | `--temperature T`, `--top-p P`, `--top-k K`, `--seed N` | Draw tokens, seeded, rather than take the likeliest: see above; defaults greedy, 1, all, random |
 | `--system TEXT` | System prompt |
 | `--system-file PATH` | Append a file from the image to the system prompt |
