@@ -4,6 +4,8 @@ a tokenizer of one token per character."""
 
 import json
 import re
+import socket
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -26,14 +28,18 @@ class Replies:
 
     name = "tiny/model"
 
-    def __init__(self):
+    def __init__(self, api_key=None, cors=(), fail=None):
         self.asked = []
+        self.api_key, self.cors, self.fail = api_key, list(cors), fail
+        self.waiting = threading.BoundedSemaphore(serve.MAX_WAITING)
 
     def prompt(self, messages):
         return [0] * 3
 
     def complete(self, messages, max_tokens=None, stops=(), out=None):
         self.asked.append((messages, max_tokens, list(stops)))
+        if self.fail:
+            raise RuntimeError(self.fail)
         for piece in ("Hel", "lo"):
             if out is not None:
                 out(piece)
@@ -50,14 +56,22 @@ def api():
     server.server_close()
 
 
-def call(url: str, body: dict | None = None) -> tuple[int, bytes]:
+def call(url: str, body: dict | None = None, headers: dict | None = None, method: str | None = None):
     data = json.dumps(body).encode() if body is not None else None
-    request = urllib.request.Request(url, data, {"Content-Type": "application/json"})
+    request = urllib.request.Request(url, data, {"Content-Type": "application/json", **(headers or {})}, method=method)
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
+            call.headers = response.headers
             return response.status, response.read()
     except urllib.error.HTTPError as error:
+        call.headers = error.headers
         return error.code, error.read()
+
+
+def serving(replies):
+    server = serve.start(replies, serve.listen("127.0.0.1", 0))
+    host, port = server.server_address
+    return server, f"http://{host}:{port}"
 
 
 def test_completions_answer_as_openai_does(api):
@@ -310,3 +324,86 @@ def test_a_session_refuses_tokens_past_the_window():
     with pytest.raises(ContextFull):
         session.feed([4, 5, 6])
     assert session.tokens == [1, 2, 3], "a refused feed changes nothing"
+
+
+def test_a_key_is_required_when_there_is_one():
+    server, url = serving(Replies(api_key="s3cret"))
+    try:
+        for headers in ({}, {"Authorization": "Bearer wrong"}, {"Authorization": "Basic s3cret"}):
+            status, data = call(f"{url}/v1/chat/completions", HI, headers)
+            assert status == 401 and json.loads(data)["error"]["code"] == "invalid_api_key"
+        assert call(f"{url}/v1/models")[0] == 401
+        assert call(f"{url}/health")[0] == 200, "probes need no key"
+        good = {"Authorization": "Bearer s3cret"}
+        assert call(f"{url}/v1/chat/completions", HI, good)[0] == 200
+        assert call(f"{url}/v1/models", headers=good)[0] == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_pages_call_the_api_only_from_the_origins_allowed():
+    server, url = serving(Replies(cors=["https://app.example"]))
+    try:
+        ask = {"Origin": "https://app.example"}
+        assert call(f"{url}/v1/chat/completions", HI, ask)[0] == 200
+        assert call.headers["Access-Control-Allow-Origin"] == "https://app.example"
+        assert call(f"{url}/v1/chat/completions", HI, {"Origin": "https://evil.example"})[0] == 200
+        assert call.headers["Access-Control-Allow-Origin"] is None, "the reply is not readable there"
+        status, _ = call(
+            f"{url}/v1/chat/completions", headers=ask | {"Access-Control-Request-Method": "POST"}, method="OPTIONS"
+        )
+        assert status == 204 and "Authorization" in call.headers["Access-Control-Allow-Headers"]
+        assert (
+            call(f"{url}/v1/chat/completions", headers={"Origin": "https://evil.example"}, method="OPTIONS")[0] == 403
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    server, url = serving(Replies(cors=["*"]))
+    try:
+        assert call(f"{url}/v1/models", headers={"Origin": "https://any.example"})[0] == 200
+        assert call.headers["Access-Control-Allow-Origin"] == "*"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_body_is_a_size_the_api_takes(api):
+    _, url = api
+    host, port = url.removeprefix("http://").split(":")
+    for length, status in (("-5", 400), ("abc", 400), (str(serve.MAX_BODY + 1), 413)):
+        with socket.create_connection((host, int(port)), timeout=10) as raw:
+            raw.sendall(f"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {length}\r\n\r\n".encode())
+            assert raw.recv(4096).startswith(f"HTTP/1.1 {status}".encode()), length
+
+
+def test_a_failure_after_the_headers_of_a_stream_is_an_event():
+    server, url = serving(Replies(fail="the template refused"))
+    try:
+        status, data = call(f"{url}/v1/chat/completions", HI | {"stream": True})
+        assert status == 200
+        events = [line.removeprefix("data: ") for line in data.decode().split("\n\n") if line]
+        assert events[-1] == "[DONE]"
+        assert "the template refused" in json.loads(events[-2])["error"]["message"]
+        assert call(f"{url}/v1/chat/completions", HI)[0] == 500
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_requests_past_the_queue_are_told_to_retry(monkeypatch):
+    monkeypatch.setattr(serve, "MAX_WAITING", 1)
+    replies = Replies()
+    replies.waiting = threading.BoundedSemaphore(1)
+    server, url = serving(replies)
+    try:
+        replies.waiting.acquire()  # the model's turn is taken, and its queue is full
+        status, data = call(f"{url}/v1/chat/completions", HI)
+        assert status == 429 and json.loads(data)["error"]["code"] == "busy"
+        assert call.headers["Retry-After"] == "5"
+        replies.waiting.release()
+        assert call(f"{url}/v1/chat/completions", HI)[0] == 200
+    finally:
+        server.shutdown()
+        server.server_close()

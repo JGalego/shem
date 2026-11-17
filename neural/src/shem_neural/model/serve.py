@@ -5,6 +5,12 @@ clients and tools written for that API:
     GET  /v1/models             the model, by the repository it came from
     GET  /health                200 once the model is loaded
 
+A request is refused unless it carries `Authorization: Bearer KEY` when the
+environment has `SHEM_API_KEY` (`/health` stays open, for probes); a page
+elsewhere may call the API only from an origin `--cors-origin` allows; a
+body is at most `MAX_BODY` bytes; and at most `MAX_WAITING` requests wait
+their turn on the model, the rest being told to try again.
+
 Replies are greedy, as the driver's are, so sampling settings are accepted
 and ignored. Requests take turns on the model. The image's system prompt
 comes first unless a request gives its own, and a conversation that starts
@@ -17,6 +23,7 @@ serves in the container's network, where `docker run -p` publishes it.
 
 import contextlib
 import copy
+import hmac
 import json
 import os
 import socket
@@ -27,6 +34,13 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .generate import ContextFull, Session, reply
+
+#: The largest request body taken, in bytes: a long conversation is a few hundred kilobytes
+MAX_BODY = 8 << 20
+#: Requests that may be waiting for or having their turn on the model; the next is told to retry
+MAX_WAITING = 32
+#: Seconds a client may stay silent in the middle of a request, or between requests on a connection
+CLIENT_TIMEOUT = 60
 
 
 class Chat:
@@ -41,6 +55,11 @@ class Chat:
         self.max_tokens = args.max_tokens
         self.stops = list(args.stop)
         self.system = args.system
+        #: The key requests must carry, from the environment, never the command line, where `ps` shows it
+        self.api_key = os.environ.get("SHEM_API_KEY") or None
+        #: Origins whose pages may call the API, or `*` for any
+        self.cors = list(getattr(args, "cors_origin", None) or [])
+        self.waiting = threading.BoundedSemaphore(MAX_WAITING)
         self.primed = primed if primed is not None and primed.tokens else None
         self.lock = threading.Lock()
 
@@ -127,12 +146,48 @@ def handler(chat: Chat):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "shem"
+        timeout = CLIENT_TIMEOUT
 
         def log_message(self, format, *args):
             pass
 
+        def _allowed(self) -> bool:
+            """Whether the request carries the key, if there is one."""
+            if not chat.api_key:
+                return True
+            given = self.headers.get("Authorization", "")
+            scheme, _, token = given.partition(" ")
+            return scheme.lower() == "bearer" and hmac.compare_digest(token.strip().encode(), chat.api_key.encode())
+
+        def _origin(self) -> str | None:
+            """What `Access-Control-Allow-Origin` says to this request's page, if it may call."""
+            origin = self.headers.get("Origin")
+            if "*" in chat.cors:
+                return "*"
+            return origin if origin and origin in chat.cors else None
+
+        def do_OPTIONS(self):
+            """The preflight a page's browser sends before it calls the API."""
+            allow = self._origin()
+            self.send_response(204 if allow else 403)
+            if allow:
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+                self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def end_headers(self):
+            if allow := self._origin():
+                self.send_header("Access-Control-Allow-Origin", allow)
+                if allow != "*":
+                    self.send_header("Vary", "Origin")
+            super().end_headers()
+
         def do_GET(self):
             path = self.path.split("?")[0]
+            if path != "/health" and not self._allowed():
+                return self._unauthorized()
             if path == "/health":
                 self._json(200, {"status": "ok"})
             elif path in ("/v1/models", "/models"):
@@ -142,12 +197,27 @@ def handler(chat: Chat):
             else:
                 self._error(404, f"nothing at {path}: the API is at /v1/chat/completions")
 
+        def _unauthorized(self) -> None:
+            self.close_connection = True
+            self._error(401, "send the API key as 'Authorization: Bearer KEY'", "invalid_api_key")
+
         def do_POST(self):
             path = self.path.split("?")[0]
+            if not self._allowed():
+                return self._unauthorized()
             if path not in ("/v1/chat/completions", "/chat/completions"):
+                self.close_connection = True  # a body it did not read would be taken for the next request
                 return self._error(404, f"nothing at {path}: the API is at /v1/chat/completions")
             try:
                 length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0:
+                return self._error(400, "not a chat completion request: Content-Length is not a size")
+            if length > MAX_BODY:
+                self.close_connection = True
+                return self._error(413, f"the request is over the {MAX_BODY} bytes the API takes", "request_too_large")
+            try:
                 request = json.loads(self.rfile.read(length))
                 messages = [message(m) for m in request["messages"]]
                 if not messages:
@@ -165,14 +235,19 @@ def handler(chat: Chat):
                 chat.prompt(messages)
             except ContextFull as error:
                 return self._error(400, str(error), "context_length_exceeded")
-            if request.get("stream"):
-                self._stream(messages, max_tokens, stops, request.get("stream_options") or {})
-                return
+            if not chat.waiting.acquire(blocking=False):
+                return self._error(429, f"{MAX_WAITING} requests are waiting for the model: try again", "busy", retry=5)
             try:
-                done = chat.complete(messages, max_tokens, stops)
-            except Exception as error:  # the template, say, refusing the conversation
-                return self._error(500, f"no reply: {error}")
-            self._json(200, self._completion(done))
+                if request.get("stream"):
+                    self._stream(messages, max_tokens, stops, request.get("stream_options") or {})
+                    return
+                try:
+                    done = chat.complete(messages, max_tokens, stops)
+                except Exception as error:  # the template, say, refusing the conversation
+                    return self._error(500, f"no reply: {error}")
+                self._json(200, self._completion(done))
+            finally:
+                chat.waiting.release()
 
         def _model(self) -> dict:
             return {"id": chat.name, "object": "model", "created": 0, "owned_by": "shem"}
@@ -217,23 +292,40 @@ def handler(chat: Chat):
                 self.wfile.flush()
 
             send({"role": "assistant", "content": ""})
-            done = chat.complete(messages, max_tokens, stops, out=lambda text: send({"content": text}))
+            try:
+                done = chat.complete(messages, max_tokens, stops, out=lambda text: send({"content": text}))
+            except (BrokenPipeError, ConnectionError):
+                return  # the client left
+            except Exception as error:  # after the headers, an error is an event, as OpenAI sends one
+                failure = {"error": {"message": f"no reply: {error}", "type": "server_error", "code": None}}
+                self.wfile.write(f"data: {json.dumps(failure)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
             usage = _usage(done) if options.get("include_usage") else None
             send({}, done["finish"], usage)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
 
-        def _json(self, status: int, body: dict) -> None:
+        def _json(self, status: int, body: dict, retry: int | None = None) -> None:
             data = json.dumps(body).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            if retry is not None:
+                self.send_header("Retry-After", str(retry))
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
 
-        def _error(self, status: int, text: str, code: str | None = None) -> None:
-            kind = {400: "invalid_request_error", 404: "not_found_error"}.get(status, "server_error")
-            self._json(status, {"error": {"message": text, "type": kind, "code": code}})
+        def _error(self, status: int, text: str, code: str | None = None, retry: int | None = None) -> None:
+            kind = {
+                400: "invalid_request_error",
+                401: "authentication_error",
+                404: "not_found_error",
+                413: "invalid_request_error",
+                429: "rate_limit_error",
+            }.get(status, "server_error")
+            self._json(status, {"error": {"message": text, "type": kind, "code": code}}, retry)
 
     return Handler
 

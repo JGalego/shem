@@ -330,6 +330,11 @@ struct ServeArgs {
     /// for every network it is on
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
+    /// Let pages of this origin call the API, or `*` for any; may be given
+    /// again. Requests must carry `Authorization: Bearer KEY` when the
+    /// environment has SHEM_API_KEY
+    #[arg(long, value_name = "ORIGIN")]
+    cors_origin: Vec<String>,
     /// A model image: name[:tag] in the store, or an OCI layout directory
     image: String,
 }
@@ -906,7 +911,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<u8> {
         true => format!("[{}]:{}", args.host, args.port),
         false => format!("{}:{}", args.host, args.port),
     };
-    image::model::serve(&image.config.entrypoint, &root, &address)
+    image::model::serve(&image.config.entrypoint, &root, &address, &args.cors_origin)
 }
 
 fn pull(args: PullArgs) -> anyhow::Result<u8> {

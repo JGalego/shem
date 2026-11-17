@@ -206,14 +206,23 @@ pub fn warm(entrypoint: &[String], root: &Path, out: &Path) -> anyhow::Result<()
 /// Serve the model in the image at `root` as OpenAI's chat completions API
 /// at `address` (`HOST:PORT`), with the driver's options in `entrypoint`;
 /// replies start from the image's own primed session, if it has one.
-/// Returns the driver's status once it is interrupted.
-pub fn serve(entrypoint: &[String], root: &Path, address: &str) -> anyhow::Result<u8> {
+/// Pages of the `cors` origins may call it. Returns the driver's status once
+/// it is interrupted.
+pub fn serve(
+    entrypoint: &[String],
+    root: &Path,
+    address: &str,
+    cors: &[String],
+) -> anyhow::Result<u8> {
     let (driver, options) = entrypoint.split_first().context("no entrypoint")?;
     if driver != DRIVER {
         bail!("shem serve needs the shem:generate driver, not {driver}");
     }
     let mut command = python("shem_neural.model.generate");
     command.args(options).arg("--serve").arg(address);
+    for origin in cors {
+        command.arg("--cors-origin").arg(origin);
+    }
     let own = root.join(SESSION_DIR);
     if own.join("session.json").is_file() {
         command.arg("--session").arg(&own);

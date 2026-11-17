@@ -351,6 +351,13 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
         choices=DTYPES,
         help="the type the model computes in: bfloat16 takes half the memory",
     )
+    parser.add_argument(
+        "--cors-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help="with --serve, let pages of this origin call the API, or * for any; may be given again",
+    )
     parser.add_argument("--tools", help="offer the programs in this directory of the image to the model as tools")
     parser.add_argument(
         "--serve",

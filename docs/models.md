@@ -393,7 +393,10 @@ docker run -d -p 8000:8000 --runtime io.containerd.shem.v1 --platform linux/risc
 
 - Replies are greedy, as the driver's are: sampling settings are accepted and ignored, and `n` must be 1. `max_tokens` and `stop` apply.
 - The image's system prompt comes first unless a request gives its own, and a conversation that starts with the image's [primed session](#sessions-as-layers) goes on from it rather than reading it again.
-- Requests take turns on the model. Messages are text; tools in requests, and images, are not understood yet.
+- Requests take turns on the model, up to 32 waiting, after which the API answers `429` with `Retry-After`. Messages are text; tools in requests, and images, are not understood yet.
+- It listens on `127.0.0.1` unless given `--host`. Set `SHEM_API_KEY` in the environment, and every request but `/health` must send `Authorization: Bearer KEY`; under Docker, the model server's environment is the one that counts. A key is read from the environment, not an option, so that `ps` does not show it.
+- A page in a browser may call the API only from an origin that `--cors-origin ORIGIN` allows (or `*`).
+- A request body may be 8 MiB, and a client that stays silent for 60 seconds is dropped. A failure after a stream has begun is sent as an `error` event before `[DONE]`.
 - An image serves when it starts with `ENTRYPOINT ["shem:generate", "--serve", "8000"]` and `EXPOSE 8000`.
 
 ## Compiled layers and tools
