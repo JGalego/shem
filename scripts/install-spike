@@ -1,0 +1,23 @@
+#!/bin/sh
+# Build Spike, the RISC-V ISA simulator, at a pinned commit, and install it under
+# PREFIX (default /usr/local), for the comparison in crates/shem/tests/external.rs
+# (`cargo test --release --test external -- --ignored spike`). Needs a C++
+# compiler, make, git, the device tree compiler and Boost's regex and system
+# libraries (apt: build-essential git device-tree-compiler libboost-regex-dev
+# libboost-system-dev).
+set -eu
+COMMIT=7d1ee24bcc3308557e1c6a45c579db9ca5e97dd9
+PREFIX=${PREFIX:-/usr/local}
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cd "$work"
+git init -q spike
+cd spike
+git fetch -q --depth 1 https://github.com/riscv-software-src/riscv-isa-sim "$COMMIT"
+git checkout -q FETCH_HEAD
+mkdir build
+cd build
+../configure --prefix="$PREFIX" > /dev/null
+make -j"$(nproc)" > /dev/null
+make install > /dev/null
+echo "spike installed at $PREFIX/bin/spike"

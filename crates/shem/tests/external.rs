@@ -355,3 +355,273 @@ fn the_reference_vcpu_agrees_with_qemu_on_random_programs() {
         }
     }
 }
+
+// ---- Spike ------------------------------------------------------------------
+//
+// Spike is the RISC-V ISA's own simulator. It runs bare-metal programs, which
+// stop by writing to `tohost` and say what they computed in a signature, a
+// range of memory that it writes to a file. A program here is the same random
+// instructions as above, between a prologue that fills the registers and an
+// epilogue that stores them with the data, and ends by writing `tohost`; the
+// reference vCPU runs it too, at Spike's address, and the two ranges must be
+// the same.
+
+const SPIKE_BASE: u32 = 0x8000_0000;
+/// The signature: the data the program may have written, then every register.
+const SIGNATURE_BYTES: usize = DATA_BYTES + 4 * REGS.len();
+
+struct Bare {
+    /// What is in memory at `SPIKE_BASE`: the code, `tohost`, the data and the room for the registers
+    image: Vec<u8>,
+    /// The program as an ELF file with the symbols Spike looks for
+    elf: Vec<u8>,
+    /// Where the signature is
+    signature: u32,
+}
+
+/// The instructions of a bare program, given where `tohost` and the data are.
+fn bare_code(seed: u64, ops: usize, compressed: bool, tohost: u32, data: u32) -> (Vec<u16>, Rng) {
+    let pool = compressed_pool();
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let mut halves: Vec<u16> = Vec::new();
+    let full = |code: &mut Vec<u16>, word: u32| code.extend([word as u16, (word >> 16) as u16]);
+    for word in li(GP, data) {
+        full(&mut halves, word);
+    }
+    for &reg in &REGS {
+        for word in li(reg, rng.value()) {
+            full(&mut halves, word);
+        }
+    }
+    for _ in 0..ops {
+        if compressed && rng.below(2) == 0 {
+            halves.push(rng.pick(&pool));
+            continue;
+        }
+        let word = instruction(&mut rng);
+        full(&mut halves, word);
+        if word & 0x7f == 0x63 {
+            let (rd, rs1) = (rng.pick(&REGS), rng.pick(&REGS));
+            full(&mut halves, r(0x00, 0, rd, rs1, rs1));
+        }
+    }
+    for (slot, &reg) in REGS.iter().enumerate() {
+        full(&mut halves, sw(reg, GP, (DATA_BYTES + 4 * slot) as i32));
+    }
+    for word in li(T0, tohost) {
+        full(&mut halves, word);
+    }
+    // tohost = 1: exit with status 0
+    for word in [addi(T1, ZERO, 1), sw(T1, T0, 0), EBREAK] {
+        full(&mut halves, word);
+    }
+    (halves, rng)
+}
+
+fn bare_program(seed: u64, ops: usize, compressed: bool) -> Bare {
+    // The addresses do not change how long the code is
+    let (halves, _) = bare_code(seed, ops, compressed, 0, 0);
+    let code_len = 2 * halves.len() as u32;
+    let tohost = SPIKE_BASE + code_len.next_multiple_of(64);
+    let data = tohost + 64;
+    let (halves, mut rng) = bare_code(seed, ops, compressed, tohost, data);
+    let mut image: Vec<u8> = halves.iter().flat_map(|half| half.to_le_bytes()).collect();
+    image.resize((data - SPIKE_BASE) as usize, 0);
+    image.extend((0..DATA_BYTES).map(|_| rng.next() as u8));
+    image.resize(image.len() + 4 * REGS.len(), 0);
+    let symbols = [
+        ("tohost", tohost),
+        ("fromhost", tohost + 8),
+        ("begin_signature", data),
+        ("end_signature", data + SIGNATURE_BYTES as u32),
+    ];
+    Bare {
+        elf: bare_elf(&image, &symbols, compressed),
+        image,
+        signature: data,
+    }
+}
+
+/// An ELF file that loads `image` at `SPIKE_BASE` and starts there, with a
+/// symbol table of `symbols`, which is where Spike finds `tohost`.
+fn bare_elf(image: &[u8], symbols: &[(&str, u32)], compressed: bool) -> Vec<u8> {
+    const TEXT_AT: u32 = 0x100;
+    let mut strtab = vec![0u8];
+    let mut symtab = vec![0u8; 16]; // the null symbol
+    for (name, value) in symbols {
+        symtab.extend((strtab.len() as u32).to_le_bytes());
+        strtab.extend(name.bytes().chain([0]));
+        symtab.extend(value.to_le_bytes());
+        symtab.extend(0u32.to_le_bytes()); // size
+        symtab.extend([0x10, 0]); // global, no type
+        symtab.extend(1u16.to_le_bytes()); // in .text
+    }
+    let shstrtab = b"\0.text\0.symtab\0.strtab\0.shstrtab\0".to_vec();
+    let (text, symtab_at) = (TEXT_AT, TEXT_AT + image.len() as u32);
+    let strtab_at = symtab_at + symtab.len() as u32;
+    let shstrtab_at = strtab_at + strtab.len() as u32;
+    let sections_at = (shstrtab_at + shstrtab.len() as u32).next_multiple_of(4);
+
+    let mut out = b"\x7fELF\x01\x01\x01".to_vec();
+    out.resize(16, 0);
+    for half in [2u16, 243] {
+        out.extend(half.to_le_bytes());
+    }
+    let flags = u32::from(compressed);
+    for word in [1, SPIKE_BASE, 52, sections_at, flags] {
+        out.extend(word.to_le_bytes()); // version, entry, phoff, shoff, flags
+    }
+    for half in [52u16, 32, 1, 40, 5, 4] {
+        out.extend(half.to_le_bytes()); // ehsize, phentsize, phnum, shentsize, shnum, shstrndx
+    }
+    let size = image.len() as u32;
+    for word in [1, TEXT_AT, SPIKE_BASE, SPIKE_BASE, size, size, 7, 0x1000] {
+        out.extend(word.to_le_bytes());
+    }
+    out.resize(TEXT_AT as usize, 0);
+    out.extend(image);
+    out.extend(&symtab);
+    out.extend(&strtab);
+    out.extend(&shstrtab);
+    out.resize(sections_at as usize, 0);
+    // name, type, flags, addr, offset, size, link, info, addralign, entsize
+    let section = |out: &mut Vec<u8>, fields: [u32; 10]| {
+        for field in fields {
+            out.extend(field.to_le_bytes());
+        }
+    };
+    section(&mut out, [0; 10]);
+    section(&mut out, [1, 1, 6, SPIKE_BASE, text, size, 0, 0, 4, 0]);
+    section(
+        &mut out,
+        [7, 2, 0, 0, symtab_at, symtab.len() as u32, 3, 1, 4, 16],
+    );
+    section(
+        &mut out,
+        [15, 3, 0, 0, strtab_at, strtab.len() as u32, 0, 0, 1, 0],
+    );
+    section(
+        &mut out,
+        [23, 3, 0, 0, shstrtab_at, shstrtab.len() as u32, 0, 0, 1, 0],
+    );
+    out
+}
+
+/// The signature the reference vCPU leaves, as words.
+fn signature_on_reference(bare: &Bare, compressed: bool) -> Vec<u32> {
+    use shem::vcpu::{ExitReason, Vcpu};
+    let mut vcpu = shem::reference::ReferenceVcpu::with_base(1 << 20, SPIKE_BASE);
+    assert!(vcpu.set_compressed(compressed));
+    vcpu.write_mem(SPIKE_BASE, &bare.image).unwrap();
+    vcpu.set_pc(SPIKE_BASE);
+    let exit = vcpu.run(1_000_000);
+    assert_eq!(exit.reason, ExitReason::Ebreak, "{exit:?}");
+    let mut bytes = vec![0u8; SIGNATURE_BYTES];
+    vcpu.read_mem(bare.signature, &mut bytes).unwrap();
+    bytes
+        .chunks(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect()
+}
+
+fn spike() -> Option<PathBuf> {
+    let name = std::env::var("SHEM_SPIKE").unwrap_or_else(|_| "spike".into());
+    // Spike has no --version: its usage text, which it prints and exits with 1, says it is there
+    let found = Command::new(&name).arg("--help").output().ok()?;
+    String::from_utf8_lossy(&found.stderr)
+        .contains("Spike RISC-V ISA Simulator")
+        .then(|| PathBuf::from(name))
+}
+
+/// The signature Spike writes for the program.
+fn signature_on_spike(
+    spike: &std::path::Path,
+    bare: &Bare,
+    compressed: bool,
+    dir: &std::path::Path,
+) -> Vec<u32> {
+    let (elf, signature) = (dir.join("program.elf"), dir.join("signature.txt"));
+    std::fs::write(&elf, &bare.elf).unwrap();
+    let isa = if compressed { "rv32imc" } else { "rv32im" };
+    let out = Command::new(spike)
+        .arg(format!("--isa={isa}"))
+        .arg(format!("+signature={}", signature.display()))
+        .arg("+signature-granularity=4")
+        .arg(&elf)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "spike: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read_to_string(&signature)
+        .unwrap()
+        .lines()
+        .map(|line| u32::from_str_radix(line.trim(), 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn bare_programs_run_to_their_end_and_say_what_they_computed_on_shem() {
+    for compressed in [false, true] {
+        for seed in 0..20 {
+            let bare = bare_program(seed, 150, compressed);
+            assert_eq!(bare.elf[36] & 1, u8::from(compressed));
+            let signature = signature_on_reference(&bare, compressed);
+            assert_eq!(signature.len(), SIGNATURE_BYTES / 4);
+        }
+        let (one, other) = (
+            bare_program(1, 150, compressed),
+            bare_program(2, 150, compressed),
+        );
+        assert_ne!(
+            signature_on_reference(&one, compressed),
+            signature_on_reference(&other, compressed)
+        );
+    }
+}
+
+fn agree_with_spike(compressed: bool) {
+    let spike = spike().expect("spike (or SHEM_SPIKE) is needed");
+    let dir = tempfile::tempdir().unwrap();
+    let count: u64 = std::env::var("SHEM_RANDOM_PROGRAMS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(300);
+    for seed in 0..count {
+        let bare = bare_program(seed, 200, compressed);
+        let (ours, theirs) = (
+            signature_on_reference(&bare, compressed),
+            signature_on_spike(&spike, &bare, compressed, dir.path()),
+        );
+        assert_eq!(
+            theirs.len(),
+            ours.len(),
+            "seed {seed}: the signature's size"
+        );
+        if let Some(at) = (0..ours.len()).find(|&at| ours[at] != theirs[at]) {
+            let what = if at < DATA_BYTES / 4 {
+                format!("data word {at}")
+            } else {
+                format!("x{}", REGS[at - DATA_BYTES / 4])
+            };
+            panic!(
+                "seed {seed} (compressed: {compressed}): {what} is {:#010x} on shem and {:#010x} on Spike",
+                ours[at], theirs[at]
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs spike (riscv-isa-sim), which CI builds"]
+fn the_reference_vcpu_agrees_with_spike_on_random_programs() {
+    agree_with_spike(false);
+}
+
+#[test]
+#[ignore = "needs spike (riscv-isa-sim), which CI builds"]
+fn the_reference_vcpu_agrees_with_spike_on_random_compressed_programs() {
+    agree_with_spike(true);
+}
