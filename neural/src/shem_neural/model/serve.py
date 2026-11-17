@@ -46,6 +46,7 @@ import torch
 
 from .. import metrics as telemetry
 from . import receipt as receipts
+from .constrain import JsonConstraint
 from .generate import ContextFull, Reply, Session
 from .sampling import Sampler
 from .tools import tool_calls
@@ -141,6 +142,7 @@ class Chat:
         tools: list[dict] | None = None,
         logprobs: int | None = None,
         prompt_tokens: list[int] | None = None,
+        json_object: bool = False,
     ) -> dict:
         """Reply to `messages`, or continue `prompt_tokens`, writing the text
         to `out` as it comes, drawing tokens as `draw` says over the image's
@@ -167,6 +169,8 @@ class Chat:
                 session.choices = []
             if logprobs is not None:
                 session.logprobs, session.top_logprobs = [], logprobs
+            if json_object:
+                session.constraint = JsonConstraint(self.tokenizer)
             session.feed(prompt[len(session.tokens) :])
         job.made = Reply(session, self.tokenizer, max_tokens, text, hold=bool(tools), stops=[*self.stops, *stops])
         self.batcher.submit(job)
@@ -611,8 +615,14 @@ def handler(chat: Chat):
                     raise ValueError("top_logprobs, or logprobs of a completion, must be a number from 0 to 20")
                 if request.get("stream"):
                     raise ValueError("logprobs are not sent in a stream yet: ask without stream")
-            if request.get("response_format") not in (None, {"type": "text"}):
-                raise ValueError("response_format: shem does not constrain replies to JSON, only text")
+            form = request.get("response_format")
+            if form not in (None, {"type": "text"}, {"type": "json_object"}):
+                raise ValueError("response_format can be text or json_object: shem does not take a JSON schema")
+            json_object = form == {"type": "json_object"}
+            if json_object and (receipt or kind != "chat"):
+                raise ValueError(
+                    "json_object is for chat completions, and not with shem_receipt, which cannot replay it"
+                )
             complete = {
                 **given,
                 "max_tokens": max_tokens,
@@ -620,6 +630,7 @@ def handler(chat: Chat):
                 "draw": draw,
                 "receipt": receipt,
                 "logprobs": logprobs,
+                "json_object": json_object,
             }
             return {**given, "tools": tools or None, "complete": complete, "logprobs": logprobs}
 

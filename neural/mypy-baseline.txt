@@ -7,8 +7,6 @@ src/shem_neural/gpu.py: error: Item "DeltaMemory" of "DeltaMemory | PagedMemory 
 src/shem_neural/gpu.py: error: Item "PagedMemory" of "DeltaMemory | PagedMemory | FlatMemory" has no attribute "bytes"  [union-attr]
 src/shem_neural/model/generate.py: error: "_end" of "Reply" does not return a value (it only ever returns None)  [func-returns-value]
 src/shem_neural/model/generate.py: error: Argument 1 to "chat" has incompatible type "Session | None"; expected "Session"  [arg-type]
-src/shem_neural/model/generate.py: error: Argument 1 to "draw" of "Sampler" has incompatible type "Tensor | None"; expected "Tensor"  [arg-type]
-src/shem_neural/model/generate.py: error: Item "None" of "Tensor | None" has no attribute "argmax"  [union-attr]
 src/shem_neural/model/generate.py: error: Item "None" of "Tensor | None" has no attribute "float"  [union-attr]
 src/shem_neural/model/generate.py: error: Item "None" of "Tools | None" has no attribute "run"  [union-attr]
 src/shem_neural/model/importers.py: error: Argument 1 to "log" has incompatible type "Any | None"; expected "SupportsFloat | SupportsIndex"  [arg-type]

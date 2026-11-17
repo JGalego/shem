@@ -20,6 +20,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from safetensors.torch import load, load_file, save, save_file
@@ -66,6 +67,8 @@ class Session:
         #: Each token chosen, its log probability and the likeliest others', when a list is put here
         self.logprobs: list[tuple[int, float, list[tuple[int, float]]]] | None = None
         self.top_logprobs = 0
+        #: Limits what the model may choose, if a reply must be a JSON object
+        self.constraint: Any = None
 
     def choose(self) -> int:
         token = self._choose()
@@ -85,15 +88,19 @@ class Session:
         """The token the session continues with: the likeliest. A session
         that keeps its choices adds it, with its margin: how far its logit
         is ahead of the runner-up's."""
+        assert self.logits is not None, "a session chooses after it has read something"
+        logits = self.logits if self.constraint is None else self.constraint.mask(self.logits)
         if self.sampler is not None and not self.sampler.greedy:
-            token, margin = self.sampler.draw(self.logits)
+            token, margin = self.sampler.draw(logits)
             if self.choices is not None:
                 self.choices.append((token, margin))
-            return token
-        token = int(self.logits.argmax())
-        if self.choices is not None:
-            first, second = self.logits.float().topk(2).values.tolist()
-            self.choices.append((token, first - second))
+        else:
+            token = int(logits.argmax())
+            if self.choices is not None:
+                first, second = logits.float().topk(2).values.tolist()
+                self.choices.append((token, first - second if second > float("-inf") else float("inf")))
+        if self.constraint is not None:
+            self.constraint.advance(token)
         return token
 
     def room(self) -> int | None:

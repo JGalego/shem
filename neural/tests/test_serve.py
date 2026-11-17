@@ -712,11 +712,18 @@ def test_a_conversation_with_tool_calls_and_replies_is_what_the_template_takes()
         serve.message({"role": "assistant", "tool_calls": [{"function": {"name": "m", "arguments": "[1]"}}]})
 
 
-def test_response_formats_it_cannot_keep_are_refused_not_ignored(api):
-    _, url = api
+def test_json_object_replies_are_asked_for_and_other_formats_are_refused(api):
+    replies, url = api
     assert call(f"{url}/v1/chat/completions", HI | {"response_format": {"type": "text"}})[0] == 200
-    status, data = call(f"{url}/v1/chat/completions", HI | {"response_format": {"type": "json_object"}})
-    assert status == 400 and "response_format" in json.loads(data)["error"]["message"]
+    assert replies.more["json_object"] is False
+    assert call(f"{url}/v1/chat/completions", HI | {"response_format": {"type": "json_object"}})[0] == 200
+    assert replies.more["json_object"] is True
+    schema = {"type": "json_schema", "json_schema": {"name": "x", "schema": {}}}
+    status, data = call(f"{url}/v1/chat/completions", HI | {"response_format": schema})
+    assert status == 400 and "JSON schema" in json.loads(data)["error"]["message"]
+    json_mode = {"response_format": {"type": "json_object"}}
+    assert call(f"{url}/v1/completions", {"prompt": "x"} | json_mode)[0] == 400
+    assert call(f"{url}/v1/chat/completions", HI | json_mode | {"shem_receipt": True})[0] == 400
 
 
 def test_a_real_model_gives_log_probabilities_and_continues_raw_text():
