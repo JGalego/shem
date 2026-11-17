@@ -19,6 +19,20 @@ The neural vCPU is inspired by [Qwenputer](https://divagr.com/blog/qwenputer), b
 | Snapshot | Save canonical machine state and the host-side process or device state |
 | Multi-tenancy | The batch dimension |
 
+## What is in the weights, and what is not
+
+The tagline says containers run inside a model's weights. Precisely:
+
+| Part | Where it runs | In a language model's weights? |
+|---|---|---|
+| The neural vCPU | A standalone network of compiled weights: fetch, decode, units, writeback ([neural.md](neural.md)) | No. It is its own network, published as [`jgalego/shem-rv32im`](https://huggingface.co/jgalego/shem-rv32im) |
+| Its registers and memory | Delta-rule state of that network, or pages the fused executor keeps | No: the network's own, not a model's recurrent state |
+| A language model | PyTorch, from the checkpoint's own tensors, block by block ([models.md](models.md)) | Yes: it is the model |
+| A model's session | The model's KV caches and recurrent state | Yes, but it holds a conversation, not guest memory |
+| A tool call | The host runs the program on the compiled CPU and returns the output as text | The two meet only in text: the CPU does not share the model's residual stream or state |
+
+[Qwenputer](https://divagr.com/blog/qwenputer) goes further than shem does: its CPU layers sit inside a pretrained model, so one forward pass is both. Joining the two here would take layers that read and write the residual stream directly, with a token's embedding carrying an instruction and a Gated DeltaNet block's state as the guest's memory, a design the compiled CPU's delta-rule state suggests but nothing has tested. Nothing of that is built. The pieces that exist are the part of the CPU that does not depend on it, the [`Vcpu` interface](#the-vcpu-interface), and the receipts that would let anyone check such a run. Until a model's own forward pass executes the guest, "inside a model" means the model and the machine are both neural networks, driven by one host.
+
 ## Two modes, one runtime
 
 | | Container (`shem run`) | VM (`shem boot`) |

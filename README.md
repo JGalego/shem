@@ -25,7 +25,9 @@ The project is experimental. Current features include:
 - **Neural vCPU.** Execute RV32IM instructions with [🔥 PyTorch](https://pytorch.org), one instruction per forward pass. Tests compare it with the reference interpreter. The server batches compatible guests and shares memory pages; GPU benchmarks use [🤗 Hugging Face Jobs](https://huggingface.co/docs/huggingface_hub/guides/jobs) ([design and benchmarks](docs/neural.md)).
 - **Reference vCPU.** A [🦀 Rust](https://www.rust-lang.org) RV32IM interpreter used for differential testing and build-time snapshots. It passes the official riscv-tests, with atomics emulated by the host.
 
-See the [roadmap](docs/architecture.md#roadmap) for what is next.
+Two things are separate today, and the tagline stretches both. The CPU is a standalone compiled network, not part of any language model's weights; a model calls programs on it through the host, as a tool call that runs `shem run --vcpu neural`, and the two share no state. And a model image's session is the model's own state, not guest RAM. [What is and is not in the weights](docs/architecture.md#what-is-in-the-weights-and-what-is-not) says what it would take to join them.
+
+See the [roadmap](ROADMAP.md) for what is next.
 
 ## Getting started
 
