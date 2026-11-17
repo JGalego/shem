@@ -28,11 +28,18 @@ fn context(shemfile: &str, files: &[(&str, Vec<u8>)]) -> tempfile::TempDir {
 }
 
 fn build(context: &Path) -> anyhow::Result<Image> {
+    build_in(context, tempfile::tempdir().unwrap().keep())
+}
+
+/// As `build`, with the build cache in `home`.
+fn build_in(context: &Path, home: std::path::PathBuf) -> anyhow::Result<Image> {
     image::build(&BuildOptions {
         shemfile: context.join("Shemfile"),
         context: context.to_path_buf(),
         build_args: Default::default(),
         mem: Some(MEM),
+
+        home: Some(home),
     })
 }
 
@@ -156,6 +163,41 @@ fn warm_images_resume_at_the_frozen_system_call() {
         again.write_layout(&dir.path().join("b"), "w").unwrap(),
         "WARM is deterministic, so warm images are reproducible too"
     );
+}
+
+#[test]
+fn a_warm_the_build_made_before_is_taken_from_the_cache_and_is_the_same_image() {
+    let shemfile = "FROM scratch\nCOPY echo /bin/echo\nENTRYPOINT [\"/bin/echo\"]\nWARM --until=syscall:read\n";
+    let ctx = context(shemfile, &[("echo", echo())]);
+    let home = tempfile::tempdir().unwrap();
+    let first = build_in(ctx.path(), home.path().to_path_buf()).unwrap();
+    let runs: Vec<_> = fs::read_dir(home.path().join("runs")).unwrap().collect();
+    assert_eq!(runs.len(), 1, "the first build kept what its WARM made");
+
+    // The same build, from the cache: the same image, and it resumes where the WARM stopped
+    let second = build_in(ctx.path(), home.path().to_path_buf()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        first.write_layout(&dir.path().join("a"), "w").unwrap(),
+        second.write_layout(&dir.path().join("b"), "w").unwrap()
+    );
+    assert_eq!(run(&second, &[], b"ping\n"), (0, b"ping\n".to_vec()));
+    assert_eq!(fs::read_dir(home.path().join("runs")).unwrap().count(), 1);
+
+    // It really is taken from the cache: an entry that says something else is believed
+    let entry = runs.into_iter().next().unwrap().unwrap().path();
+    let marked = b"what the cache holds".to_vec(); // a state layer is not read back at once
+    fs::write(entry.join("state.tar"), &marked).unwrap();
+    let third = build_in(ctx.path(), home.path().to_path_buf()).unwrap();
+    assert_eq!(third.layers.last().unwrap().data, marked);
+
+    // Another program, another limit or another memory size is another entry, and so is a build with no cache
+    let other = context(
+        &shemfile.replace("syscall:read", "steps:5"),
+        &[("echo", echo())],
+    );
+    build_in(other.path(), home.path().to_path_buf()).unwrap();
+    assert_eq!(fs::read_dir(home.path().join("runs")).unwrap().count(), 2);
 }
 
 #[test]
@@ -711,10 +753,18 @@ fn files_written_before_the_freeze_become_a_layer() {
     let shemfile =
         "FROM scratch\nCOPY maker /maker\nENTRYPOINT [\"/maker\"]\nWARM --until=syscall:read\n";
     let ctx = context(shemfile, &[("maker", elf(&code, &data))]);
-    let image = build(ctx.path()).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let image = build_in(ctx.path(), home.path().to_path_buf()).unwrap();
     let root = tempfile::tempdir().unwrap();
     image.unpack_rootfs(root.path()).unwrap();
     assert_eq!(fs::read(root.path().join("made")).unwrap(), b"data");
+
+    // A build that takes the WARM from the cache puts the file in the root as well, in the same layer
+    let cached = build_in(ctx.path(), home.path().to_path_buf()).unwrap();
+    let again = tempfile::tempdir().unwrap();
+    cached.unpack_rootfs(again.path()).unwrap();
+    assert_eq!(fs::read(again.path().join("made")).unwrap(), b"data");
+    assert_eq!(cached.layers, image.layers);
 }
 
 #[test]

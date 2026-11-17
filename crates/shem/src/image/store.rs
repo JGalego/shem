@@ -13,6 +13,17 @@ use super::{Image, REF_NAME, Store, parse_reference};
 /// released when dropped, or when the process ends.
 pub struct StoreLock(#[allow(dead_code)] std::fs::File);
 
+/// What a `WARM` of a program or a VM made: the layer of the files it changed,
+/// if it changed any, the state layer, and the frozen machine's two parts, as
+/// the state layer holds them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmedRun {
+    pub files: Option<Vec<u8>>,
+    pub state: Vec<u8>,
+    pub host: Vec<u8>,
+    pub machine: Vec<u8>,
+}
+
 impl Store {
     /// Lock the store against other shem processes that change it, so that
     /// two builds of one tag, a pull racing a `shem rmi`, or a `shem prune`
@@ -178,6 +189,7 @@ impl Store {
             // The build cache: models imported and sessions primed, made again by the next build
             doomed.extend(entries(&self.cache("imports"))?);
             doomed.extend(entries(&self.cache("warms"))?);
+            doomed.extend(entries(&self.cache("runs"))?);
         }
         let mut deleted = Vec::new();
         for path in doomed {
@@ -221,6 +233,32 @@ impl Store {
         self.keep("warms", key, |staging| {
             std::fs::create_dir_all(staging)?;
             std::fs::write(staging.join("state.tar"), state)?;
+            Ok(())
+        })
+    }
+
+    /// What a program's or VM's `WARM` made before under `key`.
+    pub fn cached_run(&self, key: &str) -> Option<WarmedRun> {
+        let dir = self.cache("runs").join(key);
+        let read = |name: &str| std::fs::read(dir.join(name)).ok();
+        Some(WarmedRun {
+            files: read("files.tar"),
+            state: read("state.tar")?,
+            host: read("host.json")?,
+            machine: read("machine.state")?,
+        })
+    }
+
+    /// Keep what a `WARM` made, for the build that would make it again.
+    pub fn cache_run(&self, key: &str, run: &WarmedRun) -> anyhow::Result<()> {
+        self.keep("runs", key, |staging| {
+            std::fs::create_dir_all(staging)?;
+            if let Some(files) = &run.files {
+                std::fs::write(staging.join("files.tar"), files)?;
+            }
+            std::fs::write(staging.join("state.tar"), &run.state)?;
+            std::fs::write(staging.join("host.json"), &run.host)?;
+            std::fs::write(staging.join("machine.state"), &run.machine)?;
             Ok(())
         })
     }

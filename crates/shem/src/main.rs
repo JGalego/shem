@@ -718,6 +718,8 @@ fn build(args: BuildArgs) -> anyhow::Result<u8> {
         context: args.context,
         build_args,
         mem: args.mem,
+
+        home: None,
     };
     let built = image::build(&options)?;
     let (tag, dir) = match (args.tag, args.output) {

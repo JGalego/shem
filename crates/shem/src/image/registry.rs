@@ -152,6 +152,8 @@ fn import(remote: &str, context: &Path, out: &Path) -> anyhow::Result<()> {
         context: context.to_path_buf(),
         build_args: BTreeMap::new(),
         mem: None,
+
+        home: None,
     })?;
     image.write_layout(out, tag)?;
     Ok(())

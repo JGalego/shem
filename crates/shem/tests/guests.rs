@@ -293,6 +293,8 @@ fn build_example(name: &str) -> shem::image::Image {
         context,
         build_args: Default::default(),
         mem: Some(MEM),
+
+        home: Some(tempfile::tempdir().unwrap().keep()), // a cache of its own: the tests leave shem's home alone
     })
     .unwrap_or_else(|err| panic!("building examples/{name}: {err:#} (run `just guest-tests`)"))
 }

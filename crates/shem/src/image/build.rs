@@ -16,6 +16,7 @@ use anyhow::{Context, bail};
 
 use super::modelpack::{self, Artifact};
 use super::shemfile::{self, Instruction, Stage, Until};
+use super::store::WarmedRun;
 use super::{
     Config, History, Image, Layer, ROOTFS_TYPE, STATE_TYPE, Store, find_program, layer, model,
     registry_host,
@@ -23,6 +24,7 @@ use super::{
 use crate::container::{Container, Frozen, Pause, Stop};
 use crate::linux::{RootFs, Stdio};
 use crate::reference::ReferenceVcpu;
+use crate::vcpu::MachineState;
 use crate::vm::{self, Console, Machine};
 
 /// The stage name the builder adds to export files from a Docker stage.
@@ -40,6 +42,8 @@ pub struct BuildOptions {
     /// Guest memory for `WARM` steps, which becomes the warm image's memory:
     /// by default `CONTAINER_MEM`, or `VM_MEM` for a VM image.
     pub mem: Option<u32>,
+    /// Where the build cache is kept, if not in shem's home
+    pub home: Option<PathBuf>,
 }
 
 pub fn build(options: &BuildOptions) -> anyhow::Result<Image> {
@@ -488,7 +492,12 @@ impl Builder<'_> {
             return Ok(());
         }
         let data = layer::create(&self.root, paths, deleted)?;
-        // Filesystem layers go before any state layer, which always comes last.
+        self.push_layer(data);
+        Ok(())
+    }
+
+    /// Put a filesystem layer before the state layer, which always comes last.
+    fn push_layer(&mut self, data: Vec<u8>) {
         let at = self
             .image
             .layers
@@ -497,10 +506,62 @@ impl Builder<'_> {
             .unwrap_or(self.image.layers.len());
         self.image.layers.insert(at, Layer::new(ROOTFS_TYPE, data));
         self.history.push(History::by(&self.step, false));
-        Ok(())
+    }
+
+    /// The store the build cache is in: the one the build was given, or shem's own.
+    fn store(&self) -> anyhow::Result<Store> {
+        match &self.options.home {
+            Some(home) => Ok(Store::at(home)),
+            None => Store::open(),
+        }
+    }
+
+    /// The key of what a `WARM` of this image makes: the same layers, configuration and limits
+    /// run the same, because the guest's clock and its host are virtual. None with the cache off.
+    fn warm_key(&self, kind: &str, until: &Until, max_steps: u64) -> Option<String> {
+        Store::caching().then(|| {
+            let config = &self.image.config;
+            let mut parts: Vec<Vec<u8>> = vec![
+                env!("CARGO_PKG_VERSION").into(),
+                kind.into(),
+                format!("{until:?}").into_bytes(),
+                max_steps.to_string().into_bytes(),
+                format!("{:?}", self.options.mem).into_bytes(),
+            ];
+            for layer in &self.image.layers {
+                parts.push(layer.media_type.as_bytes().to_vec());
+                parts.push(layer.data.clone());
+            }
+            for list in [&config.entrypoint, &config.cmd, &config.env] {
+                parts.push(list.join("\0").into_bytes());
+            }
+            for text in [&config.workdir, &config.kernel.clone().unwrap_or_default()] {
+                parts.push(text.clone().into_bytes());
+            }
+            parts.push(config.bootargs.clone().unwrap_or_default().into_bytes());
+            cache_key_bytes(&parts)
+        })
     }
 
     fn warm(&mut self, until: &Until, max_steps: u64) -> anyhow::Result<()> {
+        let key = self.warm_key("program", until, max_steps);
+        if let Some(key) = &key
+            && let Some(run) = self.store()?.cached_run(key)
+        {
+            eprintln!("shem: using the WARM made before");
+            if let Some(files) = &run.files {
+                layer::unpack(files, &self.root)?;
+                self.push_layer(files.clone());
+            }
+            let frozen = Frozen {
+                machine: MachineState::decode(&run.machine)?,
+                host: serde_json::from_slice(&run.host)?,
+            };
+            self.set_state(run.state);
+            self.image.config.memory = Some(frozen.machine.mem.len() as u32);
+            self.frozen = Some(frozen);
+            return Ok(());
+        }
         let config = self.image.config.clone();
         let before = layer::scan(&self.root)?;
         let stdio = || Stdio {
@@ -553,10 +614,24 @@ impl Builder<'_> {
         let frozen = container.freeze()?;
 
         let (changed, deleted) = layer::diff(&before, &layer::scan(&self.root)?);
-        self.add_layer(&changed, &deleted)?;
+        let files = (!changed.is_empty() || !deleted.is_empty())
+            .then(|| layer::create(&self.root, &changed, &deleted))
+            .transpose()?;
+        if let Some(files) = &files {
+            self.push_layer(files.clone());
+        }
         let host = serde_json::to_vec(&frozen.host)?;
         let machine = frozen.machine.encode();
         let state = layer::from_files(&[("container.json", &host), ("machine.state", &machine)])?;
+        if let Some(key) = &key {
+            let run = WarmedRun {
+                files,
+                state: state.clone(),
+                host: host.clone(),
+                machine: machine.clone(),
+            };
+            self.store()?.cache_run(key, &run)?;
+        }
         self.set_state(state);
         self.image.config.memory = Some(frozen.machine.mem.len() as u32);
         self.frozen = Some(frozen);
@@ -567,6 +642,20 @@ impl Builder<'_> {
     /// `WARM` froze, until the condition holds, and freeze the machine. The
     /// console has no input, and its output goes to stderr.
     fn warm_vm(&mut self, until: &Until, max_steps: u64) -> anyhow::Result<()> {
+        let key = self.warm_key("vm", until, max_steps);
+        if let Some(key) = &key
+            && let Some(run) = self.store()?.cached_run(key)
+        {
+            eprintln!("shem: using the WARM made before");
+            let frozen = vm::Frozen {
+                machine: MachineState::decode(&run.machine)?,
+                host: serde_json::from_slice(&run.host)?,
+            };
+            self.set_state(run.state);
+            self.image.config.memory = Some(frozen.machine.mem.len() as u32);
+            self.frozen_vm = Some(frozen);
+            return Ok(());
+        }
         let pause = match until {
             Until::Steps(n) => vm::Pause::Steps(*n),
             Until::Output(bytes) => vm::Pause::Output(bytes.clone()),
@@ -602,8 +691,17 @@ impl Builder<'_> {
         }
         let frozen = machine.freeze();
         let host = serde_json::to_vec(&frozen.host)?;
-        let state = frozen.machine.encode();
-        let state = layer::from_files(&[("machine.state", &state), ("vm.json", &host)])?;
+        let machine = frozen.machine.encode();
+        let state = layer::from_files(&[("machine.state", &machine), ("vm.json", &host)])?;
+        if let Some(key) = &key {
+            let run = WarmedRun {
+                files: None,
+                state: state.clone(),
+                host: host.clone(),
+                machine,
+            };
+            self.store()?.cache_run(key, &run)?;
+        }
         self.set_state(state);
         self.image.config.memory = Some(frozen.machine.mem.len() as u32);
         self.frozen_vm = Some(frozen);

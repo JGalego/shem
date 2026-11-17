@@ -169,6 +169,8 @@ fn build_image(shemfile: &str, files: &[(&str, &[u8])], mem: Option<u32>) -> Ima
         context: dir.path().to_path_buf(),
         build_args: Default::default(),
         mem,
+
+        home: Some(tempfile::tempdir().unwrap().keep()), // a cache of its own: the tests leave shem's home alone
     })
     .unwrap()
 }

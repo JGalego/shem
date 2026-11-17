@@ -359,6 +359,8 @@ fn warm_images_built_on_the_reference_resume_on_the_neural_vcpu() {
         context: context.path().to_path_buf(),
         build_args: Default::default(),
         mem: Some(MEM),
+
+        home: Some(tempfile::tempdir().unwrap().keep()), // a cache of its own: the tests leave shem's home alone
     })
     .unwrap();
 
