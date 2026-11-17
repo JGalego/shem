@@ -97,3 +97,98 @@ def test_only_receipts_replay(driver, tmp_path):
         (tmp_path / "junk.json").write_text(junk)
         with pytest.raises(ValueError, match="not a shem.receipt/v1 receipt"):
             driver("--replay", str(tmp_path / "junk.json"))
+
+
+# A receipt written in a container, as `docker run IMAGE --receipt /r.json "prompt"` gives one:
+# the model server writes it inside the container's root, whose files the image put there.
+
+
+@pytest.fixture
+def container(tmp_path):
+    """An image's root with the tiny model in it, and the model server."""
+    import shutil
+
+    from shem_neural.server import Models
+
+    shutil.copytree(MODEL, tmp_path / "root" / "model")
+    return Models(device="cpu"), tmp_path / "root"
+
+
+def ask(models, root, argv, session_id="c", *, turn=False):
+    out = []
+    request = {"model": str(root / "model"), "argv": ["--max-tokens", "8", *argv], "session_id": session_id}
+    (models.turn if turn else models.generate)(request, out.append)
+    return b"".join(out).decode()
+
+
+def replay(root, name):
+    model = Model(root / "model")
+    return receipt.replay_messages(
+        model, Tokenizer(root / "model", model.manifest.tokenizer), receipt.load(root / name)
+    )
+
+
+def test_a_container_writes_a_receipt_inside_itself_that_replays(container):
+    models, root = container
+    log = ask(models, root, ["--receipt", "/r.json", "--subject", "image=tiny@sha256:ab", PROMPT])
+    assert "wrote a receipt of 8 tokens" in log and "/r.json in the container" in log
+    held = receipt.load(root / "r.json")
+    assert held["image"] == "tiny@sha256:ab" and held["prompt"] == PROMPT
+    assert held["context"] and held["messages"][-1] == {"role": "user", "content": PROMPT}
+    status, why = replay(root, "r.json")
+    assert status == receipt.SAME, why
+    # A changed reply is not the model's
+    forged = {**held, "tokens": [(t + 1) % 60 for t in held["tokens"]]}
+    (root / "forged.json").write_text(receipt.dumps(forged))
+    assert replay(root, "forged.json")[0] in (receipt.DIFFERENT, receipt.UNDECIDED)
+
+
+def test_a_later_turn_of_a_kept_session_has_a_receipt_that_replays_from_the_tokens_it_read(container):
+    models, root = container
+    ask(models, root, ["--system", "t7 t8", "t3 t4"])
+    ask(models, root, ["--receipt", "/second.json", "t9 t10 t11"], turn=True)
+    held = receipt.load(root / "second.json")
+    assert [m["role"] for m in held["messages"]] == ["system", "user", "assistant", "user"]
+    status, why = replay(root, "second.json")
+    assert status == receipt.SAME, why
+    ask(models, root, ["--receipt", "/third.json", "t12"], turn=True)
+    assert replay(root, "third.json")[0] == receipt.SAME
+
+
+def test_a_sampled_session_s_later_replies_are_drawn_again_from_where_the_generator_was(container):
+    models, root = container
+    draw = ["--temperature", "1.5", "--seed", "11"]
+    ask(models, root, [*draw, "--receipt", "/a.json", "t3 t4"])
+    ask(models, root, ["--receipt", "/b.json", "t9 t10"], turn=True)
+    first, second = receipt.load(root / "a.json"), receipt.load(root / "b.json")
+    assert first["sampling"]["seed"] == second["sampling"]["seed"] == 11
+    assert "after" not in first["sampling"] and second["sampling"]["after"] == 8
+    for name in ("a.json", "b.json"):
+        status, why = replay(root, name)
+        assert status == receipt.SAME, f"{name}: {why}"
+
+
+def test_where_a_container_may_put_a_receipt_is_inside_it(container, tmp_path):
+    models, root = container
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link").symlink_to(outside)
+    (root / "file.json").symlink_to(outside / "taken.json")
+    for path in ("/link/r.json", "/file.json", "/../r.json", "../r.json", "/"):
+        with pytest.raises(ValueError, match="--receipt"):
+            ask(models, root, ["--receipt", path, PROMPT], session_id=f"s{path}")
+    assert not list(outside.iterdir()), "nothing was written outside the container"
+    # Directories that are not there yet are made, and a file there is replaced
+    ask(models, root, ["--receipt", "/receipts/today/r.json", PROMPT], session_id="made")
+    assert receipt.load(root / "receipts/today/r.json")["format"] == receipt.FORMAT
+    ask(models, root, ["--receipt", "/receipts/today/r.json", "t5"], session_id="again")
+    assert receipt.load(root / "receipts/today/r.json")["prompt"] == "t5"
+
+
+def test_a_container_cannot_name_other_files_of_the_hosts(container, tmp_path):
+    models, root = container
+    for option in (["--replay", str(tmp_path / "x")], ["--session", str(tmp_path)], ["--image", "/etc/passwd"]):
+        with pytest.raises(ValueError, match="cannot give"):
+            ask(models, root, [*option, PROMPT], session_id="refused")
+    with pytest.raises(ValueError, match="give a prompt"):
+        ask(models, root, ["--receipt", "/r.json"], session_id="empty")

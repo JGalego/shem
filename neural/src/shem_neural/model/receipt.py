@@ -113,12 +113,21 @@ def record(session, prompt: str, subjects: dict[str, str] | None = None) -> dict
 
 
 def record_messages(
-    session, messages: list[dict], text: str, request: dict, subjects: dict[str, str] | None = None
+    session,
+    messages: list[dict],
+    text: str,
+    request: dict,
+    subjects: dict[str, str] | None = None,
+    context: list[int] | None = None,
 ) -> dict:
     """The receipt of a reply to a conversation, as the API makes one:
     `messages` is what the model was given, `text` the reply, and `request`
     the limits it was made under (`max_tokens`, `stop`), which a replay keeps.
-    The `prompt` is the last user message, for whoever reads it."""
+    The `prompt` is the last user message, for whoever reads it. A reply in a
+    session that has gone on for turns holds its `context`: the tokens the
+    session had read when it replied, which a replay reads as they were, since
+    a conversation read a turn at a time is not always the tokens its whole
+    text makes."""
     choices = session.choices or []
     drawn = session.sampler is not None and not session.sampler.greedy
     user = next((plain(m["content"]) for m in reversed(messages) if m["role"] == "user"), "")
@@ -127,6 +136,7 @@ def record_messages(
         **(subjects or {}),
         "prompt": user,
         "messages": messages,
+        **({"context": context} if context is not None else {}),
         "reply": text,
         "tokens": [token for token, _ in choices],
         "margins": [round(margin, 6) for _, margin in choices],
@@ -150,7 +160,7 @@ def replay_messages(model, tokenizer, checked: dict, out=None) -> tuple[int, str
     if checked.get("sampling"):
         session.sampler = Sampler(**checked["sampling"])
     session.attach_images(messages)
-    session.feed(tokenizer.chat(messages))
+    session.feed(checked["context"] if "context" in checked else tokenizer.chat(messages))
     made = Reply(
         session,
         tokenizer,
@@ -167,10 +177,15 @@ def replay_messages(model, tokenizer, checked: dict, out=None) -> tuple[int, str
     return check(checked, session)
 
 
-def save(receipt: dict, path: Path) -> None:
-    """Write `receipt` to the file at `path`, a field to a line."""
+def dumps(receipt: dict) -> str:
+    """`receipt` as the text a file holds, a field to a line."""
     fields = [f" {json.dumps(key)}: {json.dumps(value, ensure_ascii=False)}" for key, value in receipt.items()]
-    Path(path).write_text("{\n" + ",\n".join(fields) + "\n}\n")
+    return "{\n" + ",\n".join(fields) + "\n}\n"
+
+
+def save(receipt: dict, path: Path) -> None:
+    """Write `receipt` to the file at `path`."""
+    Path(path).write_text(dumps(receipt))
 
 
 def load(path: Path) -> dict:

@@ -73,6 +73,8 @@ class Session:
         #: What the model reads in place of the image tokens it has yet to
         #: read: a row for each, from `attach_images`
         self.pending: torch.Tensor | None = None
+        #: How many tokens the session had read when it last began a reply: its context
+        self.prompted = 0
 
     def choose(self) -> int:
         token = self._choose()
@@ -323,6 +325,7 @@ def converse(
     new = [{"role": "user", "content": parts if images else text}]
     for _ in range(MAX_TOOL_ROUNDS + 1):
         session.feed(next_turn(session, tokenizer, new))
+        session.prompted = len(session.tokens)
         replied = reply(session, tokenizer, max_tokens, out, hold=session.runner is not None, stops=stops)
         content = tokenizer.decode(replied).strip()
         session.messages += new

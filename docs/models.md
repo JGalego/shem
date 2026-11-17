@@ -418,6 +418,21 @@ docker rm clay
 
 The `docker run` rows omit the required `--runtime io.containerd.shem.v1 --platform linux/riscv32` flags for brevity.
 
+A container can write a [receipt](#receipts) of a reply. `--receipt PATH` on a `docker run` command line, or on a `docker exec`'s, writes it to `PATH` **inside the container**, which `docker cp` brings out, whether the container is still running or has stopped:
+
+```sh
+docker run --name clay --runtime io.containerd.shem.v1 --platform linux/riscv32 golem \
+  --receipt /receipt.json --subject image=ghcr.io/me/golem@sha256:DIGEST "Who are you?"
+docker cp clay:/receipt.json . && docker rm clay
+shem replay receipt.json
+```
+
+The model server may be root and the container's files are the image's, so it opens each name of the path from the directory before it without following a link, and refuses `..`: no path leads the write out of the container's root (directories that are not there are made, and a file is replaced). A path outside the container is the host's to name, so `--warm`, `--session`, `--replay` and `--image` stay refused on a container's command line.
+
+Runtimes do not tell a container which image it came from, so a receipt names it only if the command line says (`--subject image=NAME@sha256:DIGEST`, the digest of the image as a registry has it, which `docker images --digests` shows); `shem replay` needs it, and refuses an image with another digest. Without it the receipt is still a record of the reply, which `shem-neural-generate --replay` checks on the model's directory.
+
+A later turn of a kept container's session has a receipt too, of the whole conversation so far and of the tokens the session had read when it replied, since a conversation read a turn at a time is not always the tokens its whole text makes. A sampled session's later replies are drawn again from where its generator stood (`sampling.after` draws in). Receipts are for runs without tools.
+
 ## Serving OpenAI's API
 
 `shem serve` serves a model image as OpenAI's chat completions API, for the clients and tools written for it:
@@ -547,7 +562,7 @@ uv run --project neural python space/replay.py receipt.json --prompt "Who am I?"
 
 ![The shem replay Space: a receipt is replayed and verified, with each token marked by how firmly it was chosen; a changed prompt shows which words of the reply change; and a receipt whose reply was edited comes back as a mismatch.](assets/shem-replay.gif)
 
-Receipts come from `shem run`, and from the API on request: a chat completion request with `"shem_receipt": true` gets a receipt of its reply in the response, and in a stream's last chunk. It holds the `messages` the model was given (the image's system prompt included), the `request` limits (`max_tokens`, `stop`) and the image `shem serve` named, and `shem replay` reads the conversation again and draws the reply as the API did; under Docker the server does not know its image's digest, so those receipts name none. Sessions under Docker write none yet. A receipt names its image by the reference the run was given, so once a repo is pushed to again, checking an older receipt takes the image it was made with, given to `shem replay RECEIPT IMAGE`.
+Receipts come from `shem run`, from [a container's command line](#sessions-under-docker) with `--receipt`, and from the API on request: a chat completion request with `"shem_receipt": true` gets a receipt of its reply in the response, and in a stream's last chunk. It holds the `messages` the model was given (the image's system prompt included), the `request` limits (`max_tokens`, `stop`) and the image `shem serve` named, and `shem replay` reads the conversation again and draws the reply as the API did; under Docker the server does not know its image's digest, so those receipts name none. Sessions under Docker write none yet. A receipt names its image by the reference the run was given, so once a repo is pushed to again, checking an older receipt takes the image it was made with, given to `shem replay RECEIPT IMAGE`.
 
 ## Running
 

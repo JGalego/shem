@@ -961,7 +961,7 @@ fn replay(args: ReplayArgs) -> anyhow::Result<u8> {
     .with_context(|| format!("{}: not a receipt", args.receipt.display()))?;
     let (named, digest) = parse_subject(receipt["image"].as_str().with_context(|| {
         format!(
-            "{}: the receipt names no image: was it written by the driver alone, not `shem run`?",
+            "{}: the receipt names no image: was it written by the driver alone, or by a container whose command line gave no `--subject image=NAME@sha256:DIGEST`?",
             args.receipt.display()
         )
     })?);

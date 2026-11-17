@@ -338,10 +338,28 @@ fn model_containers_hold_live_sessions() {
 
     // docker exec: another turn of the same session, which remembers the first
     let mut reply = Vec::new();
-    let args = ["shem:generate", "What did I just tell you my name is?"].map(String::from);
+    let args = [
+        "shem:generate",
+        "--receipt",
+        "/turn.json",
+        "What did I just tell you my name is?",
+    ]
+    .map(String::from);
     containerd_shim_shem::session::exec(&bundle, &args, &mut reply).unwrap();
     let reply = String::from_utf8(reply).unwrap();
     assert!(reply.contains("Joana"), "{reply}");
+    // The turn's receipt is in the container, where `docker cp` finds it: the whole conversation, and the tokens read
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle_dir.join("rootfs/turn.json")).unwrap())
+            .unwrap();
+    assert_eq!(receipt["format"], "shem.receipt/v1");
+    assert_eq!(
+        receipt["messages"].as_array().unwrap().len(),
+        4,
+        "{receipt}"
+    );
+    assert!(!receipt["context"].as_array().unwrap().is_empty());
+    assert!(reply.contains("wrote a receipt"), "{reply}");
 
     // docker commit's pause: the session, conversation and all, into /.shem
     containerd_shim_shem::session::save(&bundle).unwrap();

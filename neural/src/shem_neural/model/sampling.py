@@ -39,7 +39,11 @@ class Sampler:
     top_p: float = 1.0
     top_k: int = 0
     seed: int | None = None
+    #: Draws to skip, for a reply that comes after others of the same conversation, whose draws came first
+    after: int = 0
     generator: torch.Generator = field(init=False, repr=False, compare=False)
+    #: Draws made, which a later reply of the conversation is `after`
+    draws: int = field(init=False, default=0, repr=False, compare=False)
 
     def __post_init__(self):
         if self.temperature < 0:
@@ -51,6 +55,9 @@ class Sampler:
         if self.seed is None:
             self.seed = secrets.randbits(62)
         self.generator = torch.Generator(device="cpu").manual_seed(self.seed)
+        for _ in range(self.after):
+            torch.rand((), generator=self.generator, dtype=torch.float64)
+        self.draws = self.after
 
     @property
     def greedy(self) -> bool:
@@ -73,6 +80,7 @@ class Sampler:
         total = probabilities.sum()
         edges = probabilities.cumsum(-1)
         u = float(torch.rand((), generator=self.generator, dtype=torch.float64)) * float(total)
+        self.draws += 1
         at = min(int((edges <= u).sum()), probabilities.numel() - 1)
         low = float(edges[at - 1]) if at else 0.0
         high = float(edges[at])

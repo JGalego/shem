@@ -288,11 +288,10 @@ def test_the_model_server_takes_no_session_paths_from_a_container(tmp_path):
         ["--warm", str(tmp_path / "w")],
         [f"--warm={tmp_path / 'w'}"],
         ["--session", str(tmp_path)],
-        ["--receipt", str(tmp_path / "w")],
         ["--replay", str(tmp_path / "w")],
         ["--image", "/etc/passwd"],
     ):
-        with pytest.raises(ValueError, match="--warm, --session, --receipt, --replay or --image"):
+        with pytest.raises(ValueError, match="--warm, --session, --replay or --image"):
             models.generate({"model": str(TINY), "argv": [*argv, "--system", "x", "hi"]}, lambda _: None)
     assert not (tmp_path / "w").exists()
     assert not models.loaded

@@ -17,6 +17,7 @@ import itertools
 import json
 import os
 import socketserver
+import stat
 import struct
 import sys
 import threading
@@ -203,8 +204,9 @@ class Models:
         args = generate.resolve(generate.options(request.get("argv", []), model=request["model"]))
         # This server may be root, and a container's command line is the
         # image's: it names no host paths to write or read sessions or receipts at
-        if args.warm or args.session or args.receipt or args.replay or args.image:
-            raise ValueError("a container's command line cannot give --warm, --session, --receipt, --replay or --image")
+        # (A receipt is written inside the container, beneath its root: see `write_receipt`)
+        if args.warm or args.session or args.replay or args.image:
+            raise ValueError("a container's command line cannot give --warm, --session, --replay or --image")
         if request.get("session"):
             args.session = Path(request["session"])
         user = request.get("session_id") or f"run-{uuid.uuid4()}"
@@ -218,11 +220,16 @@ class Models:
                 return self._serve(request, model, tokenizer, args, write)
             session = generate.start(model, tokenizer, args, err=_Stream(write), vcpu_socket=self.socket)
             prompt = " ".join(args.prompt) or request.get("stdin", "")
+            if args.receipt:
+                check_receipt(session, args.receipt, bool(prompt))
             with _all_cores():
                 if session is not None and prompt:
+                    after = begin_receipt(session, args.receipt)
                     generate.converse(
                         session, tokenizer, prompt, args.max_tokens, _Stream(write), _Stream(write), args.stop
                     )
+                    if args.receipt:
+                        write_receipt(session, args, args.max_tokens, args.stop, after, _Stream(write))
             if session is not None and request.get("session_id"):
                 self.sessions[request["session_id"]] = Live(tokenizer, args, session)
                 kept = True
@@ -256,8 +263,17 @@ class Models:
             return
         max_tokens = args.max_tokens if "--max-tokens" in request.get("argv", []) else live.args.max_tokens
         stops = args.stop or live.args.stop
+        if args.warm or args.session or args.replay or args.image:
+            raise ValueError("a container's command line cannot give --warm, --session, --replay or --image")
         with live.lock, _all_cores():
+            if args.receipt:
+                check_receipt(live.session, args.receipt, True)
+            after = begin_receipt(live.session, args.receipt)
             generate.converse(live.session, live.tokenizer, text, max_tokens, _Stream(write), _Stream(write), stops)
+            if args.receipt:
+                # The container's own options say who made the receipt, and the turn's may add to them
+                args.root, args.subject = live.args.root, [*live.args.subject, *args.subject]
+                write_receipt(live.session, args, max_tokens, stops, after, _Stream(write))
 
     def save(self, request: dict) -> bytes:
         """A live session's files, as `docker commit` freezes them into the
@@ -283,6 +299,84 @@ class Models:
             return self.sessions[request["session_id"]]
         except KeyError:
             raise ValueError(f"no live session {request.get('session_id')!r}: is the container running?") from None
+
+
+def check_receipt(session, path: str | Path, prompted: bool) -> None:
+    """Refuse, before a reply is made, a receipt that could not be written."""
+    if not prompted:
+        raise ValueError("--receipt is a reply's: give a prompt")
+    if session is not None and session.runner is not None:
+        raise ValueError("a receipt is for a run without tools: they are what `shem replay` reads again")
+    beneath(path)
+
+
+def begin_receipt(session, path: str | None) -> int:
+    """Have `session` keep the choices of its next reply, if a receipt of it is
+    wanted at `path`, and return how many draws it has made, which a replay
+    skips: a conversation's replies are drawn from one generator."""
+    if not path:
+        return 0
+    session.choices = []
+    sampler = session.sampler
+    return sampler.draws if sampler is not None and not sampler.greedy else 0
+
+
+def beneath(path: str | Path) -> list[str]:
+    """The names in a path inside a container: no `..`, and a file's name last."""
+    names = [name for name in str(path).split("/") if name not in ("", ".")]
+    if not names or ".." in names:
+        raise ValueError(f"--receipt {path} must name a file inside the container, with no ..")
+    return names
+
+
+def write_receipt(session, args, max_tokens: int, stops: list[str], after: int, err) -> None:
+    """Write the receipt of the reply `session` just made to `args.receipt`, a
+    path in the container whose root is `args.root`: the whole conversation the
+    model was given, and the tokens it had read when it replied (a session
+    reads a conversation a turn at a time), for `shem replay` to read again."""
+    from .model import receipt
+
+    messages, text = session.messages[:-1], session.messages[-1]["content"]
+    subjects = dict(subject.split("=", 1) for subject in args.subject)
+    request = {"max_tokens": max_tokens, "stop": list(stops)}
+    written = receipt.record_messages(session, messages, text, request, subjects, session.tokens[: session.prompted])
+    if after and "sampling" in written:
+        written["sampling"]["after"] = after
+    write_beneath(Path(args.root), args.receipt, receipt.dumps(written).encode())
+    err.write(f"shem: wrote a receipt of {receipt.summary(written)}, to {args.receipt} in the container\n")
+
+
+def write_beneath(root: Path, path: str | Path, data: bytes) -> None:
+    """Write `data` to the file at `path` inside the container whose root is
+    `root`, creating the directories it is in. The server may be root, and
+    the container's files are the image's: each name is opened without
+    following a link, from the directory before it, so that none the image
+    put there leads the write out of the root."""
+    names = beneath(path)
+    directory = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for name in names[:-1]:
+            try:
+                inner = os.open(name, directory, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(name, 0o755, dir_fd=fd)
+                inner = os.open(name, directory, dir_fd=fd)
+            os.close(fd)
+            fd = inner
+        # Not blocking on a pipe the image left there, and then only a plain file
+        out = os.open(
+            names[-1], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o644, dir_fd=fd
+        )
+        with os.fdopen(out, "wb") as file:
+            if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                raise ValueError(f"--receipt {path} is not a plain file")
+            file.truncate(0)
+            file.write(data)
+    except OSError as error:
+        raise ValueError(f"--receipt {path}: {error.strerror}") from None
+    finally:
+        os.close(fd)
 
 
 class Live:
