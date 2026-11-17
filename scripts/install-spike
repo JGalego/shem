@@ -11,10 +11,11 @@ PREFIX=${PREFIX:-/usr/local}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cd "$work"
-git init -q spike
+git clone -q https://github.com/riscv-software-src/riscv-isa-sim spike
 cd spike
-git fetch -q --depth 1 https://github.com/riscv-software-src/riscv-isa-sim "$COMMIT"
-git checkout -q FETCH_HEAD
+git checkout -q "$COMMIT"
+# Spike's softfloat is a submodule
+git submodule update -q --init --depth 1
 mkdir build
 cd build
 ../configure --prefix="$PREFIX" > /dev/null
