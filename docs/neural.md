@@ -87,7 +87,7 @@ The **dense** executor defines the network. The **fused** executor computes the 
 | Byte to bits, 5-bit index | One-hot times a table | Index into the table |
 | Division | 32 unrolled layers | Integer division, with RISC-V's rules for zero |
 
-Both skip multiplication and division when no guest needs them. Tests compare unit results, edge cases and whole programs.
+Both skip multiplication, division and the shifter, and the fused one the memory read and write, when no guest in the batch needs them: an ALU loop's instruction costs about two thirds of what it did. What would cut it further is not done: several instructions per forward pass, narrower types for bits, and the server's vCPUs on a GPU (only [the harness](#on-gpus) runs there). Tests compare unit results, edge cases and whole programs.
 
 For GPUs, **static** mode runs every unit and uses **flat** memory: one byte array per guest, with disabled writes sent to a scratch byte. This removes data-dependent control flow for compilation and CUDA graphs ([On GPUs](#on-gpus)).
 

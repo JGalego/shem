@@ -31,6 +31,7 @@ ECALL, EBREAK, ILLEGAL, FETCH_FAULT, MEMORY_FAULT = range(5)
 
 _MUL = [isa.RESULTS.index(r) for r in ("mul", "mulh", "mulhsu", "mulhu")]
 _DIV = [isa.RESULTS.index(r) for r in ("div", "divu", "rem", "remu")]
+_SHIFT = [isa.RESULTS.index(r) for r in ("sll", "srl", "sra")]
 
 
 def clamp01(x: torch.Tensor) -> torch.Tensor:
@@ -174,6 +175,7 @@ class NeuralCpu:
         """The bits of x mod 2**32, for integers -2**34 < x < 2**34."""
         return self.decompose(x + 2.0**34, 35)[..., :32]
 
+    @torch.no_grad()
     def step(self, s: State, active: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Execute one instruction for every guest, updating `s` in place.
         Returns the exits, a (B, 5) one-hot or zero row in the order of the
@@ -214,7 +216,12 @@ class NeuralCpu:
         and_bits = a_bits * o_bits
         or_bits = a_bits + o_bits - and_bits
         xor_bits = or_bits - and_bits
-        sll, srl, sra = self.shift(a_bits, o_bits, a)
+        # Like multiply and divide, the shifter runs only when some guest routes its result
+        route = is_ @ w["result_route"]
+        if self.static or route[:, _SHIFT].any():
+            sll, srl, sra = self.shift(a_bits, o_bits, a)
+        else:
+            sll = srl = sra = torch.zeros_like(a)
         signed_a = a - TWO32 * a_bits[:, 31]
         signed_o = o - TWO32 * o_bits[:, 31]
         lt = clamp01(signed_o - signed_a)
@@ -224,7 +231,6 @@ class NeuralCpu:
         # Multiply and divide are deep, so they run only when some guest needs
         # them. Otherwise their results would be routed nowhere, so skipping
         # them changes nothing.
-        route = is_ @ w["result_route"]
         zero = torch.zeros_like(pc)
         mul = mulh = mulhsu = mulhu = div = divu = rem = remu = zero
         if self.static or route[:, _MUL].any():
@@ -239,7 +245,11 @@ class NeuralCpu:
         size = load_size + store_size
         offset = self.relative(addr, s.base)
         memory_fault = clamp01(size) * clamp01(offset + size - mem_size)
-        loaded = s.mem.read(offset, 4)
+        # Only an instruction that loads or stores touches memory: the rest need no read
+        if self.static or (size > 0).any():
+            loaded = s.mem.read(offset, 4)
+        else:
+            loaded = torch.zeros(batch, 4, dtype=DTYPE, device=self.device)
         sign_byte = self.byte_bits(loaded[:, 0])[:, 7]
         sign_half = self.byte_bits(loaded[:, 1])[:, 7]
         lbu = loaded[:, 0]
@@ -290,9 +300,10 @@ class NeuralCpu:
         else:
             writes = route.sum(-1) * (1 - rd[:, 0]) * commit
             s.regs = s.regs + writes[:, None, None] * rd[:, :, None] * (rd_bits[:, None, :] - s.regs)
-        store_bytes = b_bits.reshape(batch, 4, 8) @ self.powers[:8]
-        gates = commit[:, None] * clamp01(store_size[:, None] - torch.arange(4, device=self.device))
-        s.mem.write(offset, store_bytes, gates)
+        if self.static or (store_size > 0).any():
+            store_bytes = b_bits.reshape(batch, 4, 8) @ self.powers[:8]
+            gates = commit[:, None] * clamp01(store_size[:, None] - torch.arange(4, device=self.device))
+            s.mem.write(offset, store_bytes, gates)
         keep = (1 - commit)[:, None]
         s.pc = commit * self.value(next_bits) + (1 - commit) * pc
         s.pc_low = (1 - keep) * next_bits[:, :2] + keep * s.pc_low
