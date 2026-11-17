@@ -10,6 +10,8 @@ shem run ghcr.io/your-user/qwen3:0.6b "Olá"    # elsewhere: pulled on first use
 ```
 
 
+`shem run -i qwen3` has a conversation instead: each line you type is a turn of one session, which remembers them, until `/exit` or end of input (`/clear` starts over). With a prompt, it starts there; piped input works too, a turn to a line, and a driver started with no prompt on a terminal does the same.
+
 Model imports and execution need [uv](https://docs.astral.sh/uv/); registry transfers need [ORAS](https://oras.land) and a registry login. For `docker build`, use shem's [BuildKit frontend](shemfile.md#with-docker-build), as in the [Qwen3 Dockerfile](../examples/qwen3/Dockerfile).
 
 ## Shemfile
@@ -47,6 +49,7 @@ A `shem:` entrypoint selects a host-side driver, not a guest executable.
 | `--system-file PATH` | Append a file from the image to the system prompt |
 | `--stop TEXT` | End the reply at this text; useful for [base models](../examples/mamba/Shemfile) |
 | `--tools DIR` | Offer programs in this directory as [tools](#compiled-layers-and-tools) |
+| `--chat` | Read turns, a line each, as `shem run -i` does |
 | `--keep` | Keep a [Docker session](#sessions-under-docker) open after replying |
 | `--serve [HOST:]PORT` | [Serve OpenAI's chat completions API](#serving-openais-api) instead of replying once |
 

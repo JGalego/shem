@@ -150,6 +150,11 @@ struct RunArgs {
     /// chose, for `shem replay` to check
     #[arg(long, value_name = "FILE")]
     receipt: Option<PathBuf>,
+    /// For a model image, have a conversation: each line of input is a turn,
+    /// until its end or `/exit`, after the prompt if there is one, and the
+    /// image's own CMD does not count as one
+    #[arg(short, long)]
+    interactive: bool,
     /// An image (name[:tag] in the store, or an OCI layout directory), or an executable
     target: String,
     /// Arguments: for an image they replace its CMD
@@ -481,7 +486,19 @@ fn launch<V: Vcpu + Clone>(
                 None => Receipt::None,
             };
             let state = args.state.as_deref().map(|state| (state, None));
-            return run_model(&args.target, &image, state, &args.args, receipt);
+            return run_model(
+                &args.target,
+                &image,
+                state,
+                &args.args,
+                receipt,
+                args.interactive,
+            );
+        }
+        if args.interactive {
+            bail!(
+                "-i is for model images, which it has a conversation with: a program has its own stdin"
+            );
         }
         if args.receipt.is_some() {
             bail!("--receipt is for model images: it records what a model was asked and replied");
@@ -675,15 +692,20 @@ fn run_model(
     state: Option<(&str, Option<&str>)>,
     args: &[String],
     receipt: Receipt,
+    interactive: bool,
 ) -> anyhow::Result<u8> {
     let digest = Image::layout_digest(&image_dir(target)?)?;
     let root = Store::open()?.rootfs(image, &digest)?;
-    let input = if args.is_empty() {
+    // A conversation starts from the prompt given, not from the image's default
+    let input = if args.is_empty() && !interactive {
         &image.config.cmd
     } else {
         args
     };
     let mut options: Vec<std::ffi::OsString> = Vec::new();
+    if interactive {
+        options.push("--chat".into());
+    }
     match receipt {
         Receipt::None => {}
         Receipt::Write(path) => {
@@ -760,7 +782,14 @@ fn replay(args: ReplayArgs) -> anyhow::Result<u8> {
         None if args.state.is_some() => bail!("the receipt's run continued no session"),
         None => None,
     };
-    run_model(target, &image, state, &[], Receipt::Replay(&args.receipt))
+    run_model(
+        target,
+        &image,
+        state,
+        &[],
+        Receipt::Replay(&args.receipt),
+        false,
+    )
 }
 
 /// A console on this process's stdin and stdout.

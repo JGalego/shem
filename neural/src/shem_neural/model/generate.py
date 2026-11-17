@@ -343,6 +343,11 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
         metavar="KEY=VALUE",
         help="with --receipt, what the run was of, such as image=NAME@DIGEST; may be given again",
     )
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="a conversation: each line of input is a turn, till its end; also what no prompt on a terminal means",
+    )
     parser.add_argument("--keep", action="store_true", help="in a container, keep the session open for docker exec")
     parser.add_argument("--device", default="auto", help="cpu, cuda, or auto: a GPU if there is one")
     parser.add_argument(
@@ -464,6 +469,50 @@ def run(
     return 0
 
 
+def chat(
+    session: Session,
+    tokenizer: Tokenizer,
+    args: argparse.Namespace,
+    prompt: str = "",
+    lines=None,
+    out=sys.stdout,
+    err=sys.stderr,
+    restart=None,
+) -> int:
+    """A conversation: `prompt` first, if there is one, then a turn for each
+    line of `lines` (stdin), until it ends or `/exit`. On a terminal, a `> `
+    asks for each, with the line editing and history `input` gives. `/clear`
+    starts the conversation over, with a session `restart` makes."""
+    terminal = lines is None and sys.stdin.isatty()
+    lines = lines if lines is not None else sys.stdin
+    if terminal:
+        try:
+            import readline  # noqa: F401  (input uses it for line editing and history)
+        except ImportError:
+            pass
+        print("shem: a conversation; /clear starts over, /exit or Ctrl-D ends it", file=err)
+    text = prompt
+    while True:
+        if not text:
+            try:
+                line = input("> ") if terminal else lines.readline()
+            except EOFError:
+                break
+            if not line:
+                break
+            text = line.strip()
+            if text in ("/exit", "/quit"):
+                break
+            if text == "/clear" and restart is not None:
+                session, text = restart(), ""
+                continue
+            if not text:
+                continue
+        converse(session, tokenizer, text, args.max_tokens, out, err, args.stop)
+        text = ""
+    return 0
+
+
 def main() -> None:
     args = resolve(options(sys.argv[1:]))
     model = Model(args.model, dtype=dtype(args.dtype), device=args.device)
@@ -475,6 +524,18 @@ def main() -> None:
         serve_forever(model, tokenizer, args, primed)
         return
     try:
+        talking = args.chat or not (args.prompt or args.warm or args.replay or args.receipt) and sys.stdin.isatty()
+        if talking:
+            if args.receipt or args.replay or args.warm:
+                raise ValueError("--chat is a conversation: --receipt, --replay and --warm are for one prompt")
+            session = start(model, tokenizer, args)
+            try:
+                sys.exit(
+                    chat(session, tokenizer, args, " ".join(args.prompt), restart=lambda: start(model, tokenizer, args))
+                )
+            except KeyboardInterrupt:
+                print(file=sys.stderr)
+                sys.exit(130)
         if args.replay:
             prompt = receipt.load(args.replay)["prompt"]
         else:
