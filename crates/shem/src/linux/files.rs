@@ -1102,13 +1102,25 @@ impl Process {
             }
         } else {
             let resolved = self.resolve_at(vcpu, dirfd, path, false)?;
-            if !std::fs::symlink_metadata(&resolved.host)?.is_symlink() {
-                return Err(Errno::EINVAL);
+            match self
+                .root()
+                .and_then(|root| root.readlink_beneath(&resolved.guest))
+            {
+                Some(Ok(target)) => target,
+                Some(Err(err)) if err.raw_os_error() == Some(libc::EINVAL) => {
+                    return Err(Errno::EINVAL);
+                }
+                Some(Err(err)) => return Err(err.into()),
+                None => {
+                    if !std::fs::symlink_metadata(&resolved.host)?.is_symlink() {
+                        return Err(Errno::EINVAL);
+                    }
+                    std::fs::read_link(&resolved.host)?
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec()
+                }
             }
-            std::fs::read_link(&resolved.host)?
-                .as_os_str()
-                .as_bytes()
-                .to_vec()
         };
         let n = target.len().min(size as usize);
         vcpu.write_mem(buf, &target[..n])?;
@@ -1292,7 +1304,15 @@ impl Process {
             }
         } else {
             let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-            self.resolve_at(vcpu, dirfd, path, follow)?.host
+            let resolved = self.resolve_at(vcpu, dirfd, path, follow)?;
+            if let Some(root) = self.root()
+                && let Some(done) =
+                    root.set_times_beneath(&resolved.guest, &timespecs(stamps[0], stamps[1]))
+            {
+                done?;
+                return Ok(0);
+            }
+            resolved.host
         };
         set_times(&host, stamps[0], stamps[1])?;
         Ok(0)
@@ -1551,13 +1571,27 @@ fn list_dir(root: Option<&RootFs>, resolved: Resolved) -> Result<Dir, Errno> {
         },
     ];
     let mut listed = Vec::new();
-    for entry in std::fs::read_dir(&resolved.host)? {
-        let entry = entry?;
-        listed.push(Dirent {
-            ino: guest_ino(root, meta.dev(), entry.ino()),
-            kind: dirent_type(entry.file_type()?),
-            name: entry.file_name().as_bytes().to_vec(),
-        });
+    #[cfg(target_os = "linux")]
+    let beneath = root.and_then(|root| root.list_beneath(&resolved.guest));
+    #[cfg(not(target_os = "linux"))]
+    let beneath: Option<std::io::Result<super::rootfs::Listing>> = None;
+    if let Some(names) = beneath {
+        for (name, entry_ino, kind) in names? {
+            listed.push(Dirent {
+                ino: guest_ino(root, meta.dev(), entry_ino),
+                kind: dirent_type(kind),
+                name,
+            });
+        }
+    } else {
+        for entry in std::fs::read_dir(&resolved.host)? {
+            let entry = entry?;
+            listed.push(Dirent {
+                ino: guest_ino(root, meta.dev(), entry.ino()),
+                kind: dirent_type(entry.file_type()?),
+                name: entry.file_name().as_bytes().to_vec(),
+            });
+        }
     }
     // /proc is always there, whether or not the rootfs has a directory for it
     if resolved.guest == b"/" && !listed.iter().any(|entry| entry.name == b"proc") {
@@ -1598,7 +1632,19 @@ fn dirent_type(kind: std::fs::FileType) -> u8 {
     }
 }
 
+#[allow(clippy::unnecessary_cast)] // the platform's field types differ
 fn stat_host(root: Option<&RootFs>, resolved: &Resolved, follow: bool) -> Result<Stat, Errno> {
+    // The resolver has followed any link there is to follow, so what is left
+    // is read as itself, through its parent opened beneath the root
+    if let Some(root) = root
+        && let Some(stat) = root.stat_beneath(&resolved.guest)
+    {
+        let stat = stat?;
+        return Ok(Stat::from_stat(
+            &stat,
+            root.inode(stat.st_dev as u64, stat.st_ino as u64),
+        ));
+    }
     let meta = if follow {
         std::fs::metadata(&resolved.host)?
     } else {
@@ -1625,13 +1671,9 @@ fn stamp(path: &std::path::Path, access: Option<u64>, modify: Option<u64>) {
     let _ = set_times(path, access, modify);
 }
 
-/// Set the times of the file at the host `path`, or of the symlink there,
-/// which is not followed.
-fn set_times(
-    path: &std::path::Path,
-    access: Option<u64>,
-    modify: Option<u64>,
-) -> Result<(), Errno> {
+/// An access and a modification time, in virtual nanoseconds, as `utimensat`
+/// takes them: `None` leaves the time as it is.
+fn timespecs(access: Option<u64>, modify: Option<u64>) -> [libc::timespec; 2] {
     let timespec = |ns: Option<u64>| match ns {
         Some(ns) => libc::timespec {
             tv_sec: (ns / NS_PER_SEC) as libc::time_t,
@@ -1642,8 +1684,18 @@ fn set_times(
             tv_nsec: libc::UTIME_OMIT,
         },
     };
+    [timespec(access), timespec(modify)]
+}
+
+/// Set the times of the file at the host `path`, or of the symlink there,
+/// which is not followed.
+fn set_times(
+    path: &std::path::Path,
+    access: Option<u64>,
+    modify: Option<u64>,
+) -> Result<(), Errno> {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
-    let times = [timespec(access), timespec(modify)];
+    let times = timespecs(access, modify);
     // SAFETY: a NUL-terminated path and two timespecs, as utimensat expects.
     let status = unsafe {
         libc::utimensat(

@@ -8,11 +8,15 @@
 //! symlinks are expanded here rather than by the host, so `..` is applied to
 //! real directories, as Linux does.
 //!
-//! Known gap: resolving a path and then opening it are separate host calls. A
-//! concurrent writer to the host directory could swap a checked component for a
-//! symlink in between. A single guest cannot do this, because the host services
-//! its system calls one at a time. On Linux, `openat2` with `RESOLVE_IN_ROOT`
-//! would close the gap.
+//! Resolving a path and then acting on it are separate host calls, so a
+//! concurrent writer to the host directory could swap a checked component for
+//! a symlink in between. A single guest cannot do this, because the host
+//! services its system calls one at a time. On Linux the acting calls close
+//! the gap: opens, stats, link reads, time changes, listings and the changes
+//! to a directory (`mkdir`, `unlink`, `symlink`, `rename`) go through
+//! `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, which fails
+//! rather than follow a link. Elsewhere, and before Linux 5.6, they act on
+//! the host path as checked.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -27,6 +31,9 @@ use super::abi::Errno;
 const MAX_SYMLINKS: usize = 40;
 pub const PATH_MAX: usize = 4096;
 const NAME_MAX: usize = 255;
+
+/// The names in a directory, each with its host inode and file type.
+pub type Listing = Vec<(Vec<u8>, u64, std::fs::FileType)>;
 
 pub struct RootFs {
     root: PathBuf,
@@ -241,6 +248,100 @@ impl RootFs {
             Err(err) => return Some(Err(err)),
         };
         Some(change(dir.as_raw_fd(), &name))
+    }
+
+    /// The metadata of the canonical guest path `guest`, itself and not what a
+    /// link there leads to, read through its parent opened beneath the root.
+    /// None as `at_parent` is.
+    pub fn stat_beneath(&self, guest: &[u8]) -> Option<std::io::Result<libc::stat>> {
+        self.at_parent(guest, |dir, name| {
+            // SAFETY: a zeroed stat that fstatat fills in, and a NUL-terminated name
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let status =
+                unsafe { libc::fstatat(dir, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) };
+            if status == 0 {
+                Ok(stat)
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        })
+    }
+
+    /// Where the symlink at the canonical guest path `guest` points, read
+    /// through its parent opened beneath the root. None as `at_parent` is.
+    pub fn readlink_beneath(&self, guest: &[u8]) -> Option<std::io::Result<Vec<u8>>> {
+        self.at_parent(guest, |dir, name| {
+            let mut buf = vec![0u8; PATH_MAX];
+            // SAFETY: a buffer of the length given, and a NUL-terminated name
+            let n =
+                unsafe { libc::readlinkat(dir, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            buf.truncate(n as usize);
+            Ok(buf)
+        })
+    }
+
+    /// Set the times of the canonical guest path `guest` (a link's own, not
+    /// what it leads to) through its parent opened beneath the root. None as
+    /// `at_parent` is.
+    pub fn set_times_beneath(
+        &self,
+        guest: &[u8],
+        times: &[libc::timespec; 2],
+    ) -> Option<std::io::Result<()>> {
+        self.at_parent(guest, |dir, name| {
+            // SAFETY: a NUL-terminated name and two timespecs, as utimensat expects
+            let status = unsafe {
+                libc::utimensat(
+                    dir,
+                    name.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        })
+    }
+
+    /// The names in the directory at the canonical guest path `guest`, read
+    /// from the directory opened beneath the root, with each one's inode and
+    /// file type. None where `open_beneath` is, or the host has no way to
+    /// list a descriptor.
+    #[cfg(target_os = "linux")]
+    pub fn list_beneath(&self, guest: &[u8]) -> Option<std::io::Result<Listing>> {
+        use std::os::fd::AsRawFd;
+        let dir = match self.open_beneath(guest, libc::O_RDONLY | libc::O_DIRECTORY, 0)? {
+            Ok(dir) => dir,
+            Err(err) => return Some(Err(err)),
+        };
+        let through = format!("/proc/self/fd/{}", dir.as_raw_fd());
+        let entries = match std::fs::read_dir(&through) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => return None,
+            Err(err) => return Some(Err(err)),
+        };
+        let mut listed = Vec::new();
+        for entry in entries {
+            let result = entry.and_then(|entry| {
+                use std::os::unix::fs::DirEntryExt;
+                Ok((
+                    entry.file_name().as_bytes().to_vec(),
+                    entry.ino(),
+                    entry.file_type()?,
+                ))
+            });
+            match result {
+                Ok(item) => listed.push(item),
+                Err(err) => return Some(Err(err)),
+            }
+        }
+        Some(Ok(listed))
     }
 
     fn host_path(&self, components: &[Vec<u8>]) -> PathBuf {

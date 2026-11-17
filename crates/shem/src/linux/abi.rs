@@ -329,6 +329,26 @@ impl Stat {
         }
     }
 
+    /// As `from_metadata`, from what `fstatat` filled in. The casts are the
+    /// platform's field types, which differ.
+    #[allow(clippy::unnecessary_cast)]
+    pub fn from_stat(st: &libc::stat, ino: u64) -> Self {
+        let size = st.st_size as u64;
+        Self {
+            mode: st.st_mode as u32,
+            nlink: st.st_nlink as u32,
+            ino,
+            size,
+            blocks: size.div_ceil(4096) * 8,
+            blksize: 4096,
+            atime: (st.st_atime as i64, st.st_atime_nsec as u32),
+            mtime: (st.st_mtime as i64, st.st_mtime_nsec as u32),
+            ctime: (st.st_mtime as i64, st.st_mtime_nsec as u32),
+            dev: GUEST_DEV,
+            rdev: st.st_rdev as u64,
+        }
+    }
+
     /// A device file such as /dev/null, with its major and minor numbers.
     pub fn device(major: u32, minor: u32) -> Self {
         let (major, minor) = (major as u64, minor as u64);

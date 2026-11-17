@@ -218,4 +218,71 @@ mod beneath {
         });
         assert!(ok.unwrap().is_ok() && root.host.join("bin/new").is_dir());
     }
+
+    #[test]
+    fn stat_readlink_times_and_listings_stay_beneath_the_root() {
+        let root = root();
+        fs::create_dir(root.host.join("data")).unwrap();
+        fs::write(root.host.join("data/note"), "inside").unwrap();
+        symlink("note", root.host.join("data/link")).unwrap();
+        let Some(stat) = root.fs.stat_beneath(b"/data/note") else {
+            return; // a kernel before openat2
+        };
+        assert_eq!(stat.unwrap().st_size, 6);
+        // A link is itself, not its target
+        let link = root.fs.stat_beneath(b"/data/link").unwrap().unwrap();
+        assert_eq!(link.st_mode & 0o170000, 0o120000);
+        assert_eq!(
+            root.fs.readlink_beneath(b"/data/link").unwrap().unwrap(),
+            b"note"
+        );
+        let now = [libc::timespec {
+            tv_sec: 1_000_000,
+            tv_nsec: 0,
+        }; 2];
+        root.fs
+            .set_times_beneath(b"/data/note", &now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            root.fs
+                .stat_beneath(b"/data/note")
+                .unwrap()
+                .unwrap()
+                .st_mtime,
+            1_000_000
+        );
+        let mut names: Vec<_> = root
+            .fs
+            .list_beneath(b"/data")
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|(name, _, _)| String::from_utf8(name).unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["link", "note"]);
+
+        // A directory swapped for a link to somewhere else is refused by all four
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("note"), "the host's").unwrap();
+        fs::rename(root.host.join("data"), root.host.join("data.old")).unwrap();
+        symlink(outside.path(), root.host.join("data")).unwrap();
+        assert!(root.fs.stat_beneath(b"/data/note").unwrap().is_err());
+        assert!(root.fs.readlink_beneath(b"/data/link").unwrap().is_err());
+        assert!(
+            root.fs
+                .set_times_beneath(b"/data/note", &now)
+                .unwrap()
+                .is_err()
+        );
+        assert!(root.fs.list_beneath(b"/data").unwrap().is_err());
+        assert_ne!(
+            fs::metadata(outside.path().join("note"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000)
+        );
+    }
 }
