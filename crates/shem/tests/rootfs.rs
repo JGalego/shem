@@ -196,7 +196,7 @@ mod beneath {
         let guest = std::str::from_utf8(&resolved.guest).unwrap();
         let made = root.fs.at_parent(guest.as_bytes(), |dir, name| {
             // SAFETY: the descriptor is open and the name a C string, for the call
-            match unsafe { libc::mkdirat(dir, name.as_ptr(), 0o755) } {
+            match unsafe { libc::mkdirat(dir, name.as_ptr(), 0o755 as libc::mode_t) } {
                 0 => Ok(()),
                 _ => Err(std::io::Error::last_os_error()),
             }
@@ -211,7 +211,7 @@ mod beneath {
         assert!(!outside.path().join("kept").is_dir() && outside.path().join("kept").is_file());
         // A parent that is a plain directory works as before
         let ok = root.fs.at_parent(b"/bin/new", |dir, name| {
-            match unsafe { libc::mkdirat(dir, name.as_ptr(), 0o755) } {
+            match unsafe { libc::mkdirat(dir, name.as_ptr(), 0o755 as libc::mode_t) } {
                 0 => Ok(()),
                 _ => Err(std::io::Error::last_os_error()),
             }

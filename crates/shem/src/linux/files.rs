@@ -990,7 +990,7 @@ impl Process {
         let beneath = self.root.as_deref().and_then(|root| {
             root.at_parent(&resolved.guest, |dir, name| {
                 // SAFETY: `dir` is open and `name` is a C string, for the call
-                match unsafe { libc::mkdirat(dir, name.as_ptr(), mode) } {
+                match unsafe { libc::mkdirat(dir, name.as_ptr(), mode as libc::mode_t) } {
                     0 => Ok(()),
                     _ => Err(std::io::Error::last_os_error()),
                 }

@@ -1260,3 +1260,19 @@ fn socket_options_are_accepted_and_report_what_a_stream_socket_is() {
     assert_eq!(word(&g.get(value, 4), 0), SOCK_STREAM, "SO_TYPE");
     assert_eq!(g.call(GETSOCKOPT, &[99, 1, 3, value, len]), EBADF);
 }
+
+#[test]
+fn making_the_root_or_what_exists_says_it_exists_and_directories_nest() {
+    // `mkdir -p` walks from /, and takes this as the answer that goes on
+    let mut g = Guest::new();
+    let root = g.cstr("/");
+    assert_eq!(g.call(MKDIRAT, &[AT_FDCWD, root, 0o755]), EEXIST);
+    let tmp = g.cstr("/tmp");
+    assert_eq!(g.call(MKDIRAT, &[AT_FDCWD, tmp, 0o755]), 0);
+    assert_eq!(g.call(MKDIRAT, &[AT_FDCWD, tmp, 0o755]), EEXIST);
+    let nested = g.cstr("/tmp/a");
+    assert_eq!(g.call(MKDIRAT, &[AT_FDCWD, nested, 0o755]), 0);
+    assert!(g.host("tmp/a").is_dir());
+    let missing = g.cstr("/nowhere/a");
+    assert_eq!(g.call(MKDIRAT, &[AT_FDCWD, missing, 0o755]), ENOENT);
+}

@@ -228,6 +228,9 @@ impl RootFs {
         use std::os::fd::AsRawFd;
         let cut = guest.iter().rposition(|&b| b == b'/')?;
         let (parent, name) = (&guest[..cut.max(1)], &guest[cut + 1..]);
+        if name.is_empty() {
+            return None; // the root itself, which has no parent here: by path, as it was
+        }
         let name = std::ffi::CString::new(name).ok()?;
         let dir = match self.open_beneath(
             parent,
