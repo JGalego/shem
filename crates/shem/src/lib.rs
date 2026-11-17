@@ -5,6 +5,7 @@
 //! and exits to the host for everything else. See `docs/architecture.md`.
 
 pub mod container;
+pub mod daemon;
 pub mod elf;
 pub mod emulate;
 pub mod fdt;

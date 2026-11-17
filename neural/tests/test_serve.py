@@ -407,3 +407,40 @@ def test_requests_past_the_queue_are_told_to_retry(monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_a_model_stays_loaded_while_it_lingers_and_is_evicted_after():
+    from shem_neural.server import Models
+
+    models = Models(device="cpu", linger=60)
+    first = models.get(TINY, "float32", "run-1")[0]
+    models.release("run-1")
+    assert len(models.loaded) == 1, "kept for the next run"
+    assert models.get(TINY, "float32", "run-2")[0] is first, "which finds it loaded"
+    models.release("run-2")
+    key = next(iter(models.idle))
+    assert models.evict(models.idle[key] + 30) == []
+    assert models.evict(models.idle[key] + 61) == [key]
+    assert not models.loaded and not models.idle
+
+
+def test_a_model_in_use_is_not_evicted_however_long_it_lingers():
+    from shem_neural.server import Models
+
+    models = Models(device="cpu", linger=1)
+    models.get(TINY, "float32", "run-1")
+    models.get(TINY, "float32", "run-2")
+    models.release("run-1")
+    assert models.evict(1e9) == [] and len(models.loaded) == 1
+
+
+def test_a_server_that_nothing_uses_exits_and_leaves_no_socket(tmp_path):
+    import time
+
+    from shem_neural.server import serve
+
+    socket_path = tmp_path / "idle.sock"
+    started = time.monotonic()
+    serve(socket_path, keep_warm=0.5, idle_exit=1.0)  # returns when the server exits by itself
+    assert 1.0 <= time.monotonic() - started < 15
+    assert not socket_path.exists()

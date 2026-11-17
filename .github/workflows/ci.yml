@@ -300,6 +300,12 @@ jobs:
           export UV_FIND_LINKS=$PWD/target/dist SHEM_HOME=$PWD/$dir/home
           target/release/shem build -t tiny $dir
           target/release/shem run tiny --max-tokens 4 Hello
+          # The first run started a model server from the wheel, which the second finds, and which a run can do without
+          pgrep -f '[s]hem_neural.server --keep-warm'
+          target/release/shem run tiny --max-tokens 4 Hello
+          pkill -f '[s]hem_neural.server --keep-warm'
+          SHEM_DAEMON=0 target/release/shem run tiny --max-tokens 4 Hello
+          ! pgrep -f '[s]hem_neural.server --keep-warm'
 
   models:
     name: Model images (against transformers)

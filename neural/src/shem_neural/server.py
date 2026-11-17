@@ -11,6 +11,7 @@ with an op byte, responses with a `Status` byte. See `docs/neural.md`.
 """
 
 import argparse
+import contextlib
 import hashlib
 import itertools
 import json
@@ -19,6 +20,7 @@ import socketserver
 import struct
 import sys
 import threading
+import time
 import uuid
 from enum import IntEnum
 from pathlib import Path
@@ -81,8 +83,13 @@ class Models:
     different weights or templates, and a container must get its own. It is
     released when the last container using it closes."""
 
-    def __init__(self, device: str = "auto", socket: Path | None = None):
+    def __init__(self, device: str = "auto", socket: Path | None = None, linger: float = 0.0):
         self.device = device
+        #: Seconds a model stays loaded after its last user is done, so that
+        #: the next run of it does not read its weights again
+        self.linger = linger
+        #: When each model nobody uses was last used, on the monotonic clock
+        self.idle: dict[str, float] = {}
         #: This server's socket, where tools' programs run on its vCPUs
         self.socket = socket
         self.loaded: dict[str, tuple] = {}
@@ -102,6 +109,7 @@ class Models:
 
         key = f"{Path(directory).resolve()}\0{dtype}"
         with self.lock:
+            self.idle.pop(key, None)
             if key not in self.loaded:
                 model = Model(directory, dtype=torch_dtype(dtype), device=self.device)
                 self.loaded[key] = (model, Tokenizer(directory, model.manifest.tokenizer))
@@ -115,7 +123,21 @@ class Models:
                 self.users[key].discard(user)
                 if not self.users[key]:
                     del self.users[key]
-                    self.loaded.pop(key, None)
+                    if self.linger > 0:
+                        self.idle[key] = time.monotonic()
+                    else:
+                        self.loaded.pop(key, None)
+
+    def evict(self, now: float | None = None) -> list[str]:
+        """Unload the models that nobody has used for `linger` seconds, and
+        return their keys."""
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            gone = [key for key, since in self.idle.items() if now - since >= self.linger]
+            for key in gone:
+                del self.idle[key]
+                self.loaded.pop(key, None)
+        return gone
 
     def generate(self, request: dict, write) -> None:
         """Start a session for `request` and reply to its prompt, writing the
@@ -468,17 +490,51 @@ def write_frame(stream, payload: bytes) -> None:
     stream.flush()
 
 
+class Activity:
+    """When a server was last used: how many connections it has open, and
+    since when it has had none."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.open = 0
+        self.since = time.monotonic()
+
+    def __enter__(self):
+        with self.lock:
+            self.open += 1
+
+    def __exit__(self, *_):
+        with self.lock:
+            self.open -= 1
+            self.since = time.monotonic()
+
+    def idle_for(self) -> float:
+        """Seconds with no connection open, or 0 while there is one."""
+        with self.lock:
+            return 0.0 if self.open else time.monotonic() - self.since
+
+
 def make_server(
-    socket_path: Path, dense: bool = False, device: str = "auto", single_thread: bool = True
+    socket_path: Path,
+    dense: bool = False,
+    device: str = "auto",
+    single_thread: bool = True,
+    linger: float = 0.0,
 ) -> tuple[socketserver.BaseServer, Registry]:
-    """A server on `socket_path`, not yet serving, and its registry of vCPUs."""
+    """A server on `socket_path`, not yet serving, and its registry of vCPUs.
+    Models stay loaded `linger` seconds after they were last used."""
     if single_thread:
         torch.set_num_threads(1)  # tiny tensors: threads only add overhead
     registry = Registry(dense)
-    models = Models(device, socket_path)
+    models = Models(device, socket_path, linger)
+    activity = Activity()
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
+            with activity:
+                self.serve()
+
+        def serve(self):
             while (payload := read_frame(self.rfile)) is not None:
                 try:
                     op, request = payload[0], payload[1:]
@@ -513,14 +569,39 @@ def make_server(
     # Only this user, and root (as the containerd shim runs), may connect
     os.chmod(staging, 0o600)
     os.replace(staging, socket_path)
+    server.models, server.activity = models, activity
     return server, registry
 
 
-def serve(socket_path: Path, dense: bool = False, device: str = "auto") -> None:
-    server, _ = make_server(socket_path, dense, device)
+def serve(
+    socket_path: Path, dense: bool = False, device: str = "auto", keep_warm: float = 0.0, idle_exit: float = 0.0
+) -> None:
+    """Serve until interrupted, or, with `idle_exit`, until that many seconds
+    have passed with no connection open: a server started on demand by
+    `shem run`, which would otherwise stay for good."""
+    server, _ = make_server(socket_path, dense, device, linger=keep_warm)
+    stopped = threading.Event()
+
+    def watch() -> None:
+        while not stopped.wait(min(5.0, max(0.5, keep_warm / 4 or 5.0))):
+            if keep_warm:
+                server.models.evict()
+            if idle_exit and server.activity.idle_for() >= idle_exit:
+                server.shutdown()
+                return
+
     with server:
         print(f"shem-neural: serving vCPUs on {socket_path}", file=sys.stderr, flush=True)
-        server.serve_forever()
+        if keep_warm or idle_exit:
+            threading.Thread(target=watch, daemon=True).start()
+        try:
+            server.serve_forever()
+        finally:
+            stopped.set()
+            # Leave no socket behind for a client to find and fail to reach
+            with contextlib.suppress(OSError):
+                if socket_path.is_socket():
+                    socket_path.unlink()
 
 
 def main() -> None:
@@ -533,9 +614,19 @@ def main() -> None:
     )
     parser.add_argument("--dense", action="store_true", help="run the network densely, without fused kernels")
     parser.add_argument("--device", default="auto", help="where models run: cpu, cuda, or auto (a GPU if there is one)")
+    parser.add_argument(
+        "--keep-warm",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="keep a model loaded this long after its last use",
+    )
+    parser.add_argument(
+        "--idle-exit", type=float, default=0.0, metavar="SECONDS", help="exit after this long with no connection open"
+    )
     args = parser.parse_args()
     try:
-        serve(args.socket or default_socket(), args.dense, args.device)
+        serve(args.socket or default_socket(), args.dense, args.device, args.keep_warm, args.idle_exit)
     except KeyboardInterrupt:
         pass
 

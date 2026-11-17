@@ -486,6 +486,8 @@ Receipts come from `shem run` only. Sessions under Docker and the API server wri
 
 ## Running
 
+A plain `shem run` of a model asks your own model server to reply, and starts one if none is running: it keeps the model loaded for 10 minutes after each run, so the second run of a model skips reading its weights (a few seconds for a small model, against one for the first), and exits after 15 minutes with no connection. Its log is `server.log` in shem's home. `SHEM_DAEMON=0` runs the driver in a process of its own instead, as `-i`, `--receipt` and a terminal's prompt always do.
+
 The server defaults to `--device auto`; use `--device cpu` or `--device cuda` to select explicitly:
 
 ```sh

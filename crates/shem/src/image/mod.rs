@@ -791,6 +791,11 @@ impl Store {
         Ok(Self::at(&home))
     }
 
+    /// The directory the store lives in: `SHEM_HOME`, or its default.
+    pub fn home(&self) -> &Path {
+        self.root.parent().unwrap_or(&self.root)
+    }
+
     /// The store in `home`, as `SHEM_HOME` names it.
     pub fn at(home: &Path) -> Self {
         Self {

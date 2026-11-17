@@ -49,7 +49,7 @@ const IMPORTER: &str = "shem_neural.model.importers";
 /// Run a module of the neural package with uv: from its source when there
 /// is one, otherwise the release on PyPI that matches this binary. The
 /// importer gets the `gguf` extra too, which reads GGUF files.
-fn python(module: &str) -> Command {
+pub fn python(module: &str) -> Command {
     let mut command = Command::new("uv");
     command.args(["run", "--quiet"]);
     match neural_project() {
@@ -308,22 +308,28 @@ pub fn is_driver(entrypoint: &[String]) -> bool {
 /// with `args` (the run's arguments, or the image's CMD), continuing the
 /// session in `session`, or else the image's own, if it has one. `host` are
 /// options of the host's, after the image's: a receipt to write or check.
-/// Returns the driver's status.
+/// Returns the driver's status. A plain run is the model server's, which
+/// keeps the model loaded for the next one (see [`crate::daemon`]), with the
+/// server's log at `log`.
 pub fn run_driver(
     entrypoint: &[String],
     host: &[std::ffi::OsString],
     args: &[String],
     root: &Path,
     session: Option<&Path>,
+    log: &Path,
 ) -> anyhow::Result<u8> {
+    let own = root.join(SESSION_DIR);
+    let session = session.or(own.join("session.json").is_file().then_some(own.as_path()));
+    if let Some(status) = crate::daemon::run(entrypoint, host, args, root, session, log) {
+        return status;
+    }
     let (driver, options) = entrypoint.split_first().context("no entrypoint")?;
     let mut command = match driver.as_str() {
         "shem:generate" => python("shem_neural.model.generate"),
         other => bail!("unknown driver {other}: shem has shem:generate"),
     };
     command.args(options).args(host);
-    let own = root.join(SESSION_DIR);
-    let session = session.or(own.join("session.json").is_file().then_some(own.as_path()));
     if let Some(session) = session {
         command.arg("--session").arg(session);
     }

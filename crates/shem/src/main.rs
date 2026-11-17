@@ -742,7 +742,15 @@ fn run_model(
         image::session::load(&layout, &model, session.path())?;
     }
     let session = state.map(|_| session.path());
-    image::model::run_driver(&image.config.entrypoint, &options, input, &root, session)
+    let log = Store::open()?.home().join("server.log");
+    image::model::run_driver(
+        &image.config.entrypoint,
+        &options,
+        input,
+        &root,
+        session,
+        &log,
+    )
 }
 
 /// Check a receipt: find its image, which must have the digest it names,
