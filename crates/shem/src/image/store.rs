@@ -190,6 +190,16 @@ impl Store {
             doomed.extend(entries(&self.cache("imports"))?);
             doomed.extend(entries(&self.cache("warms"))?);
             doomed.extend(entries(&self.cache("runs"))?);
+            // What runs that were killed left of their overlays: with no run going, nothing else is in them
+            for stale in entries(&self.cache("tmp"))? {
+                if stale
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("overlay-"))
+                {
+                    super::overlay::make_removable(&stale);
+                    doomed.push(stale);
+                }
+            }
         }
         let mut deleted = Vec::new();
         for path in doomed {

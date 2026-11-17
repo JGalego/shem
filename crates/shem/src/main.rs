@@ -566,7 +566,7 @@ fn launch<V: Vcpu + Clone>(
         stdout: Box::new(std::io::stdout()),
         stderr: Box::new(std::io::stderr()),
     };
-    // An image's filesystem is unpacked fresh for each run, and removed after.
+    // An image's filesystem is an overlay of its unpacked copy for each run, or else unpacked fresh, and removed after.
     let mut rootfs = None;
     let mut container = if Path::new(&args.target).is_file() {
         if args.state.is_some() {
@@ -620,21 +620,23 @@ fn launch<V: Vcpu + Clone>(
                 "--state is for model images: a program or VM image resumes the state it was frozen with"
             );
         }
-        let dir = tempfile::tempdir()?;
+        let store = Store::open()?;
+        let digest = Image::layout_digest(&image_dir(&args.target)?)?;
+        let run_root = store.run_root(&image, &digest);
         if image.config.kernel.is_some() {
-            return run_vm(args, &image, dir.path(), |mem| vcpu(mem, vm::RAM_BASE));
+            return run_vm(args, &image, &run_root, |mem| vcpu(mem, vm::RAM_BASE));
         }
-        let container = image::start(
+        let container = image::start_in(
             &image,
             |mem| vcpu(mem, 0),
             &args.args,
             &args.env,
             stdio,
-            dir.path(),
+            &run_root,
             args.mem.unwrap_or(image::CONTAINER_MEM),
         )
         .with_context(|| format!("starting {}", args.target))?;
-        rootfs = Some(dir);
+        rootfs = run_root.into_held();
         container
     };
     container.trace = args.trace;
@@ -775,14 +777,14 @@ fn build(args: BuildArgs) -> anyhow::Result<u8> {
 fn run_vm<V: Vcpu>(
     args: &RunArgs,
     image: &Image,
-    root: &Path,
+    root: &image::RunRoot,
     vcpu: impl FnOnce(u32) -> anyhow::Result<V>,
 ) -> anyhow::Result<u8> {
     if !args.args.is_empty() || !args.env.is_empty() {
         bail!("a VM image takes no arguments or environment: KERNEL sets its command line");
     }
     let mem = args.mem.unwrap_or(image::VM_MEM);
-    let machine = image::start_vm(image, vcpu, stdio_console(), root, mem)
+    let machine = image::start_vm_in(image, vcpu, stdio_console(), root, mem)
         .with_context(|| format!("starting {}", args.target))?;
     finish_vm(machine, args.max_steps, args.stats)
 }

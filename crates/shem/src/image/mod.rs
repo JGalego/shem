@@ -14,6 +14,7 @@ mod inspect;
 mod layer;
 pub mod model;
 pub mod modelpack;
+pub mod overlay;
 mod registry;
 pub mod session;
 pub mod shemfile;
@@ -655,6 +656,77 @@ impl Image {
     }
 }
 
+/// Where one run's filesystem is, made when the run first needs it: a
+/// directory the image is unpacked into, or an overlay of the image's
+/// unpacked copy (see [`overlay`]) that the run's changes go to.
+pub enum RunRoot<'a> {
+    /// The image unpacked into a directory the caller gives
+    Dir {
+        image: &'a Image,
+        dir: &'a Path,
+        unpacked: std::cell::Cell<bool>,
+    },
+    /// An overlay of the store's copy of the image, or, where overlays
+    /// cannot be had, a directory of its own, removed with this
+    Layered {
+        image: &'a Image,
+        store: &'a Store,
+        digest: String,
+        made: std::cell::OnceCell<(Held, PathBuf)>,
+    },
+}
+
+/// What keeps a run's filesystem in existence.
+pub enum Held {
+    Overlay(overlay::Mounted),
+    Dir(#[allow(dead_code)] tempfile::TempDir),
+}
+
+impl RunRoot<'_> {
+    /// The directory the guest's `/` is, made if it was not yet.
+    pub fn path(&self) -> anyhow::Result<PathBuf> {
+        match self {
+            RunRoot::Dir {
+                image,
+                dir,
+                unpacked,
+            } => {
+                if !unpacked.replace(true) {
+                    image.unpack_rootfs(dir)?;
+                }
+                Ok(dir.to_path_buf())
+            }
+            RunRoot::Layered {
+                image,
+                store,
+                digest,
+                made,
+            } => {
+                if let Some((_, dir)) = made.get() {
+                    return Ok(dir.clone());
+                }
+                let (held, dir) = store.run_dir(image, digest)?;
+                Ok(made.get_or_init(|| (held, dir)).1.clone())
+            }
+        }
+    }
+
+    /// What keeps the filesystem in existence, to hold on to once the
+    /// image and the store it was made from are gone: None if it was never
+    /// made, or is a directory the caller gave.
+    pub fn into_held(self) -> Option<Held> {
+        match self {
+            RunRoot::Layered { mut made, .. } => made.take().map(|(held, _)| held),
+            RunRoot::Dir { .. } => None,
+        }
+    }
+
+    /// Whether the run's filesystem is an overlay, as far as it is made.
+    pub fn is_overlay(&self) -> bool {
+        matches!(self, RunRoot::Layered { made, .. } if matches!(made.get(), Some((Held::Overlay(_), _))))
+    }
+}
+
 /// Start a container from `image`, its filesystem unpacked into `root`. A warm
 /// image resumes where `WARM` froze it, and takes no arguments; otherwise the
 /// entrypoint starts, with `args` in place of the image's CMD if given.
@@ -669,7 +741,26 @@ pub fn start<V: Vcpu + Clone>(
     root: &Path,
     mem: u32,
 ) -> anyhow::Result<Container<V>> {
-    image.unpack_rootfs(root)?;
+    let root = RunRoot::Dir {
+        image,
+        dir: root,
+        unpacked: std::cell::Cell::new(false),
+    };
+    start_in(image, vcpu, args, env, stdio, &root, mem)
+}
+
+/// Start a container as `start` does, on the filesystem `root` makes.
+pub fn start_in<V: Vcpu + Clone>(
+    image: &Image,
+    vcpu: impl FnOnce(u32) -> anyhow::Result<V>,
+    args: &[String],
+    env: &[String],
+    stdio: Stdio,
+    root: &RunRoot,
+    mem: u32,
+) -> anyhow::Result<Container<V>> {
+    let root = root.path()?;
+    let root = root.as_path();
     let config = &image.config;
     let mut container = match image.warm_state()? {
         Some(frozen) => {
@@ -719,6 +810,23 @@ pub fn start_vm<V: Vcpu>(
     root: &Path,
     mem: u32,
 ) -> anyhow::Result<Machine<V>> {
+    let root = RunRoot::Dir {
+        image,
+        dir: root,
+        unpacked: std::cell::Cell::new(false),
+    };
+    start_vm_in(image, vcpu, console, &root, mem)
+}
+
+/// Start a VM as `start_vm` does, reading its kernel from the filesystem `root`
+/// makes, which a warm image does not need.
+pub fn start_vm_in<V: Vcpu>(
+    image: &Image,
+    vcpu: impl FnOnce(u32) -> anyhow::Result<V>,
+    console: Console,
+    root: &RunRoot,
+    mem: u32,
+) -> anyhow::Result<Machine<V>> {
     if let Some(frozen) = image.warm_machine()? {
         return Ok(Machine::thaw(
             vcpu(frozen.machine.mem.len() as u32)?,
@@ -726,8 +834,8 @@ pub fn start_vm<V: Vcpu>(
             console,
         )?);
     }
-    image.unpack_rootfs(root)?;
-    let kernel = read_kernel(&image.config, root)?;
+    let root = root.path()?;
+    let kernel = read_kernel(&image.config, &root)?;
     let bootargs = (image.config.bootargs.as_deref()).unwrap_or(vm::DEFAULT_BOOTARGS);
     Ok(Machine::boot(vcpu(mem)?, &kernel, bootargs, console)?)
 }
@@ -849,9 +957,46 @@ impl Store {
                     std::fs::write(dir.join(name), data)?;
                 }
             }
-            std::fs::rename(staging.keep(), &dir)?;
+            let staged = staging.keep();
+            if let Err(error) = std::fs::rename(&staged, &dir) {
+                // Another run unpacked the same image first: its copy is the same
+                let _ = std::fs::remove_dir_all(&staged);
+                if !dir.is_dir() {
+                    return Err(error.into());
+                }
+            }
         }
         Ok(dir)
+    }
+
+    /// The filesystem for one run of `image`, whose manifest digest is
+    /// `digest`: made when the run first needs it, as an overlay of the
+    /// image's unpacked copy if the system can mount one, and otherwise the
+    /// image unpacked into a directory removed after the run.
+    pub fn run_root<'a>(&'a self, image: &'a Image, digest: &str) -> RunRoot<'a> {
+        RunRoot::Layered {
+            image,
+            store: self,
+            digest: digest.into(),
+            made: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn run_dir(&self, image: &Image, digest: &str) -> anyhow::Result<(Held, PathBuf)> {
+        // Where it cannot be done the run unpacks the image, and `shem doctor` says why
+        if overlay::enter().is_ok() {
+            let lower = self.rootfs(image, digest)?;
+            let scratch = self.root.with_file_name("tmp");
+            std::fs::create_dir_all(&scratch)?;
+            if let Ok(mounted) = overlay::mount(&lower, &scratch) {
+                let dir = mounted.path().to_path_buf();
+                return Ok((Held::Overlay(mounted), dir));
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        image.unpack_rootfs(dir.path())?;
+        let path = dir.path().to_path_buf();
+        Ok((Held::Dir(dir), path))
     }
 
     /// The layout of the image `reference` in the store, pulled from its

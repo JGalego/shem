@@ -1,0 +1,190 @@
+//! A run's filesystem as an overlay of the image's unpacked copy: the guest
+//! reads the image's files and changes them, and the copy the next run
+//! starts from does not change. Run through the `shem` binary, since a
+//! process can only enter the namespaces an overlay is mounted in while it
+//! has no other threads, which the tests' own harness has.
+
+mod common;
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::{Command, Output};
+
+use common::*;
+use shem::image::{self, BuildOptions, Store};
+
+const AT_FDCWD: u32 = -100i32 as u32;
+const O_WRONLY: i32 = 1;
+const O_CREAT: i32 = 0o100;
+const O_TRUNC: i32 = 0o1000;
+const MEM: u32 = 1 << 20;
+/// `K`, and what the guest's changes add to it when they all work
+const STATUS: i32 = b'K' as i32 + 7 + 5;
+
+/// What the guest does to its filesystem: reads the first byte of `/keep`,
+/// deletes `/gone`, truncates `/mod` and writes `changed` in it, creates
+/// `/new` holding `fresh`, and exits with the byte it read and what the
+/// calls that changed things returned (0, 7 and 5 when they did), which
+/// make a status of `STATUS`.
+fn guest() -> Vec<u8> {
+    let mut data = Vec::new();
+    let mut put = |text: &[u8]| {
+        let at = DATA + data.len() as u32;
+        data.extend(text);
+        data.push(0);
+        data.resize(data.len().next_multiple_of(8), 0);
+        at
+    };
+    let (keep, gone, modified) = (put(b"/keep"), put(b"/gone"), put(b"/mod"));
+    let (changed, new, fresh) = (put(b"changed"), put(b"/new"), put(b"fresh"));
+    let buf = put(b"");
+    data.resize(data.len() + 8, 0);
+    let open = |path: u32, flags: i32| {
+        program![
+            li(A0, AT_FDCWD),
+            li(A1, path),
+            li(A2, flags as u32),
+            addi(A3, ZERO, 0o644),
+            addi(A7, ZERO, 56),
+            ECALL,
+        ]
+    };
+    let write = |text: u32, len: i32| {
+        // The descriptor `open` returned is still in a0
+        program![
+            li(A1, text),
+            addi(A2, ZERO, len),
+            addi(A7, ZERO, 64),
+            ECALL,
+            // The bytes written: an error would change the status
+            add(S0, S0, A0),
+        ]
+    };
+    let code = [
+        open(keep, 0),
+        program![
+            li(A1, buf),
+            addi(A2, ZERO, 1),
+            addi(A7, ZERO, 63),
+            ECALL,
+            li(T0, buf),
+            lbu(S0, T0, 0),
+            // unlinkat(AT_FDCWD, "/gone", 0)
+            li(A0, AT_FDCWD),
+            li(A1, gone),
+            addi(A2, ZERO, 0),
+            addi(A7, ZERO, 35),
+            ECALL,
+            // 0 if it was deleted
+            add(S0, S0, A0),
+        ],
+        open(modified, O_WRONLY | O_TRUNC),
+        write(changed, 7),
+        open(new, O_WRONLY | O_CREAT),
+        write(fresh, 5),
+        program![addi(A0, S0, 0), addi(A7, ZERO, 93), ECALL],
+    ]
+    .concat();
+    elf(&code, &data)
+}
+
+/// A store in `home` holding the image `guest` runs as, with the files it works on.
+fn installed(home: &Path) -> (String, std::path::PathBuf) {
+    let context = tempfile::tempdir().unwrap();
+    let files: [(&str, Vec<u8>); 4] = [
+        ("prog", guest()),
+        ("keep", b"Keep".to_vec()),
+        ("gone", b"Gone".to_vec()),
+        ("mod", b"Original contents".to_vec()),
+    ];
+    for (name, data) in &files {
+        let path = context.path().join(name);
+        fs::write(&path, data).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(
+        context.path().join("Shemfile"),
+        "FROM scratch\nCOPY prog /bin/prog\nCOPY keep /keep\nCOPY gone /gone\nCOPY mod /mod\nENTRYPOINT [\"/bin/prog\"]\n",
+    )
+    .unwrap();
+    let image = image::build(&BuildOptions {
+        shemfile: context.path().join("Shemfile"),
+        context: context.path().to_path_buf(),
+        build_args: Default::default(),
+        mem: Some(MEM),
+        home: Some(tempfile::tempdir().unwrap().keep()),
+    })
+    .unwrap();
+    let store = Store::at(home);
+    let digest = image
+        .write_layout(&store.path("prog").unwrap(), "latest")
+        .unwrap();
+    (
+        digest.clone(),
+        home.join("rootfs").join(&digest["sha256:".len()..]),
+    )
+}
+
+fn run(home: &Path, overlay: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shem"));
+    command.args(["run", "prog"]).env("SHEM_HOME", home);
+    if !overlay {
+        command.env("SHEM_NO_OVERLAY", "1");
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn a_guest_changes_its_filesystem_and_the_image_does_not() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, unpacked) = installed(home.path());
+    for turn in 0..3 {
+        let output = run(home.path(), true);
+        assert_eq!(
+            output.status.code(),
+            Some(STATUS),
+            "run {turn}: the guest read the image's /keep: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // Where the system mounts overlays, runs were overlays of the unpacked image
+    let doctor = Command::new(env!("CARGO_BIN_EXE_shem"))
+        .arg("doctor")
+        .env("SHEM_HOME", home.path())
+        .output()
+        .unwrap();
+    let overlays = String::from_utf8_lossy(&doctor.stdout).contains("ok    overlayfs");
+    assert_eq!(
+        unpacked.is_dir(),
+        overlays,
+        "the image's copy is kept for overlays"
+    );
+    // and that copy is what each started from, still
+    if unpacked.is_dir() {
+        assert_eq!(fs::read(unpacked.join("keep")).unwrap(), b"Keep");
+        assert_eq!(fs::read(unpacked.join("gone")).unwrap(), b"Gone");
+        assert_eq!(
+            fs::read(unpacked.join("mod")).unwrap(),
+            b"Original contents"
+        );
+        assert!(!unpacked.join("new").exists());
+    }
+    // Nothing a run made is left behind
+    let scratch = home.path().join("tmp");
+    let left = fs::read_dir(&scratch).map_or(0, Iterator::count);
+    assert_eq!(left, 0, "the runs' own directories are removed");
+}
+
+#[test]
+fn a_run_with_the_overlay_does_what_one_without_does() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, unpacked) = installed(home.path());
+    let without = run(home.path(), false);
+    assert_eq!(without.status.code(), Some(STATUS));
+    // Turned off, a run does not keep a copy of the image: it unpacks one for itself
+    assert!(!unpacked.exists());
+    let with = run(home.path(), true);
+    assert_eq!(with.status.code(), without.status.code());
+    assert_eq!(with.stdout, without.stdout);
+}

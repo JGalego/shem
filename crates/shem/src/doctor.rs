@@ -238,6 +238,15 @@ pub fn run() -> Vec<Check> {
     match crate::image::Store::open() {
         Ok(store) => {
             let home = store.home();
+            // What a run does with an image's files: mount an overlay of them, or unpack them
+            checks.push(match std::fs::create_dir_all(home.join("tmp")).map_err(|e| e.to_string()).and_then(|()| crate::image::overlay::probe(&home.join("tmp"))) {
+                Ok(()) => Check::ok("overlayfs", "a run's files are an overlay of the image's: nothing is unpacked or copied for it"),
+                Err(why) => Check::warn(
+                    "overlayfs",
+                    format!("not usable ({why}): each run unpacks the image's files"),
+                    "needs Linux 5.11 or later and a user allowed to make user namespaces (on Ubuntu 24.04, `sysctl kernel.apparmor_restrict_unprivileged_userns=0`); SHEM_NO_OVERLAY=1 turns it off",
+                ),
+            });
             let probe =
                 std::fs::create_dir_all(home).and_then(|()| tempfile::tempfile_in(home).map(drop));
             checks.push(match probe {
