@@ -50,8 +50,11 @@ class Replies:
         self.drew, self.more, self.tools = draw, more, tools
         if self.fail:
             raise RuntimeError(self.fail)
-        for piece in ("Hel", "lo"):
-            if out is not None:
+        entries = [(7, -0.5, [(7, -0.5), (8, -1.5)][: more.get("logprobs") or 0]), (9, -2.0, [])]
+        for piece, entry in zip(("Hel", "lo"), entries, strict=True):
+            if out is not None and more.get("out_logprobs") and more.get("logprobs") is not None:
+                out(piece, [entry])
+            elif out is not None:
                 out(piece)
         done = {
             "text": "Hello",
@@ -61,7 +64,7 @@ class Replies:
             "completion_tokens": 2,
         }
         if more.get("logprobs") is not None:
-            done["logprobs"] = [(7, -0.5, [(7, -0.5), (8, -1.5)][: more["logprobs"]]), (9, -2.0, [])]
+            done["logprobs"] = entries
         return done
 
 
@@ -664,7 +667,18 @@ def test_log_probabilities_come_back_in_the_endpoints_shapes(api):
     assert shown["tokens"] == ["<7>", "<9>"] and shown["token_logprobs"] == [-0.5, -2.0]
     assert shown["text_offset"] == [0, 3] and shown["top_logprobs"][0] == {"<7>": -0.5}
     assert json.loads(call(f"{url}/v1/chat/completions", HI)[1])["choices"][0]["logprobs"] is None
-    assert call(f"{url}/v1/chat/completions", HI | {"logprobs": True, "stream": True})[0] == 400
+    # In a stream, each chunk brings the log probabilities of its tokens
+    status, data = call(f"{url}/v1/chat/completions", HI | {"logprobs": True, "top_logprobs": 1, "stream": True})
+    events = [json.loads(e.removeprefix("data: ")) for e in data.decode().split("\n\n") if e and "[DONE]" not in e]
+    shown = [e["choices"][0].get("logprobs") for e in events]
+    assert status == 200 and shown[0] is None and shown[-1] is None
+    assert [c["token"] for e in shown if e for c in e["content"]] == ["<7>", "<9>"]
+    status, data = call(f"{url}/v1/completions", {"prompt": "Hi", "logprobs": 1, "stream": True})
+    events = [json.loads(e.removeprefix("data: ")) for e in data.decode().split("\n\n") if e and "[DONE]" not in e]
+    assert [t for e in events if e["choices"][0]["logprobs"] for t in e["choices"][0]["logprobs"]["tokens"]] == [
+        "<7>",
+        "<9>",
+    ]
     assert call(f"{url}/v1/chat/completions", HI | {"logprobs": True, "top_logprobs": 99})[0] == 400
 
 
@@ -718,12 +732,44 @@ def test_json_object_replies_are_asked_for_and_other_formats_are_refused(api):
     assert replies.more["json_object"] is False
     assert call(f"{url}/v1/chat/completions", HI | {"response_format": {"type": "json_object"}})[0] == 200
     assert replies.more["json_object"] is True
-    schema = {"type": "json_schema", "json_schema": {"name": "x", "schema": {}}}
-    status, data = call(f"{url}/v1/chat/completions", HI | {"response_format": schema})
-    assert status == 400 and "JSON schema" in json.loads(data)["error"]["message"]
+    mine = {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}
+    named = {"type": "json_schema", "json_schema": {"name": "x", "schema": mine, "strict": True}}
+    assert call(f"{url}/v1/chat/completions", HI | {"response_format": named})[0] == 200
+    assert replies.more["schema"] == mine
+    for bad in ({"name": "x", "schema": {"type": "object", "pattern": "a"}}, {"name": "x"}, {"schema": {}}):
+        status, data = call(
+            f"{url}/v1/chat/completions", HI | {"response_format": {"type": "json_schema", "json_schema": bad}}
+        )
+        assert status == 400 and json.loads(data)["error"]["message"], bad
     json_mode = {"response_format": {"type": "json_object"}}
     assert call(f"{url}/v1/completions", {"prompt": "x"} | json_mode)[0] == 400
     assert call(f"{url}/v1/chat/completions", HI | json_mode | {"shem_receipt": True})[0] == 400
+
+
+class JsonCharacters(Characters):
+    """Characters that can write JSON, and a token that ends the reply."""
+
+    ALPHABET = '{}[]":,. -0123456789abcdefghijklmnopqrstuvwxyz'
+    eos = {0}
+
+    def decode(self, ids):
+        return "".join(self.ALPHABET[i % len(self.ALPHABET)] for i in ids)
+
+
+def test_a_real_model_writes_an_object_that_fits_a_schema():
+    args = SimpleNamespace(max_tokens=300, stop=[], system=None)
+    chat = serve.Chat(Model(TINY), JsonCharacters(), args)
+    plain = chat.complete([{"role": "user", "content": "Hi"}], json_object=True)
+    assert isinstance(json.loads(plain["text"]), dict)
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}, "n": {"type": "integer"}, "kind": {"enum": ["a", "b"]}},
+        "required": ["ok", "n", "kind"],
+    }
+    done = chat.complete([{"role": "user", "content": "Hi"}], schema=schema)
+    value = json.loads(done["text"])
+    assert set(value) == {"ok", "n", "kind"} and isinstance(value["ok"], bool) and isinstance(value["n"], int)
+    assert value["kind"] in ("a", "b")
 
 
 def test_a_real_model_gives_log_probabilities_and_continues_raw_text():
@@ -734,6 +780,14 @@ def test_a_real_model_gives_log_probabilities_and_continues_raw_text():
         assert logprob <= 0 and len(top) == 2
         assert top[0][0] == token and abs(top[0][1] - logprob) < 1e-6, "greedy chooses the likeliest"
         assert top[0][1] >= top[1][1]
+    streamed, pieces = [], []
+    again = chat.complete(
+        [{"role": "user", "content": "Hi"}],
+        logprobs=2,
+        out=lambda piece, entries: (pieces.append(piece), streamed.extend(entries)),
+        out_logprobs=True,
+    )
+    assert streamed == again["logprobs"] == done["logprobs"], "a stream carries every token's, once, in order"
     assert "logprobs" not in chat.complete([{"role": "user", "content": "Hi"}])
     raw = chat.complete(None, prompt_tokens=Characters().encode("Once upon"), max_tokens=4)
     assert raw["completion_tokens"] == 4 and raw["prompt_tokens"] == len("Once upon")

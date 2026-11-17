@@ -46,7 +46,7 @@ import torch
 
 from .. import metrics as telemetry
 from . import receipt as receipts
-from .constrain import JsonConstraint
+from .constrain import JsonConstraint, check_schema
 from .generate import ContextFull, Reply, Session
 from .sampling import Sampler
 from .tools import tool_calls
@@ -143,9 +143,13 @@ class Chat:
         logprobs: int | None = None,
         prompt_tokens: list[int] | None = None,
         json_object: bool = False,
+        schema: dict | None = None,
+        out_logprobs: bool = False,
     ) -> dict:
         """Reply to `messages`, or continue `prompt_tokens`, writing the text
-        to `out` as it comes, drawing tokens as `draw` says over the image's
+        to `out` as it comes (and with `out_logprobs`, the log probabilities of
+        the tokens chosen since the last piece as its second argument, the rest
+        at the end with an empty piece), drawing tokens as `draw` says over the image's
         own settings. Returns the reply, why it ended, how many tokens each
         side took, the tool calls it makes if it was offered `tools`, the
         log probabilities of its tokens if `logprobs` (how many of the likeliest
@@ -169,21 +173,29 @@ class Chat:
                 session.choices = []
             if logprobs is not None:
                 session.logprobs, session.top_logprobs = [], logprobs
-            if json_object:
-                session.constraint = JsonConstraint(self.tokenizer)
+            if json_object or schema is not None:
+                session.constraint = JsonConstraint(self.tokenizer, schema)
             session.feed(prompt[len(session.tokens) :])
         job.made = Reply(session, self.tokenizer, max_tokens, text, hold=bool(tools), stops=[*self.stops, *stops])
         self.batcher.submit(job)
         try:
             # What the reply writes is passed on from this request's own thread: a slow client holds up no one else
+            sent = 0
             while (piece := job.pieces.get()) is not None:
-                if out is not None:
+                if out is not None and out_logprobs and logprobs is not None:
+                    # Tokens are noted in the session as they are chosen, before the reply counts them
+                    upto = len(job.made.tokens)
+                    out(piece, session.logprobs[sent:upto])
+                    sent = upto
+                elif out is not None:
                     out(piece)
         except BaseException:
             job.cancelled = True
             raise
         if job.error is not None:
             raise job.error
+        if out is not None and out_logprobs and logprobs is not None and sent < len(job.made.tokens):
+            out("", session.logprobs[sent : len(job.made.tokens)])
         tokens, room = job.made.tokens, session.room()
         made = {}
         if receipt:
@@ -613,15 +625,21 @@ def handler(chat: Chat):
             if logprobs is not None:
                 if isinstance(logprobs, bool) or not isinstance(logprobs, int) or not 0 <= logprobs <= 20:
                     raise ValueError("top_logprobs, or logprobs of a completion, must be a number from 0 to 20")
-                if request.get("stream"):
-                    raise ValueError("logprobs are not sent in a stream yet: ask without stream")
             form = request.get("response_format")
-            if form not in (None, {"type": "text"}, {"type": "json_object"}):
-                raise ValueError("response_format can be text or json_object: shem does not take a JSON schema")
+            schema = None
+            if isinstance(form, dict) and form.get("type") == "json_schema":
+                named = form.get("json_schema")
+                if not isinstance(named, dict) or "schema" not in named:
+                    raise ValueError('response_format json_schema is {"json_schema": {"name": ..., "schema": {...}}}')
+                schema = named["schema"]
+                check_schema(schema)
+            elif form not in (None, {"type": "text"}, {"type": "json_object"}):
+                raise ValueError("response_format can be text, json_object or json_schema")
             json_object = form == {"type": "json_object"}
-            if json_object and (receipt or kind != "chat"):
+            if (json_object or schema is not None) and (receipt or kind != "chat"):
                 raise ValueError(
-                    "json_object is for chat completions, and not with shem_receipt, which cannot replay it"
+                    "json_object and json_schema are for chat completions, and not with shem_receipt, "
+                    "which cannot replay a mask"
                 )
             complete = {
                 **given,
@@ -631,6 +649,7 @@ def handler(chat: Chat):
                 "receipt": receipt,
                 "logprobs": logprobs,
                 "json_object": json_object,
+                "schema": schema,
             }
             return {**given, "tools": tools or None, "complete": complete, "logprobs": logprobs}
 
@@ -728,11 +747,15 @@ def handler(chat: Chat):
                 finish: str | None = None,
                 usage: dict | None = None,
                 receipt: dict | None = None,
+                entries: list | None = None,
             ) -> None:
+                shown = self._logprobs(kind, entries, "") if entries else None
                 if kind == "chat":
                     choice = {"index": 0, "delta": delta, "finish_reason": finish}
+                    if shown is not None:
+                        choice["logprobs"] = shown
                 else:
-                    choice = {"index": 0, "text": delta, "logprobs": None, "finish_reason": finish}
+                    choice = {"index": 0, "text": delta, "logprobs": shown, "finish_reason": finish}
                 event = {**base, "choices": [choice]}
                 if usage is not None:
                     event["usage"] = usage
@@ -745,7 +768,9 @@ def handler(chat: Chat):
                 send({"role": "assistant", "content": ""})
             try:
                 done = chat.complete(
-                    **ask["complete"], out=lambda text: send({"content": text} if kind == "chat" else text)
+                    **ask["complete"],
+                    out=lambda text, entries=None: send({"content": text} if kind == "chat" else text, entries=entries),
+                    out_logprobs=True,
                 )
             except (BrokenPipeError, ConnectionError):
                 return  # the client left
