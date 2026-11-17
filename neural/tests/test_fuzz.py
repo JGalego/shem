@@ -2,19 +2,22 @@
 
 These are property tests, with Hypothesis, of the Python parsers that the Rust fuzz targets
 (`fuzz/`) have no counterpart for: receipts, manifests, tool calls, chat messages, addresses,
-the registry's headers and sizes, and the registry's digest file.
+the registry's headers and sizes, the registry's digest file, the vCPU server's frames, and image references.
 """
 
 import argparse
+import io
 import json
 import string
 
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from shem_neural import server
 from shem_neural.model import receipt, serve
 from shem_neural.model.manifest import Manifest
 from shem_neural.model.tools import tool_calls
+from shem_neural.modelpack import parse_reference
 from shem_neural.registry import Digests, byte_size, credential
 
 FUZZ = settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
@@ -114,3 +117,56 @@ def test_a_digest_file_that_is_garbage_is_forgotten(tmp_path_factory, data):
     path = tmp_path_factory.mktemp("d") / "digests.json"
     path.write_bytes(data)
     assert isinstance(dict(Digests(path)), dict)
+
+
+@FUZZ
+@given(st.lists(st.binary(max_size=300), max_size=5))
+def test_frames_come_back_whole_and_in_order(payloads):
+    wire = io.BytesIO()
+    for payload in payloads:
+        server.write_frame(wire, payload)
+    wire.seek(0)
+    assert [server.read_frame(wire) for _ in payloads] == payloads
+    assert server.read_frame(wire) is None, "the end of the stream is no frame"
+
+
+@FUZZ
+@given(st.binary(max_size=40))
+def test_a_stream_that_is_cut_short_or_garbage_gives_a_frame_a_short_one_or_none(data):
+    stream = io.BytesIO(data)
+    frame = server.read_frame(stream)  # never an exception, whatever the bytes
+    assert frame is None or isinstance(frame, bytes)
+
+
+names = st.from_regex(r"[a-z0-9]+(?:[._-][a-z0-9]+)*", fullmatch=True)
+
+
+@FUZZ
+@given(
+    st.one_of(st.none(), st.sampled_from(["localhost", "ghcr.io", "example.com:5000", "hf.co"])),
+    st.lists(names, min_size=1, max_size=3),
+    st.one_of(st.none(), names),
+    st.one_of(st.none(), st.just("sha256:" + "a" * 64)),
+)
+def test_a_reference_splits_into_where_what_and_which(host, path, tag, digest):
+    name = "/".join(path)
+    text = (f"{host}/" if host else "") + name
+    if digest:
+        text += "@" + digest
+    elif tag:
+        text += ":" + tag
+    got_host, got_path, got_which = parse_reference(text)
+    assert got_which == (digest or tag or "latest")
+    if host:
+        assert (got_host, got_path) == (host, name)
+    elif len(path) == 1:
+        assert (got_host, got_path) == ("registry-1.docker.io", f"library/{name}")
+    # Whatever it was made of, a reference that names no registry never loses its path
+    assert got_path.endswith(path[-1]) and isinstance(got_host, str)
+
+
+@FUZZ
+@given(st.text(max_size=60))
+def test_any_text_is_a_reference_and_never_crashes_the_parser(text):
+    host, path, which = parse_reference(text)
+    assert isinstance(host, str) and isinstance(path, str) and isinstance(which, str)
