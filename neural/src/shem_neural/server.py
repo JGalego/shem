@@ -102,7 +102,14 @@ class Models:
         self.users: dict[str, set[str]] = {}
         self.lock = threading.Lock()
 
-    def get(self, directory: Path, dtype: str = "float32", user: str = "", quantize: str | None = None):
+    def get(
+        self,
+        directory: Path,
+        dtype: str = "float32",
+        user: str = "",
+        quantize: str | None = None,
+        adapters: list[Path] | None = None,
+    ):
         """The model in `directory`, computing in `dtype`, and its tokenizer,
         for `user`, a session ID, until `release(user)`.
 
@@ -121,7 +128,7 @@ class Models:
         manifest = Manifest.load(directory)
         shared = manifest.fingerprint and all(spec.file is None for spec in manifest.blocks)
         identity = manifest.fingerprint if shared else str(Path(directory).resolve())
-        key = f"{identity}\0{dtype}\0{quantize or ''}"
+        key = f"{identity}\0{dtype}\0{quantize or ''}\0{[str(a) for a in adapters or []]}"
         with self.lock:
             # Claimed first, so that a model being loaded is not released from under its loader
             self.idle.pop(key, None)
@@ -133,7 +140,12 @@ class Models:
                     model = self.loaded.get(key)
                 if model is None:
                     model = Model(
-                        directory, dtype=torch_dtype(dtype), device=self.device, quantize=quantize, verify=bool(shared)
+                        directory,
+                        dtype=torch_dtype(dtype),
+                        device=self.device,
+                        quantize=quantize,
+                        verify=bool(shared),
+                        adapters=adapters,
                     )
                     with self.lock:
                         self.loaded[key] = model
@@ -184,7 +196,9 @@ class Models:
         if request.get("session"):
             args.session = Path(request["session"])
         user = request.get("session_id") or f"run-{uuid.uuid4()}"
-        model, tokenizer = self.get(args.model, args.dtype, user, args.quantize)
+        model, tokenizer = self.get(
+            args.model, args.dtype, user, args.quantize, generate.adapter_paths(args.model, args.root, args.adapter)
+        )
         kept = False
         try:
             if args.serve:

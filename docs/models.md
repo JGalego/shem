@@ -45,6 +45,7 @@ A `shem:` entrypoint selects a host-side driver, not a guest executable.
 |---|---|
 | `--max-tokens N` | Maximum reply length; default 256 |
 | `--dtype bfloat16` | Compute in bfloat16, which halves the memory weights and sessions take and is faster on GPUs; default `float32` |
+| `--adapter PATH` | Merge a LoRA adapter into the weights as the model loads: see [adapters](#adapters-as-layers) |
 | `--quantize int8` | Hold the projections' weights as int8 with a scale for each output row, a quarter of float32's memory and half of bfloat16's, applied with PyTorch's int8 kernel on a CPU; embeddings stay as they are. Sessions and receipts record it (`float32+int8`), so they are not mixed with unquantized ones |
 | `--temperature T`, `--top-p P`, `--top-k K`, `--seed N` | Draw tokens, seeded, rather than take the likeliest: see above; defaults greedy, 1, all, random |
 | `--system TEXT` | System prompt |
@@ -185,6 +186,21 @@ SHEM_MODEL_TESTS=1 SHEM_LARGE_MODEL_TESTS=1 \
 ```
 
 Bfloat16 checks require next-token agreement at 90% or more of prompt positions and final-logit cosine similarity above 0.99. Gated models require access and a Hugging Face token; CI skips them, while `just models-job` forwards your token.
+
+## Adapters as layers
+
+A LoRA adapter, as [PEFT](https://github.com/huggingface/peft) saves one, is a few megabytes beside the model's gigabytes, so an image for it is the model's layers and one more. `COPY` it in and name it:
+
+```dockerfile
+FROM hf.co/Qwen/Qwen3-0.6B
+COPY golem-lora/ /adapters/golem/
+ENTRYPOINT ["shem:generate", "--adapter", "/adapters/golem", "--system", "You are Shem, a golem."]
+WARM --until=prompt
+```
+
+`golem-lora/` holds `adapter_model.safetensors` and `adapter_config.json`. The adapter is merged into the weights it names as the model loads (`--adapter` may be given again, and they merge in order), so it costs nothing to run; the model's own layers are the base image's, pushed and pulled once for every adapter's image, and the model server shares the loaded base between containers. Sessions and receipts record the adapters by name and a digest of their weights, so a session made with one is read again, not resumed, by a model without it. A `--adapter` that is not a path in the image is a name under `/model/adapters/`.
+
+shem merges plain LoRA (and rsLoRA): DoRA, other PEFT types and adapters that train whole modules (`modules_to_save`) are refused, as is an adapter for weights the model does not have. Quantizing with `--quantize int8` quantizes the merged weights.
 
 ## ModelPack artifacts
 

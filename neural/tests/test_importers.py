@@ -656,3 +656,92 @@ def test_sessions_read_together_what_they_read_alone(imported):
         tokens = [(t * 3 + step) % 60 + 1 for t in tokens]
         for a, b in zip(alone, together, strict=True):
             assert torch.allclose(a.logits.float(), b.logits.float(), atol=1e-4, rtol=1e-4), (name, step)
+
+
+def lora_for(model, directory, rank=2, alpha=4, name_of=None):
+    """A LoRA adapter, as PEFT saves one, for the first attention projection of `model`'s first attention block."""
+    from safetensors.torch import save_file
+
+    block = next((b for b in model.manifest.blocks if b.type == "attention"), None)
+    if block is None:
+        pytest.skip("no attention projection to adapt")
+    local = next(key for key in ("q", "qkv") if key in block.tensors)
+    name = block.tensors[local]
+    if not name.endswith(".weight"):
+        pytest.skip("tensor names that PEFT cannot name")
+    out_features, in_features = (
+        next(
+            b for b in model.blocks if b.t.get(local) is not None and b.t[local].shape[1] == model.manifest.hidden_size
+        )
+        .t[local]
+        .shape
+    )
+    generator = torch.Generator().manual_seed(5)
+    module = (name_of or name).removesuffix(".weight")
+    directory.mkdir(parents=True)
+    save_file(
+        {
+            f"base_model.model.{module}.lora_A.weight": torch.randn(rank, in_features, generator=generator),
+            f"base_model.model.{module}.lora_B.weight": torch.randn(out_features, rank, generator=generator),
+        },
+        str(directory / "adapter_model.safetensors"),
+    )
+    (directory / "adapter_config.json").write_text(
+        json.dumps({"peft_type": "LORA", "r": rank, "lora_alpha": alpha, "target_modules": [module]})
+    )
+    return block, local, name
+
+
+def test_an_adapter_is_merged_into_the_weights_it_names(imported, tmp_path):
+    from safetensors.torch import load_file
+
+    from shem_neural.model.generate import Session
+
+    name, _, out, _ = imported
+    base = Model(out)
+    block, local, tensor_name = lora_for(base, tmp_path / "lora")
+    adapted = Model(out, adapters=[tmp_path / "lora"])
+    index = base.manifest.blocks.index(block)
+    changed = adapted.blocks[index].t[local]
+    pair = load_file(str(tmp_path / "lora" / "adapter_model.safetensors"))
+    module = tensor_name.removesuffix(".weight")
+    a, b = pair[f"base_model.model.{module}.lora_A.weight"], pair[f"base_model.model.{module}.lora_B.weight"]
+    assert torch.allclose(changed, base.blocks[index].t[local] + (b @ a) * 2.0, atol=1e-5)
+    # Everything else is the model's own
+    other = next(i for i, spec in enumerate(base.manifest.blocks) if i != index and spec.type in ("mlp", "moe"))
+    assert all(torch.equal(adapted.blocks[other].t[k], v) for k, v in base.blocks[other].t.items())
+    assert adapted.adapter_names[0].startswith("lora@")
+    # And it changes what the model says, which a session remembers it was made with
+    one, two = Session(base), Session(adapted)
+    one.feed([1, 5, 7])
+    two.feed([1, 5, 7])
+    assert not torch.allclose(one.logits, two.logits)
+    two.save(tmp_path / "saved")
+    from shem_neural.model.generate import staleness
+
+    meta = json.loads((tmp_path / "saved" / "session.json").read_text())
+    assert staleness(adapted, meta) is None
+    assert "adapters" in staleness(base, meta)
+
+
+def test_an_adapter_for_another_model_is_refused(imported, tmp_path):
+    name, _, out, _ = imported
+    base = Model(out)
+    lora_for(base, tmp_path / "lora", name_of="model.layers.99.self_attn.nothing.weight")
+    with pytest.raises(ValueError, match="for another model"):
+        Model(out, adapters=[tmp_path / "lora"])
+
+
+def test_adapters_that_are_not_plain_lora_are_refused(imported, tmp_path):
+    name, _, out, _ = imported
+    base = Model(out)
+    lora_for(base, tmp_path / "lora")
+    config = json.loads((tmp_path / "lora" / "adapter_config.json").read_text())
+    for change, text in (
+        ({"use_dora": True}, "use_dora"),
+        ({"peft_type": "IA3"}, "IA3"),
+        ({"modules_to_save": ["x"]}, "modules_to_save"),
+    ):
+        (tmp_path / "lora" / "adapter_config.json").write_text(json.dumps(config | change))
+        with pytest.raises(ValueError, match=text):
+            Model(out, adapters=[tmp_path / "lora"])

@@ -143,6 +143,7 @@ class Session:
         return {
             "format": SESSION_FORMAT,
             "precision": self.model.precision,
+            "adapters": self.model.adapter_names,
             "blocks": self.model.versions,
             "tokens": self.tokens,
             "messages": self.messages,
@@ -201,6 +202,8 @@ def staleness(model: Model, meta: dict) -> str | None:
     precision = meta.get("precision", "float32")
     if precision != model.precision:
         return f"in {precision}, and this model runs in {model.precision}"
+    if (adapters := meta.get("adapters", [])) != model.adapter_names:
+        return f"with adapters {adapters or 'none'}, and this model has {model.adapter_names or 'none'}"
     saved, here = meta.get("blocks", dict.fromkeys(model.versions, 1)), model.versions
     changed = sorted(kind for kind in saved.keys() | here.keys() if saved.get(kind) != here.get(kind))
     if changed:
@@ -442,6 +445,14 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
         help="with --serve, let pages of this origin call the API, or * for any; may be given again",
     )
     parser.add_argument(
+        "--adapter",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="merge a LoRA adapter into the weights: its directory in the image, or a name under the model's "
+        "adapters/; may be given again, and they merge in order",
+    )
+    parser.add_argument(
         "--quantize",
         choices=["int8"],
         help="hold the projections' weights as int8, a quarter of float32's memory (embeddings stay as they are)",
@@ -477,6 +488,23 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
     parser.add_argument("model", help="the model's directory, holding shem.json, or an image's root holding one")
     parser.add_argument("prompt", nargs="*")
     return parser.parse_args(argv)
+
+
+def adapter_paths(model_dir: Path, root: Path, names: list[str]) -> list[Path]:
+    """The directories of the adapters `--adapter` names, each as a path in
+    the image (under its root, which the model server reads with the host's
+    view of the filesystem: a path that leads out is refused) or a name under
+    the model's `adapters/`."""
+    found = []
+    for name in names:
+        for base in (Path(root).resolve(), (Path(model_dir) / "adapters").resolve()):
+            candidate = (base / name.lstrip("/")).resolve()
+            if candidate.is_relative_to(base) and (candidate / "adapter_model.safetensors").is_file():
+                found.append(candidate)
+                break
+        else:
+            raise ValueError(f"--adapter {name}: no adapter_model.safetensors there, or in the model's adapters/")
+    return found
 
 
 def tools_for(model_dir: Path, root: Path, directory: str, vcpu_socket: Path | None = None) -> Tools:
@@ -634,7 +662,13 @@ def chat(
 
 def main() -> None:
     args = resolve(options(sys.argv[1:]))
-    model = Model(args.model, dtype=dtype(args.dtype), device=args.device, quantize=args.quantize)
+    model = Model(
+        args.model,
+        dtype=dtype(args.dtype),
+        device=args.device,
+        quantize=args.quantize,
+        adapters=adapter_paths(args.model, args.root, args.adapter),
+    )
     tokenizer = Tokenizer(args.model, model.manifest.tokenizer)
     if args.serve and not args.warm:
         from .serve import serve_forever

@@ -563,6 +563,56 @@ def resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
+class Adapter:
+    """A LoRA adapter, as PEFT saves one: low-rank matrices for some of a
+    model's weights, `adapter_model.safetensors` and `adapter_config.json` in a
+    directory. Merged into the weights as the model loads, it costs nothing
+    to run, and the image that holds it holds a few megabytes beside the
+    model's gigabytes, which every adapter's image shares."""
+
+    def __init__(self, directory: Path):
+        self.directory = Path(directory)
+        config = json.loads((self.directory / "adapter_config.json").read_text())
+        if config.get("peft_type", "LORA") != "LORA":
+            raise ValueError(f"{directory}: shem merges LoRA adapters, not {config['peft_type']}")
+        for option in ("use_dora", "fan_in_fan_out"):
+            if config.get(option):
+                raise ValueError(f"{directory}: shem does not merge adapters made with {option}")
+        if config.get("modules_to_save"):
+            raise ValueError(f"{directory}: shem does not merge adapters that train whole modules (modules_to_save)")
+        rank = config["r"]
+        self.scale = config["lora_alpha"] / (rank**0.5 if config.get("use_rslora") else rank)
+        pairs: dict[str, dict] = {}
+        for key, tensor in load_file(str(self.directory / "adapter_model.safetensors")).items():
+            module, _, rest = key.removeprefix("base_model.model.").partition(".lora_")
+            kind, _, _ = rest.partition(".")
+            if kind not in ("A", "B"):
+                raise ValueError(f"{directory}: no meaning for the adapter's tensor {key}")
+            pairs.setdefault(module + ".weight", {})[kind] = tensor
+        if not pairs or any(set(pair) != {"A", "B"} for pair in pairs.values()):
+            raise ValueError(f"{directory}: the adapter has no complete pair of low-rank matrices")
+        self.pairs = pairs
+        self.digest = hashlib.sha256((self.directory / "adapter_model.safetensors").read_bytes()).hexdigest()[:16]
+
+    @property
+    def name(self) -> str:
+        return f"{self.directory.name}@{self.digest}"
+
+    def merge(self, name: str, weight: torch.Tensor) -> torch.Tensor:
+        """`weight`, the checkpoint's tensor `name`, with the adapter's change to it, if it has one."""
+        pair = self.pairs.get(name)
+        if pair is None:
+            return weight
+        delta = (pair["B"].float() @ pair["A"].float()) * self.scale
+        if delta.shape != weight.shape:
+            raise ValueError(f"{self.directory}: the adapter's change to {name} is {tuple(delta.shape)}, not its shape")
+        return (weight.float() + delta).to(weight.dtype)
+
+    def unused(self, names: set[str]) -> list[str]:
+        """The weights it changes that the model has none of."""
+        return sorted(set(self.pairs) - names)
+
+
 class Model:
     """A model loaded from its manifest's directory, ready to run sessions."""
 
@@ -573,6 +623,7 @@ class Model:
         device: str = "cpu",
         quantize: str | None = None,
         verify: bool = False,
+        adapters: list[Path] | None = None,
     ):
         """The model in `directory`. With `verify`, its tensors are checked
         against the fingerprint its manifest records, as they are read: a
@@ -583,6 +634,9 @@ class Model:
         self.manifest = Manifest.load(self.directory)
         self.dtype = dtype
         self.quantize = quantize
+        #: LoRA adapters merged into the weights as they load, in order
+        self.adapters = [Adapter(path) for path in adapters or []]
+        used: set[str] = set()
         self.device = resolve_device(device)
         device = str(self.device)
         if self.device.type == "cuda":
@@ -614,6 +668,11 @@ class Model:
                         tensor = named[name].cpu().contiguous()
                         digest.update(f"{name}:{tensor.dtype}:{list(tensor.shape)}".encode())
                         digest.update(tensor.view(torch.uint8).numpy().tobytes() if tensor.numel() else b"")
+            for adapter in self.adapters:
+                for local, name in spec.tensors.items():
+                    if name in adapter.pairs and local in loaded:
+                        loaded[local] = adapter.merge(name, loaded[local])
+                        used.add(name)
             if quantize:
                 # Quantized as loaded, from the checkpoint's own precision
                 return {
@@ -631,6 +690,12 @@ class Model:
                 raise ValueError(f"unknown block type {spec.type!r}: this runtime has {sorted(BLOCKS)}")
             self.blocks.append(BLOCKS[spec.type](spec.params, tensors(spec)))
         head = tensors(m.head)
+        for adapter in self.adapters:
+            if missing := adapter.unused(used):
+                raise ValueError(
+                    f"{adapter.directory}: the adapter changes {len(missing)} weights this model has none of, "
+                    f"such as {missing[0]}: is it for another model?"
+                )
         if digest is not None and "sha256:" + digest.hexdigest() != m.fingerprint:
             raise ValueError(f"{self.directory}: the weights are not the ones the manifest's fingerprint names")
         self.head_norm = head["norm"]
@@ -650,6 +715,11 @@ class Model:
         """The type the model computes in, as ModelPack names it, such as `float32`."""
         name = str(self.dtype).removeprefix("torch.")
         return f"{name}+{self.quantize}" if self.quantize else name
+
+    @property
+    def adapter_names(self) -> list[str]:
+        """The adapters merged in, by name and a digest of their weights."""
+        return [adapter.name for adapter in self.adapters]
 
     @torch.no_grad()
     def forward_batch(self, tokens: list[int], states: list[list], starts: list[int]) -> torch.Tensor:

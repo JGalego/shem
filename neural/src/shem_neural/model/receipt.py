@@ -74,6 +74,7 @@ def runtime(model) -> dict:
         "device": model.device.type,
         "machine": torch.cuda.get_device_name(model.device) if cuda else platform.machine(),
         "precision": model.precision,
+        **({"adapters": model.adapter_names} if model.adapters else {}),
         "blocks": model.versions,
     }
 
