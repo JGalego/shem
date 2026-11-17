@@ -215,6 +215,31 @@ impl RootFs {
         })
     }
 
+    /// Run `change` on the directory that holds the canonical guest path
+    /// `guest` and the name it has there, with the directory opened beneath the
+    /// root as `open_beneath` opens a file: a `mkdirat` or `unlinkat` on it
+    /// cannot be sent through a link a host process swapped in since the
+    /// path was resolved. None where `open_beneath` has no `openat2`.
+    pub fn at_parent<T>(
+        &self,
+        guest: &[u8],
+        change: impl FnOnce(std::os::fd::RawFd, &std::ffi::CStr) -> std::io::Result<T>,
+    ) -> Option<std::io::Result<T>> {
+        use std::os::fd::AsRawFd;
+        let cut = guest.iter().rposition(|&b| b == b'/')?;
+        let (parent, name) = (&guest[..cut.max(1)], &guest[cut + 1..]);
+        let name = std::ffi::CString::new(name).ok()?;
+        let dir = match self.open_beneath(
+            parent,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        )? {
+            Ok(dir) => dir,
+            Err(err) => return Some(Err(err)),
+        };
+        Some(change(dir.as_raw_fd(), &name))
+    }
+
     fn host_path(&self, components: &[Vec<u8>]) -> PathBuf {
         let mut host = self.root.clone();
         for name in components {

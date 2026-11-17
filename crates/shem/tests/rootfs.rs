@@ -183,4 +183,39 @@ mod beneath {
         let climbs = read(&root, "/../../etc/hostname").unwrap();
         assert!(climbs.is_err());
     }
+
+    #[test]
+    fn a_directory_swapped_for_a_link_is_not_made_into_or_removed_from() {
+        let root = root();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.host.join("data")).unwrap();
+        fs::write(outside.path().join("kept"), "the host's").unwrap();
+        let resolved = root.fs.resolve(b"/", b"/data/kept", true).unwrap();
+        fs::rename(root.host.join("data"), root.host.join("data.old")).unwrap();
+        symlink(outside.path(), root.host.join("data")).unwrap();
+        let guest = std::str::from_utf8(&resolved.guest).unwrap();
+        let made = root.fs.at_parent(guest.as_bytes(), |dir, name| {
+            // SAFETY: the descriptor is open and the name a C string, for the call
+            match unsafe { libc::mkdirat(dir, name.as_ptr(), 0o755) } {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+        let Some(made) = made else { return };
+        // The link is refused, as a link (ELOOP) or as no directory (ENOTDIR, which O_DIRECTORY says of one)
+        let refused = made.unwrap_err().raw_os_error();
+        assert!(
+            refused == Some(libc::ELOOP) || refused == Some(libc::ENOTDIR),
+            "{refused:?}"
+        );
+        assert!(!outside.path().join("kept").is_dir() && outside.path().join("kept").is_file());
+        // A parent that is a plain directory works as before
+        let ok = root.fs.at_parent(b"/bin/new", |dir, name| {
+            match unsafe { libc::mkdirat(dir, name.as_ptr(), 0o755) } {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+        assert!(ok.unwrap().is_ok() && root.host.join("bin/new").is_dir());
+    }
 }

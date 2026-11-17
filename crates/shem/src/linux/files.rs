@@ -986,9 +986,22 @@ impl Process {
         mode: u32,
     ) -> Result<u32, Errno> {
         let resolved = self.resolve_at(vcpu, dirfd, path, false)?;
-        std::fs::DirBuilder::new()
-            .mode((mode & !self.umask) & 0o7777)
-            .create(&resolved.host)?;
+        let mode = (mode & !self.umask) & 0o7777;
+        let beneath = self.root.as_deref().and_then(|root| {
+            root.at_parent(&resolved.guest, |dir, name| {
+                // SAFETY: `dir` is open and `name` is a C string, for the call
+                match unsafe { libc::mkdirat(dir, name.as_ptr(), mode) } {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                }
+            })
+        });
+        match beneath {
+            Some(done) => done?,
+            None => std::fs::DirBuilder::new()
+                .mode(mode)
+                .create(&resolved.host)?,
+        }
         self.created(&resolved);
         Ok(0)
     }
@@ -1004,17 +1017,37 @@ impl Process {
         if resolved.guest == b"/" {
             return Err(Errno::EBUSY);
         }
-        let meta = std::fs::symlink_metadata(&resolved.host)?;
-        if flags & AT_REMOVEDIR != 0 {
-            if !meta.is_dir() {
-                return Err(Errno::ENOTDIR);
-            }
-            std::fs::remove_dir(&resolved.host)?;
+        let how = if flags & AT_REMOVEDIR != 0 {
+            libc::AT_REMOVEDIR
         } else {
-            if meta.is_dir() {
-                return Err(Errno::EISDIR);
+            0
+        };
+        let beneath = self.root.as_deref().and_then(|root| {
+            root.at_parent(&resolved.guest, |dir, name| {
+                // SAFETY: `dir` is open and `name` is a C string, for the call; the kernel
+                // answers EISDIR and ENOTDIR as Linux does for the wrong kind
+                match unsafe { libc::unlinkat(dir, name.as_ptr(), how) } {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                }
+            })
+        });
+        match beneath {
+            Some(done) => done?,
+            None => {
+                let meta = std::fs::symlink_metadata(&resolved.host)?;
+                if flags & AT_REMOVEDIR != 0 {
+                    if !meta.is_dir() {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    std::fs::remove_dir(&resolved.host)?;
+                } else {
+                    if meta.is_dir() {
+                        return Err(Errno::EISDIR);
+                    }
+                    std::fs::remove_file(&resolved.host)?;
+                }
             }
-            std::fs::remove_file(&resolved.host)?;
         }
         self.changed_dir(&resolved);
         Ok(0)
@@ -1033,7 +1066,22 @@ impl Process {
         }
         let resolved = self.resolve_at(vcpu, dirfd, path, false)?;
         // The target is stored verbatim; the resolver interprets it inside the root.
-        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &resolved.host)?;
+        let beneath = self.root.as_deref().and_then(|root| {
+            let link = std::ffi::CString::new(target.clone()).ok()?;
+            root.at_parent(&resolved.guest, |dir, name| {
+                // SAFETY: `dir` is open, and `link` and `name` are C strings, for the call
+                match unsafe { libc::symlinkat(link.as_ptr(), dir, name.as_ptr()) } {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                }
+            })
+        });
+        match beneath {
+            Some(done) => done?,
+            None => {
+                std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &resolved.host)?
+            }
+        }
         self.created(&resolved);
         Ok(0)
     }
@@ -1079,10 +1127,48 @@ impl Process {
         }
         let from = self.resolve_at(vcpu, old_dirfd, old_path, false)?;
         let to = self.resolve_at(vcpu, new_dirfd, new_path, false)?;
-        if flags & RENAME_NOREPLACE != 0 && std::fs::symlink_metadata(&to.host).is_ok() {
-            return Err(Errno::EEXIST);
+        #[cfg(target_os = "linux")]
+        let beneath = self.root.as_deref().and_then(|root| {
+            root.at_parent(&from.guest, |from_dir, from_name| {
+                root.at_parent(&to.guest, |to_dir, to_name| {
+                    // SAFETY: both descriptors are open and both names are C strings, for the call
+                    let done = unsafe {
+                        libc::syscall(
+                            libc::SYS_renameat2,
+                            from_dir,
+                            from_name.as_ptr(),
+                            to_dir,
+                            to_name.as_ptr(),
+                            flags,
+                        )
+                    };
+                    if done == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                })
+                .unwrap_or_else(|| Err(std::io::Error::from_raw_os_error(libc::ENOSYS)))
+            })
+        });
+        #[cfg(not(target_os = "linux"))]
+        let beneath: Option<std::io::Result<()>> = None;
+        match beneath {
+            // The kernel with openat2 has renameat2 too; one without either renames by path
+            Some(Err(err)) if err.raw_os_error() == Some(libc::ENOSYS) => {
+                if flags & RENAME_NOREPLACE != 0 && std::fs::symlink_metadata(&to.host).is_ok() {
+                    return Err(Errno::EEXIST);
+                }
+                std::fs::rename(&from.host, &to.host)?;
+            }
+            Some(done) => done?,
+            None => {
+                if flags & RENAME_NOREPLACE != 0 && std::fs::symlink_metadata(&to.host).is_ok() {
+                    return Err(Errno::EEXIST);
+                }
+                std::fs::rename(&from.host, &to.host)?;
+            }
         }
-        std::fs::rename(&from.host, &to.host)?;
         self.changed_dir(&from);
         self.changed_dir(&to);
         Ok(0)
