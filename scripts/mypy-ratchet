@@ -7,11 +7,12 @@
 #   scripts/mypy-ratchet            check
 #   scripts/mypy-ratchet --update   write the baseline from what mypy says now
 set -eu
+export LC_ALL=C
 cd "$(dirname "$0")/../neural"
 baseline=mypy-baseline.txt
 current=$(mktemp)
 trap 'rm -f "$current"' EXIT
-uv run --quiet --with mypy mypy --ignore-missing-imports --no-error-summary --no-pretty src \
+uv run --quiet --with "mypy==2.4.1" mypy --ignore-missing-imports --no-error-summary --no-pretty src \
     | grep ': error:' | sed -E 's/:[0-9]+: /: /' | sort -u > "$current" || true
 if [ "${1:-}" = "--update" ]; then
     cp "$current" "$baseline"
