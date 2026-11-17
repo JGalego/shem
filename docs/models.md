@@ -499,7 +499,19 @@ shem: verified: the model chose the receipt's 18 tokens again
 | 3 | `undecided` | The tokens differ at a close call, which another device may make otherwise: replay on the receipt's device |
 | 125 | | The receipt could not be replayed: no such image, or one with another digest |
 
-Decoding repeats exactly on one device, while two devices round sums differently. A choice holds on any device whose logits are within half its margin of the receipt's. shem calls a choice close under a margin of 0.002 in float32, twice the tolerance [imports are held to](#comparing-an-import-with-transformers) against transformers, and 0.5 in bfloat16. These are rules of thumb, not bounds measured between devices. A receipt's closest call is printed when it is written.
+Decoding repeats exactly on one device, while two devices round sums differently. A choice holds on any device whose logits are within half its margin of the receipt's. shem calls a choice close under a margin of 0.002 in float32, twice the tolerance [imports are held to](#comparing-an-import-with-transformers) against transformers, and 0.5 in bfloat16. A receipt's closest call is printed when it is written.
+
+Those tolerances are checked against measurement. [`neural/jobs/devices.py`](../neural/jobs/devices.py), a Hugging Face Job, runs 12 conversations of 64 tokens through SmolLM2-360M and Qwen3-0.6B (768 positions each) on the job's CPU in float32, and along the same path on the same CPU in bfloat16 and on an NVIDIA L4 and an A100 in both types. The largest differences from the CPU's float32 logits (of the 16 likeliest tokens), over both models:
+
+| Device and type | Largest logit difference | 99th percentile | Largest move of a margin | Choices flipped | Largest margin that flipped |
+|---|---|---|---|---|---|
+| L4, float32 | 0.00008 | 0.00003 | 0.00007 | 0 of 1,536 | |
+| A100, float32 | 0.00007 | 0.00003 | 0.00007 | 0 of 1,536 | |
+| CPU, bfloat16 | 0.87 | 0.37 | 1.25 | 33 and 39 of 1,536 (two hosts) | 0.25 |
+| L4, bfloat16 | 0.80 | 0.32 | 0.72 | 27 of 1,536 | 0.25 |
+| A100, bfloat16 | 1.14 | 0.32 | 0.71 | 22 of 1,536 | 0.15 |
+
+In float32 the devices are 28 times closer than the tolerance (a margin moved by 0.00007 at most, against 0.002, and the closest call among the positions, a margin of 0.003, did not flip). In bfloat16 no choice with a margin over 0.25 flipped, half the tolerance, but the logits differ by up to 1.14, so a firm margin by the half-the-difference rule would be 2.3: 0.5 is what measurement supports, and a receipt of a bfloat16 run is more often `undecided` on another device for it. The sample is two models and 12 prompts, not a proof.
 
 A replay shows that this image gives this reply to this prompt. It does not show who ran it, or when: for that, sign the receipt. `shem sign receipt.json` hands it to [cosign](https://docs.sigstore.dev/cosign/) (keyless, by your identity, or with `--key`) and writes `receipt.json.sigstore.json` beside it; `shem verify receipt.json --certificate-identity ME --certificate-oidc-issuer ISSUER` checks it, and the signature's entry in Sigstore's transparency log says when. `SHEM_COSIGN` names another cosign. To see what a change to the prompt does, run the changed prompt: nothing is sampled, so any difference in the reply comes from the change.
 
