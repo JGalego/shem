@@ -12,7 +12,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread::JoinHandle;
 
 use shem::container::TERMINAL_SIGNAL;
@@ -37,10 +37,41 @@ impl Console {
         stdout: &str,
         control: Arc<Control>,
     ) -> std::io::Result<(Self, Stdio)> {
+        Self::make(stdin, stdout, None, |input| {
+            Box::new(Wakeable::new(input, control))
+        })
+    }
+
+    /// A terminal for a program `docker exec -t` adds: its input is read
+    /// without waiting, which parks the program where the container's own
+    /// loop can go on, and the keys typed at it that send signals are noted in
+    /// `typed`, for the container to deliver to the program's own foreground.
+    pub fn open_exec(
+        stdin: Option<File>,
+        stdout: &str,
+        typed: Arc<AtomicU32>,
+    ) -> std::io::Result<(Self, Stdio)> {
+        Self::make(stdin, stdout, Some(typed), |input| {
+            // SAFETY: fcntl on a descriptor `input` owns
+            unsafe {
+                let fd = input.as_raw_fd();
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            Box::new(input)
+        })
+    }
+
+    fn make(
+        stdin: Option<File>,
+        stdout: &str,
+        typed: Option<Arc<AtomicU32>>,
+        input: impl FnOnce(File) -> Box<dyn Read + Send>,
+    ) -> std::io::Result<(Self, Stdio)> {
         let (master, name) = open_master()?;
         let slave = open_slave(&name, libc::O_RDWR)?;
         // A description of its own, which reads of input make nonblocking
-        let input = open_slave(&name, libc::O_RDONLY)?;
+        let input_file = open_slave(&name, libc::O_RDONLY)?;
 
         let mut out = match stdout {
             "" => None,
@@ -60,10 +91,10 @@ impl Console {
         });
         if let Some(fifo) = stdin {
             let to = master.try_clone()?;
-            std::thread::spawn(move || type_into(fifo, to));
+            std::thread::spawn(move || type_into(fifo, to, typed));
         }
         let stdio = Stdio {
-            stdin: Box::new(Wakeable::new(input, control)),
+            stdin: input(input_file),
             stdout: Box::new(slave.try_clone()?),
             stderr: Box::new(slave.try_clone()?),
         };
@@ -98,8 +129,14 @@ impl Console {
 pub struct Resizer(File);
 
 impl Resizer {
-    /// Set the size, and tell the program with SIGWINCH.
+    /// Set the size, and tell the program with SIGWINCH, the container's
+    /// own, or with `exec` the typed signals of a program `docker exec` added.
     pub fn resize(&self, rows: u16, cols: u16) {
+        self.resize_for(rows, cols, None);
+    }
+
+    /// As `resize`, for the terminal that notes its signals in `typed`.
+    pub fn resize_for(&self, rows: u16, cols: u16, typed: Option<&AtomicU32>) {
         let size = libc::winsize {
             ws_row: rows,
             ws_col: cols,
@@ -108,7 +145,10 @@ impl Resizer {
         };
         // SAFETY: TIOCSWINSZ reads one winsize
         unsafe { libc::ioctl(self.0.as_raw_fd(), libc::TIOCSWINSZ, &size) };
-        TERMINAL_SIGNAL.store(libc::SIGWINCH as u32, Ordering::SeqCst);
+        match typed {
+            Some(typed) => typed.store(libc::SIGWINCH as u32, Ordering::SeqCst),
+            None => TERMINAL_SIGNAL.store(libc::SIGWINCH as u32, Ordering::SeqCst),
+        }
     }
 }
 
@@ -146,7 +186,7 @@ fn open_slave(name: &CStr, mode: libc::c_int) -> std::io::Result<File> {
 
 /// Copy what is typed into the terminal. A key that sends a signal, while
 /// the terminal's settings say it does, goes to the program as that signal.
-fn type_into(mut typed: File, mut master: File) {
+fn type_into(mut typed: File, mut master: File, note: Option<Arc<AtomicU32>>) {
     let mut buf = [0u8; 4096];
     while let Ok(n @ 1..) = typed.read(&mut buf) {
         let keys = signal_keys(&master);
@@ -156,7 +196,10 @@ fn type_into(mut typed: File, mut master: File) {
                 if master.write_all(&buf[from..i]).is_err() {
                     return;
                 }
-                TERMINAL_SIGNAL.store(signal, Ordering::SeqCst);
+                match &note {
+                    Some(note) => note.store(signal, Ordering::SeqCst),
+                    None => TERMINAL_SIGNAL.store(signal, Ordering::SeqCst),
+                }
                 from = i + 1;
             }
         }

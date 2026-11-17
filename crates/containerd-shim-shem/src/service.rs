@@ -33,7 +33,7 @@ use containerd_shim::{
 use log::{info, warn};
 use shem::linux::Stdio;
 
-use crate::bundle::{self, Bundle, Control, ExecRequest, Wakeable};
+use crate::bundle::{self, Bundle, Control, ExecRequest, ResizerSlot, Wakeable};
 use crate::console::{Console, Resizer};
 use crate::holder::Holder;
 
@@ -76,6 +76,10 @@ struct ExecProcess {
     stdin: String,
     stdout: String,
     stderr: String,
+    /// `docker exec -t`: the program gets a terminal of its own
+    terminal: bool,
+    /// Where its terminal's window size is set from, once it has one
+    resizer: ResizerSlot,
     status: api::Status,
     exited: Option<(u32, Timestamp)>,
 }
@@ -156,6 +160,7 @@ impl Service {
                 exec.env.clone(),
                 exec.cwd.clone(),
                 [exec.stdin.clone(), exec.stdout.clone(), exec.stderr.clone()],
+                (exec.terminal, exec.resizer.clone()),
             );
             Ok::<_, ttrpc::Error>((
                 task.id.clone(),
@@ -165,7 +170,7 @@ impl Service {
                 copy,
             ))
         })??;
-        let (args, env, cwd, [stdin, stdout, stderr]) = exec;
+        let (args, env, cwd, [stdin, stdout, stderr], (terminal, resizer)) = exec;
         self.publish(TaskExecStarted {
             container_id: container_id.clone(),
             exec_id: exec_id.clone(),
@@ -195,6 +200,8 @@ impl Service {
                     stdout,
                     stderr: stderr.clone(),
                     done,
+                    terminal,
+                    resizer,
                 };
                 if control.exec(request) {
                     u32::from(ended.recv().unwrap_or(137))
@@ -734,6 +741,8 @@ impl shim::Task for Service {
                     stdin: req.stdin.clone(),
                     stdout: req.stdout.clone(),
                     stderr: req.stderr.clone(),
+                    terminal: req.terminal,
+                    resizer: ResizerSlot::default(),
                     status: api::Status::CREATED,
                     exited: None,
                 },
@@ -792,12 +801,18 @@ impl shim::Task for Service {
         req: api::ResizePtyRequest,
     ) -> TtrpcResult<api::Empty> {
         trace(format!("resize to {}x{}", req.width, req.height));
-        // A program's terminal takes the size; a session echoes what is
-        // typed, whatever the size
+        // A program's terminal takes the size, a program `docker exec -t` added
+        // its own; a session echoes what is typed, whatever the size
         self.with_task(|task| {
-            if let Some(terminal) = &task.terminal {
-                let clamp = |n: u32| n.min(u16::MAX as u32) as u16;
-                terminal.resize(clamp(req.height), clamp(req.width));
+            let clamp = |n: u32| n.min(u16::MAX as u32) as u16;
+            if req.exec_id.is_empty() {
+                if let Some(terminal) = &task.terminal {
+                    terminal.resize(clamp(req.height), clamp(req.width));
+                }
+            } else if let Some(exec) = task.execs.get(&req.exec_id)
+                && let Some(resize) = &*exec.resizer.lock().unwrap()
+            {
+                resize(clamp(req.height), clamp(req.width));
             }
         })?;
         Ok(api::Empty::default())

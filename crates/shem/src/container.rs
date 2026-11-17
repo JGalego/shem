@@ -9,6 +9,8 @@ use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use thiserror::Error;
 
@@ -16,7 +18,7 @@ use crate::elf::{self, ElfError};
 use crate::emulate::{Emulation, Emulator};
 use crate::linux::{
     Action, Delivery, Exec, FreezeError, FrozenLinux, FrozenProcess, Linux, ProcEntry, Process,
-    Report, Stdio, Termination, Wait,
+    Report, Stdio, Terminal, Termination, Wait,
 };
 use crate::vcpu::{A0, A7, Exit, ExitReason, MachineState, MemoryFault, SP, SnapshotError, Vcpu};
 
@@ -306,6 +308,7 @@ impl<V: Vcpu + Clone> Container<V> {
     /// its own memory, on `vcpu`, and standard streams, `cwd` for its working
     /// directory, and the container's filesystem and network, and no parent
     /// to wait for it: `exit_of` says when it has ended. Returns its pid.
+    #[allow(clippy::too_many_arguments)] // what a program starts with: all of it is wanted
     pub fn spawn(
         &mut self,
         vcpu: V,
@@ -314,9 +317,12 @@ impl<V: Vcpu + Clone> Container<V> {
         envp: &[String],
         cwd: &str,
         stdio: Stdio,
+        terminal: Option<(i32, Arc<AtomicU32>)>,
     ) -> Result<u32, StartError> {
         let pid = self.next_pid;
         let mut process = Process::new(pid, stdio, 0, 0);
+        // Its own terminal, or none: not the container's
+        process.terminal = Some(terminal.as_ref().map(|(fd, _)| *fd));
         if let Some(root) = &self.root {
             process.set_root(root).map_err(|_| StartError::NoRoot)?;
         }
@@ -328,6 +334,14 @@ impl<V: Vcpu + Clone> Container<V> {
         load(&mut task, elf, exe, argv, envp)?;
         self.next_pid += 1;
         self.tasks.insert(pid, task);
+        if let Some((fd, typed)) = terminal {
+            self.linux.terminals.push(Terminal {
+                fd,
+                typed,
+                foreground: pid,
+                pid,
+            });
+        }
         Ok(pid)
     }
 
@@ -342,6 +356,7 @@ impl<V: Vcpu + Clone> Container<V> {
             return None;
         };
         self.tasks.remove(&pid);
+        self.linux.terminals.retain(|terminal| terminal.pid != pid);
         Some(termination.status())
     }
 
@@ -383,6 +398,17 @@ impl<V: Vcpu + Clone> Container<V> {
             if typed != 0 {
                 let foreground = self.group(self.linux.foreground);
                 self.raise(&foreground, typed);
+            }
+            // And at the terminal of a program `docker exec` added, to its own
+            let typed: Vec<(u32, u32)> = (self.linux.terminals.iter())
+                .filter_map(|t| match t.typed.swap(0, Ordering::SeqCst) {
+                    0 => None,
+                    signal => Some((t.foreground, signal)),
+                })
+                .collect();
+            for (foreground, signal) in typed {
+                let group = self.group(foreground);
+                self.raise(&group, signal);
             }
             let mut progress = false;
             let tids: Vec<u32> = self.tasks.keys().copied().collect();

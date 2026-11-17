@@ -56,6 +56,19 @@ pub struct Stdio {
     pub stderr: Box<dyn Write + Send>,
 }
 
+/// A terminal of its own that a program `docker exec` added has: the host
+/// terminal behind its standard streams, and where the keys typed at it that
+/// send signals are noted, for the container to deliver.
+#[derive(Debug, Clone)]
+pub struct Terminal {
+    pub fd: i32,
+    pub typed: Arc<std::sync::atomic::AtomicU32>,
+    /// The terminal's foreground process group, which typed signals go to
+    pub foreground: u32,
+    /// The program the terminal was made for
+    pub pid: u32,
+}
+
 /// How a process ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Termination {
@@ -199,6 +212,8 @@ pub struct Linux {
     pub terminal: Option<i32>,
     /// The terminal's foreground process group, which typed signals go to.
     pub foreground: u32,
+    /// The terminals of the programs `docker exec` added with `-t`
+    pub terminals: Vec<Terminal>,
     /// The container's network, which its processes' sockets are in (see `net`)
     net: Arc<Mutex<net::Net>>,
 }
@@ -209,6 +224,10 @@ pub struct Process {
     pub ppid: u32,
     pub pgid: u32,
     pub sid: u32,
+    /// The terminal behind this process's standard streams: None for the
+    /// container's (`Linux::terminal`), or what a program `docker exec` added
+    /// has, which may be no terminal at all.
+    pub terminal: Option<Option<i32>>,
     files: FdTable,
     root: Option<Arc<RootFs>>,
     cwd: Vec<u8>,
@@ -262,6 +281,7 @@ impl Linux {
             processes: Vec::new(),
             terminal: None,
             foreground: 1,
+            terminals: Vec::new(),
             net: Arc::default(),
         }
     }
@@ -281,6 +301,7 @@ impl Linux {
             processes: Vec::new(),
             terminal: None,
             foreground: 1,
+            terminals: Vec::new(),
             net: Arc::default(),
         }
     }
@@ -553,6 +574,18 @@ impl Linux {
         }
     }
 
+    /// The host terminal behind a process's standard streams, if they are one.
+    fn terminal_of(&self, p: &Process) -> Option<i32> {
+        p.terminal.unwrap_or(self.terminal)
+    }
+
+    /// The foreground process group of the host terminal `fd`.
+    fn foreground_of(&self, fd: i32) -> u32 {
+        (self.terminals.iter())
+            .find(|terminal| terminal.fd == fd)
+            .map_or(self.foreground, |terminal| terminal.foreground)
+    }
+
     /// Terminal requests on the standard streams, when they are a host
     /// terminal: its settings and window size are the host terminal's, and
     /// the foreground process group is the container's own. Anything else is
@@ -578,7 +611,7 @@ impl Linux {
         /// `struct termios` without speeds, and `struct winsize`
         const TERMIOS: usize = 36;
         const WINSIZE: usize = 8;
-        let Some(host) = self.terminal.filter(|_| p.is_stdio_stream(fd)) else {
+        let Some(host) = self.terminal_of(p).filter(|_| p.is_stdio_stream(fd)) else {
             return Err(Errno::ENOTTY);
         };
         let pass = |request: u32, buf: &mut [u8]| -> Result<(), Errno> {
@@ -607,11 +640,18 @@ impl Linux {
                 vcpu.read_mem(arg, &mut buf[..size])?;
                 pass(request, &mut buf)?;
             }
-            TIOCGPGRP => vcpu.write_mem(arg, &self.foreground.to_le_bytes())?,
+            TIOCGPGRP => {
+                let foreground = self.foreground_of(host);
+                vcpu.write_mem(arg, &foreground.to_le_bytes())?
+            }
             TIOCSPGRP => {
                 let mut pgid = [0u8; 4];
                 vcpu.read_mem(arg, &mut pgid)?;
-                self.foreground = u32::from_le_bytes(pgid);
+                let pgid = u32::from_le_bytes(pgid);
+                match self.terminals.iter_mut().find(|t| t.fd == host) {
+                    Some(terminal) => terminal.foreground = pgid,
+                    None => self.foreground = pgid,
+                }
             }
             TIOCSCTTY => {}
             _ => return Err(Errno::ENOTTY),
@@ -660,7 +700,7 @@ impl Linux {
                 let events = u16::from_le_bytes(entry[4..6].try_into().unwrap());
                 let mut revents = 0;
                 if fd >= 0 {
-                    let is_terminal = self.terminal.is_some() && p.is_stdio_stream(fd as u32);
+                    let is_terminal = self.terminal_of(p).is_some() && p.is_stdio_stream(fd as u32);
                     let (found, on_terminal) = p.poll_ready(fd as u32, events, is_terminal);
                     revents = if on_terminal && host_ready {
                         events & POLLIN
@@ -677,7 +717,7 @@ impl Linux {
         let (mut ready, terminal) = poll(p, &mut entries, false);
         if ready == 0
             && terminal
-            && let Some(host) = self.terminal
+            && let Some(host) = self.terminal_of(p)
         {
             // Wait on the host terminal itself, as a read of it would
             let millis = wait_ns.map_or(-1, |ns| (ns / 1_000_000).min(i32::MAX as u64) as i32);
@@ -781,6 +821,7 @@ impl Process {
             ppid: 0,
             pgid: pid,
             sid: pid,
+            terminal: None,
             files: FdTable::new(stdio),
             root: None,
             cwd: b"/".to_vec(),
@@ -884,6 +925,7 @@ impl Process {
             ppid: self.pid,
             pgid: self.pgid,
             sid: self.sid,
+            terminal: self.terminal,
             files: self.files.fork(),
             root: self.root.clone(),
             cwd: self.cwd.clone(),

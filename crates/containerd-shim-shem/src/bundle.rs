@@ -115,7 +115,6 @@ impl Bundle {
 /// pause` and `docker commit` ask, until it is resumed.
 /// A program `docker exec` adds to a running container: where its streams
 /// are, and where to say how it ended.
-#[derive(Debug)]
 pub struct ExecRequest {
     pub args: Vec<String>,
     pub env: Vec<String>,
@@ -125,6 +124,35 @@ pub struct ExecRequest {
     pub stderr: String,
     /// Told the exit status, or 137 if the container ends first
     pub done: Sender<u8>,
+    /// With `docker exec -t`: the program gets a terminal of its own
+    pub terminal: bool,
+    /// Where the program's terminal's resizer is put, once it has one
+    pub resizer: ResizerSlot,
+}
+
+impl std::fmt::Debug for ExecRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecRequest")
+            .field("args", &self.args)
+            .field("terminal", &self.terminal)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Sets the window size of a terminal, from its rows and columns.
+pub type Resizer = Box<dyn Fn(u16, u16) + Send>;
+/// Where a program's `Resizer` waits for a request to change the window size.
+pub type ResizerSlot = Arc<Mutex<Option<Resizer>>>;
+
+/// What closes with a program `docker exec` added, if anything does: its terminal.
+type Finish = Option<Box<dyn FnOnce()>>;
+
+/// A program `docker exec` added that is running: its process, who is waiting
+/// to hear how it ended, and what ends with it (its terminal).
+struct Joined {
+    pid: u32,
+    done: Sender<u8>,
+    finish: Finish,
 }
 
 #[derive(Debug, Default)]
@@ -171,6 +199,18 @@ impl Control {
             || TERMINAL_SIGNAL.load(Ordering::SeqCst) != 0
             || self.joined.load(Ordering::SeqCst) > 0
             || !self.spawns.lock().unwrap().is_empty()
+    }
+
+    /// Whether a program is waiting to join the container, or it is to stop or pause.
+    fn joiners_or_stop(&self) -> bool {
+        self.interrupted() || !self.spawns.lock().unwrap().is_empty()
+    }
+
+    /// Wait until a program asks to join the container, or it is to stop or pause.
+    fn idle(&self) {
+        while !self.joiners_or_stop() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Ask for a program to join the running container. False if the
@@ -364,8 +404,11 @@ fn run_on<V: Vcpu + Clone>(
     let result = run_container(bundle, stdio, control, terminal, slice, &vcpu, &mut running);
     // Whatever joined the container goes with it, and nothing can join now
     control.end();
-    for (_, done) in running {
-        let _ = done.send(137);
+    for joined in running {
+        if let Some(finish) = joined.finish {
+            finish();
+        }
+        let _ = joined.done.send(137);
     }
     result
 }
@@ -377,7 +420,7 @@ fn run_container<V: Vcpu + Clone>(
     terminal: Option<i32>,
     slice: u64,
     vcpu: &impl Fn(u32) -> anyhow::Result<V>,
-    running: &mut Vec<(u32, Sender<u8>)>,
+    running: &mut Vec<Joined>,
 ) -> anyhow::Result<u8> {
     let mut container = if let Some(frozen) = warm_state(&bundle.root)? {
         let vcpu = vcpu(frozen.machine.mem.len() as u32)?;
@@ -415,6 +458,18 @@ fn run_container<V: Vcpu + Clone>(
             Err(RunError::Deadlock) if !running.is_empty() => {
                 std::thread::sleep(Duration::from_millis(5));
             }
+            // Or all of them wait for what only a client can give, as a
+            // server does for the client `docker exec` adds: on Linux that
+            // waits as long as it takes, until a program joins or it is stopped
+            Err(RunError::Deadlock) => {
+                if !control.joiners_or_stop() {
+                    log::warn!(
+                        "every process waits, on nothing a program running here can give: \
+                         waiting for `docker exec` or a stop"
+                    );
+                    control.idle();
+                }
+            }
             Err(err) => return Err(err.into()),
         }
         join_programs(&mut container, bundle, control, vcpu, running);
@@ -434,11 +489,15 @@ fn join_programs<V: Vcpu + Clone>(
     bundle: &Bundle,
     control: &Control,
     vcpu: &impl Fn(u32) -> anyhow::Result<V>,
-    running: &mut Vec<(u32, Sender<u8>)>,
+    running: &mut Vec<Joined>,
 ) {
     for request in control.take_execs() {
         match join(container, bundle, &request, vcpu) {
-            Ok(pid) => running.push((pid, request.done)),
+            Ok((pid, finish)) => running.push(Joined {
+                pid,
+                done: request.done,
+                finish,
+            }),
             Err(err) => {
                 log::warn!("exec {:?}: {err:#}", request.args);
                 if let Ok(mut stderr) = std::fs::OpenOptions::new()
@@ -452,13 +511,21 @@ fn join_programs<V: Vcpu + Clone>(
             }
         }
     }
-    running.retain(|(pid, done)| match container.exit_of(*pid) {
+    let mut ended = Vec::new();
+    running.retain_mut(|joined| match container.exit_of(joined.pid) {
         Some(status) => {
-            let _ = done.send(status);
+            ended.push((joined.finish.take(), joined.done.clone(), status));
             false
         }
         None => true,
     });
+    for (finish, done, status) in ended {
+        // Its last output goes through its terminal before it is said to have ended
+        if let Some(finish) = finish {
+            finish();
+        }
+        let _ = done.send(status);
+    }
     control.joined.store(running.len() as u32, Ordering::SeqCst);
     control.steps.store(container.steps, Ordering::SeqCst);
     control
@@ -502,7 +569,7 @@ fn join<V: Vcpu + Clone>(
     bundle: &Bundle,
     request: &ExecRequest,
     vcpu: &impl Fn(u32) -> anyhow::Result<V>,
-) -> anyhow::Result<u32> {
+) -> anyhow::Result<(u32, Finish)> {
     let name = request.args.first().context("no program to run")?;
     let rootfs = RootFs::new(&bundle.root).context("the bundle's root filesystem")?;
     let cwd = if request.cwd.is_empty() {
@@ -517,8 +584,68 @@ fn join<V: Vcpu + Clone>(
     };
     let program = find_program(&rootfs, cwd, env, name)?;
     let elf = std::fs::read(program)?;
-    let stdio = exec_stdio(request)?;
-    Ok(container.spawn(vcpu(bundle.memory)?, &elf, &request.args, env, cwd, stdio)?)
+    let (stdio, terminal, finish) = if request.terminal {
+        exec_terminal(request)?
+    } else {
+        (exec_stdio(request)?, None, None)
+    };
+    let pid = container.spawn(
+        vcpu(bundle.memory)?,
+        &elf,
+        &request.args,
+        env,
+        cwd,
+        stdio,
+        terminal,
+    )?;
+    Ok((pid, finish))
+}
+
+/// The streams of a program `docker exec -t` added, the terminal's descriptor
+/// with where its typed signals are noted, and what closes it.
+type ExecTerminal = (Stdio, Option<(i32, Arc<AtomicU32>)>, Finish);
+
+/// The streams of a program `docker exec -t` added: a terminal between the
+/// FIFOs containerd made and the program, and what closes it when the
+/// program has ended.
+#[cfg(target_os = "linux")]
+fn exec_terminal(request: &ExecRequest) -> anyhow::Result<ExecTerminal> {
+    use crate::console::Console;
+    use std::os::unix::fs::OpenOptionsExt;
+    let stdin = if request.stdin.is_empty() {
+        None
+    } else {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&request.stdin)?;
+        // Typing is copied on a thread of its own, which waits for it
+        // SAFETY: fcntl on a descriptor `file` owns
+        unsafe {
+            let fd = file.as_raw_fd();
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+        Some(file)
+    };
+    let typed = Arc::new(AtomicU32::new(0));
+    let (console, stdio) = Console::open_exec(stdin, &request.stdout, typed.clone())?;
+    let resizer = console.resizer()?;
+    let signals = typed.clone();
+    *request.resizer.lock().unwrap() = Some(Box::new(move |rows, cols| {
+        resizer.resize_for(rows, cols, Some(&signals));
+    }));
+    let fd = console.fd();
+    Ok((
+        stdio,
+        Some((fd, typed)),
+        Some(Box::new(|| console.finish())),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exec_terminal(_: &ExecRequest) -> anyhow::Result<ExecTerminal> {
+    bail!("a terminal for `docker exec -t` needs Linux")
 }
 
 /// Pause the program until it is resumed, frozen into `/.shem` in its root

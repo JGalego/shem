@@ -95,12 +95,12 @@ Implementation: [`bundle.rs`](../crates/containerd-shim-shem/src/bundle.rs) load
 
 ## Exec and statistics
 
-`docker exec CONTAINER PROGRAM` starts another program in a running program container, with its own memory and streams, in the container's filesystem and network (its sockets included: a program and a client `exec` adds can talk), and ends with the program's status. `-i` gives it stdin; `-t` is not supported for an exec. The program joins at the next slice, about a hundredth of a second on the reference vCPU. A container whose init is blocked for good on something only a client would give it (an `accept` waiting for an `exec`'d client) is reported as deadlocked before the client can start, so start servers beside their clients, from one init.
+`docker exec CONTAINER PROGRAM` starts another program in a running program container, with its own memory and streams, in the container's filesystem and network (its sockets included: a program and a client `exec` adds can talk), and ends with the program's status. `-i` gives it stdin, and `-t` a terminal of its own (as for `docker run -t`, but the program's: its settings, its window size, and the keys that send signals, which go to its foreground process group and not the container's). The program joins at the next slice, about a hundredth of a second on the reference vCPU. A container whose processes are all blocked for good on something only a client would give it (an `accept` waiting for an `exec`'d client) waits, as on Linux, for a program to join or for a stop, so a server can be started first and its client added with `docker exec`.
 
 `docker stats` and `kubectl top` read the container's statistics, which the shim reports as cgroup v2 metrics: the processes it has, the CPU time its instructions took on the virtual clock (one nanosecond each), and its guest memory.
 
 ## Not yet
 
-- Checkpoints, and `docker exec -t`.
+- Checkpoints.
 
 Model containers support `exec`, `commit` and terminal input too; see [sessions under Docker](models.md#sessions-under-docker).

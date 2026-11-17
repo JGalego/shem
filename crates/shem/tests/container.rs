@@ -407,7 +407,15 @@ fn a_process_spawned_into_a_running_container_runs_beside_init_and_reports_how_i
     };
     let argv = ["exec".to_string(), "a".to_string()];
     let pid = container
-        .spawn(ReferenceVcpu::new(MEM), &joined, &argv, &[], "/", stdio)
+        .spawn(
+            ReferenceVcpu::new(MEM),
+            &joined,
+            &argv,
+            &[],
+            "/",
+            stdio,
+            None,
+        )
         .unwrap();
     assert!(pid > 1);
     assert_eq!(container.exit_of(pid), None, "it has not run yet");

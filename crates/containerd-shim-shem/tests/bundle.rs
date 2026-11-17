@@ -381,6 +381,8 @@ fn a_program_docker_exec_adds_runs_in_the_container_and_says_how_it_ended() {
         stdout: said.to_string_lossy().into_owned(),
         stderr: String::new(),
         done,
+        terminal: false,
+        resizer: Default::default(),
     }));
     // It ran beside init, and ended with the status its program gave
     assert_eq!(ended.recv_timeout(Duration::from_secs(30)), Ok(0));
@@ -401,6 +403,155 @@ fn a_program_docker_exec_adds_runs_in_the_container_and_says_how_it_ended() {
         stdout: String::new(),
         stderr: String::new(),
         done,
+        terminal: false,
+        resizer: Default::default(),
     }));
     assert!(ended.recv_timeout(Duration::from_secs(1)).is_err());
+}
+
+/// Write `program` in the root of the bundle in `dir` as /bin/`name`.
+fn add_program(dir: &std::path::Path, name: &str, program: Vec<u8>) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("rootfs/bin").join(name);
+    std::fs::write(&path, program).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A container whose init waits on a futex nothing will wake, as a server does
+/// for a client yet to come, running on a thread: it ends with a kill.
+fn waiting_container() -> (
+    tempfile::TempDir,
+    Arc<Control>,
+    std::thread::JoinHandle<anyhow::Result<u8>>,
+) {
+    let mut code = Vec::from(li(10, BASE + 84));
+    code.extend([
+        addi(11, 0, 128), // FUTEX_WAIT_PRIVATE
+        addi(12, 0, 0),
+        addi(13, 0, 0),
+        addi(17, 0, 98),
+        ECALL,
+        addi(10, 0, 0),
+        addi(17, 0, 93),
+        ECALL,
+    ]);
+    let dir = bundle_with(elf(&code, &[0; 4]));
+    let bundle = Bundle::load(dir.path()).unwrap();
+    let control = Arc::new(Control::default());
+    let stdio = Stdio {
+        stdin: Box::new(std::io::empty()),
+        stdout: Box::new(std::io::sink()),
+        stderr: Box::new(std::io::sink()),
+    };
+    let run = {
+        let control = control.clone();
+        std::thread::spawn(move || bundle::run(&bundle, stdio, &control, None))
+    };
+    (dir, control, run)
+}
+
+/// A request to run `program` in a container, its output to the file `out`.
+fn exec_request(
+    program: &str,
+    out: &std::path::Path,
+    stdin: &std::path::Path,
+    terminal: bool,
+) -> (
+    containerd_shim_shem::bundle::ExecRequest,
+    std::sync::mpsc::Receiver<u8>,
+) {
+    let (done, ended) = std::sync::mpsc::channel();
+    let request = containerd_shim_shem::bundle::ExecRequest {
+        args: vec![program.into()],
+        env: Vec::new(),
+        cwd: String::new(),
+        stdin: stdin.to_string_lossy().into_owned(),
+        stdout: out.to_string_lossy().into_owned(),
+        stderr: String::new(),
+        done,
+        terminal,
+        resizer: Default::default(),
+    };
+    (request, ended)
+}
+
+#[test]
+fn a_container_with_every_process_waiting_for_a_client_waits_for_docker_exec() {
+    let (dir, control, run) = waiting_container();
+    add_program(dir.path(), "client", greeter(b"client\n"));
+    // Not reported as deadlocked, as it was before the client could start
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!run.is_finished());
+
+    let streams = tempfile::tempdir().unwrap();
+    let said = streams.path().join("stdout");
+    std::fs::write(&said, "").unwrap();
+    let (request, ended) = exec_request("/bin/client", &said, std::path::Path::new(""), false);
+    assert!(control.exec(request));
+    assert_eq!(ended.recv_timeout(Duration::from_secs(30)), Ok(3));
+    assert_eq!(std::fs::read(&said).unwrap(), b"client\n");
+
+    // It still waits, until it is stopped
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!run.is_finished());
+    control.kill(15);
+    assert_eq!(run.join().unwrap().unwrap(), 128 + 15);
+}
+
+/// A program that asks for its terminal's settings, and ends with the answer:
+/// 0 for a terminal, and ENOTTY (25) negated, which is 231, for anything else.
+fn tty_check() -> Vec<u8> {
+    let mut code = vec![addi(10, 0, 0)];
+    code.extend(li(11, 0x5401)); // TCGETS
+    code.extend(li(12, BASE + 84));
+    code.extend([addi(17, 0, 29), ECALL, addi(17, 0, 93), ECALL]);
+    elf(&code, &[0; 64])
+}
+
+#[test]
+fn docker_exec_t_gives_the_program_a_terminal_of_its_own_and_its_keys_signal_it() {
+    let (dir, control, run) = waiting_container();
+    add_program(dir.path(), "tty", tty_check());
+    add_program(dir.path(), "spin", elf(&[0x0000_006f], &[])); // j .
+    let streams = tempfile::tempdir().unwrap();
+    let out = streams.path().join("stdout");
+    std::fs::write(&out, "").unwrap();
+    let nothing = std::path::Path::new("");
+
+    // With -t its standard streams are a terminal, and without, they are not one
+    let (request, ended) = exec_request("/bin/tty", &out, nothing, true);
+    assert!(control.exec(request));
+    assert_eq!(ended.recv_timeout(Duration::from_secs(30)), Ok(0));
+    let (request, ended) = exec_request("/bin/tty", &out, nothing, false);
+    assert!(control.exec(request));
+    assert_eq!(ended.recv_timeout(Duration::from_secs(30)), Ok(231));
+
+    // Ctrl-C typed at the program's terminal signals the program, and only it
+    let fifo = streams.path().join("stdin");
+    let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a NUL-terminated path
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let mut typed = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .unwrap();
+    let (request, ended) = exec_request("/bin/spin", &out, &fifo, true);
+    let resizer = request.resizer.clone();
+    assert!(control.exec(request));
+    // The terminal is made as the program joins: its window can be set then
+    while resizer.lock().unwrap().is_none() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    (resizer.lock().unwrap().as_ref().unwrap())(24, 80);
+    assert_eq!(
+        ended.recv_timeout(Duration::from_millis(300)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    typed.write_all(&[0x03]).unwrap(); // ^C
+    // SIGWINCH from the resize did not end it, and the init did not take the ^C
+    assert_eq!(ended.recv_timeout(Duration::from_secs(30)), Ok(128 + 2));
+    assert!(!run.is_finished());
+    control.kill(15);
+    assert_eq!(run.join().unwrap().unwrap(), 128 + 15);
 }
