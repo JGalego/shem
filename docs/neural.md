@@ -1,6 +1,6 @@
 # The neural vCPU
 
-The neural vCPU is an RV32IM CPU compiled into network weights. One forward pass executes one instruction per guest in a batch. It implements the same [`Vcpu` interface](../crates/shem/src/vcpu.rs) as the reference interpreter, accessed over a Unix socket.
+The neural vCPU is an RV32IM CPU compiled into network weights. It does not run compressed (C extension) instructions, which the reference vCPU does for a program built with them: it refuses such a program, and a snapshot of one, with an error. One forward pass executes one instruction per guest in a batch. It implements the same [`Vcpu` interface](../crates/shem/src/vcpu.rs) as the reference interpreter, accessed over a Unix socket.
 
 Like [Qwenputer](https://divagr.com/blog/qwenputer), it uses compiled CPU layers and delta-rule memory. Unlike Qwenputer, it is a standalone network, not part of a pretrained language model.
 

@@ -7,7 +7,7 @@ Planned work, in no fixed order. See [architecture](docs/architecture.md) for th
 - **Neural execution.** Narrower types for bits, fewer tensor operations per step, and GPU execution in the vCPU server.
 - **Builds and filesystems.** A layer-digest build cache, overlayfs instead of copied filesystems, and coherence between processes sharing writable file mappings.
 - **Guest coverage.** `/proc/PID/fd`, datagram sockets and a network beyond the container, and VM block and network devices.
-- **Guest reach.** The C extension (compressed instructions, on both vCPUs), and Rust and other languages' targets for RV32 Linux; more interpreters and databases as examples, as Lua is.
+- **Guest reach.** The C extension on the neural vCPU (the reference vCPU runs compressed programs), and Rust and other languages' targets for RV32 Linux; more interpreters and databases as examples, as Lua is.
 - **Multimodal models.** Vision encoders as a block type, so that the images of a chat request reach the model.
 - **ISA validation.** Cross-check the reference interpreter against Spike too: random programs already run against QEMU's user-mode emulator in CI.
 

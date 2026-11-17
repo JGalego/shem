@@ -23,7 +23,7 @@ The project is experimental. Current features include:
 - **VMs.** Boot no-MMU [🐧 Linux](https://kernel.org) 6.8 with `shem boot`, or resume a booted VM image on either vCPU ([VM mode](docs/vm.md)).
 - **[🐳 Docker](https://www.docker.com), [📦 containerd](https://containerd.io) and Kubernetes.** Run images through `io.containerd.shem.v1`, including live model sessions with `docker exec` and `docker commit`, and programs that `docker commit` freezes mid-run, and mount model images as Kubernetes image volumes for model servers ([containerd](docs/containerd.md), [Kubernetes](docs/kubernetes.md)).
 - **Neural vCPU.** Execute RV32IM instructions with [🔥 PyTorch](https://pytorch.org), one instruction per forward pass. Tests compare it with the reference interpreter. The server batches compatible guests and shares memory pages; GPU benchmarks use [🤗 Hugging Face Jobs](https://huggingface.co/docs/huggingface_hub/guides/jobs) ([design and benchmarks](docs/neural.md)).
-- **Reference vCPU.** A [🦀 Rust](https://www.rust-lang.org) RV32IM interpreter used for differential testing and build-time snapshots. It passes the official riscv-tests, with atomics emulated by the host.
+- **Reference vCPU.** A [🦀 Rust](https://www.rust-lang.org) RV32IM interpreter used for differential testing and build-time snapshots. It passes the official riscv-tests, the C extension's included, with atomics emulated by the host.
 
 Two things are separate today, and the tagline stretches both. The CPU is a standalone compiled network, not part of any language model's weights; a model calls programs on it through the host, as a tool call that runs `shem run --vcpu neural`, and the two share no state. And a model image's session is the model's own state, not guest RAM. [What is and is not in the weights](docs/architecture.md#what-is-in-the-weights-and-what-is-not) says what it would take to join them.
 
@@ -161,7 +161,7 @@ What shem does not do, today:
 
 - **Run fast.** It is not tuned: PyTorch on a CPU is far slower than llama.cpp's quantized kernels on the same machine (not benchmarked here), and there are no paged attention, no speculative decoding and only int8, not 4-bit, weights. GGUF files are dequantized at import.
 - **Run every model.** The families in the [list](docs/models.md#imported-models), text only: no vision towers, no JSON-constrained decoding.
-- **Run a general guest.** Programs are static RV32IM Linux executables (musl, soft-float, no compressed instructions); VMs boot no-MMU Linux with no block or network devices. The neural vCPU runs about a thousand instructions a second, so it is a demonstration of the idea more than a way to run programs.
+- **Run a general guest.** Programs are static RV32IM Linux executables (musl, soft-float; compressed instructions run on the reference vCPU, built with `RV32_C=1`, and not on the neural one); VMs boot no-MMU Linux with no block or network devices. The neural vCPU runs about a thousand instructions a second, so it is a demonstration of the idea more than a way to run programs.
 - **Join the CPU and the model.** They are [separate networks](docs/architecture.md#what-is-in-the-weights-and-what-is-not).
 - **Be stable.** The status is experimental: formats and flags may change between releases.
 

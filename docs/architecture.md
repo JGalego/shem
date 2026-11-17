@@ -40,7 +40,7 @@ The tagline says containers run inside a model's weights. Precisely:
 | Guest runs | Programs, with the host as their kernel | A kernel and its programs |
 | Guest exits on | System calls | Device access, traps, timer ticks |
 | Host provides | Linux system calls ([`linux/`](../crates/shem/src/linux/)) | The machine: CSRs, traps, a timer, a UART and a syscon ([vm.md](vm.md)) |
-| ISA needed | RV32IM; the host emulates the A extension | RV32IM too; the host emulates A, the CSRs and traps |
+| ISA needed | RV32IM (and C, on the reference vCPU, for a program built with it: the ELF header's RVC flag turns it on); the host emulates the A extension | RV32IM too; the host emulates A, the CSRs and traps |
 | Start | Load an ELF into memory, or thaw a warm image | Boot a kernel, or thaw a booted VM |
 
 ## The vCPU interface
@@ -86,7 +86,7 @@ Both vCPUs must satisfy:
 | Docker, containerd and Kubernetes | [containerd shim](containerd.md) and [RuntimeClass](kubernetes.md) |
 | Builds | `shem build` and a Go [BuildKit frontend](shemfile.md#with-docker-build) |
 | Guest toolchain | Zig targeting `riscv32-linux-musl`, in [`toolchain/Dockerfile`](../toolchain/Dockerfile) |
-| ISA | The reference vCPU passes the riscv-tests, and agrees with QEMU's user-mode emulator on random RV32IM programs ([`tests/external.rs`](../crates/shem/tests/external.rs), in CI) |
+| ISA | The reference vCPU passes the riscv-tests (rv32uc, the C extension, included), and agrees with QEMU's user-mode emulator on random RV32IM programs, and on programs with compressed instructions among them ([`tests/external.rs`](../crates/shem/tests/external.rs), in CI) |
 | Tests | `cargo test --workspace`, `just guest-tests`, `just neural-tests`, and the integration jobs in [CI](../.github/workflows/ci.yml) |
 
 ## Roadmap

@@ -15,6 +15,8 @@ pub struct ReferenceVcpu {
     /// with a memory fault, which in VM mode is how devices are reached.
     base: u32,
     instret: u64,
+    /// Runs 16-bit instructions too (the C extension), as a program built with it needs
+    compressed: bool,
 }
 
 impl ReferenceVcpu {
@@ -30,6 +32,7 @@ impl ReferenceVcpu {
             mem: vec![0; mem_size as usize],
             base,
             instret: 0,
+            compressed: false,
         }
     }
 
@@ -41,17 +44,29 @@ impl ReferenceVcpu {
     /// Execute one instruction. On `Err`, no architectural state has changed.
     fn step(&mut self) -> Result<(), ExitReason> {
         let pc = self.pc;
-        if pc & 3 != 0 {
+        if pc & if self.compressed { 1 } else { 3 } != 0 {
             return Err(ExitReason::MemoryFault(pc));
         }
-        let ins = self.load(pc, 4)?;
+        // The length of the instruction, and its 32-bit form: a compressed one is expanded
+        let mut len = 4;
+        let mut ins = 0;
+        if self.compressed {
+            let half = self.load(pc, 2)?;
+            if half & 3 != 3 {
+                len = 2;
+                ins = expand_compressed(half as u16).ok_or(ExitReason::IllegalInstruction(half))?;
+            }
+        }
+        if len == 4 {
+            ins = self.load(pc, 4)?;
+        }
         let rd = ((ins >> 7) & 31) as usize;
         let f3 = (ins >> 12) & 7;
         let f7 = ins >> 25;
         let a = self.regs[((ins >> 15) & 31) as usize];
         let b = self.regs[((ins >> 20) & 31) as usize];
         let illegal = ExitReason::IllegalInstruction(ins);
-        let mut next = pc.wrapping_add(4);
+        let mut next = pc.wrapping_add(len);
 
         let value = match ins & 0x7f {
             // OP: register-register ALU, and the M extension
@@ -113,12 +128,12 @@ impl ReferenceVcpu {
             0x6f => {
                 // JAL
                 next = pc.wrapping_add(j_imm(ins));
-                Some(pc.wrapping_add(4))
+                Some(pc.wrapping_add(len))
             }
             0x67 if f3 == 0 => {
                 // JALR
                 next = a.wrapping_add(i_imm(ins)) & !1;
-                Some(pc.wrapping_add(4))
+                Some(pc.wrapping_add(len))
             }
             // FENCE and FENCE.I are no-ops on a single in-order hart.
             0x0f => None,
@@ -207,6 +222,12 @@ impl Vcpu for ReferenceVcpu {
         self.regs = [0; 32];
         self.pc = 0;
         self.mem.fill(0);
+        self.compressed = false;
+    }
+
+    fn set_compressed(&mut self, on: bool) -> bool {
+        self.compressed = on;
+        true
     }
 
     fn run(&mut self, budget: u64) -> Exit {
@@ -235,6 +256,7 @@ impl Vcpu for ReferenceVcpu {
             regs: self.regs,
             instret: self.instret,
             mem: self.mem.clone(),
+            compressed: self.compressed,
         }
     }
 
@@ -249,6 +271,7 @@ impl Vcpu for ReferenceVcpu {
         self.regs = state.regs;
         self.regs[0] = 0;
         self.instret = state.instret;
+        self.compressed = state.compressed;
         self.mem.copy_from_slice(&state.mem);
         Ok(())
     }
@@ -307,4 +330,131 @@ fn j_imm(ins: u32) -> u32 {
         | (ins & 0xf_f000)
         | ((ins >> 9) & 0x800)
         | ((ins >> 20) & 0x7fe)
+}
+
+/// The 32-bit instruction a compressed (16-bit) one stands for, or None if it
+/// is illegal or one of the floating-point and RV64 forms RV32IM has none of.
+pub fn expand_compressed(h: u16) -> Option<u32> {
+    let h = u32::from(h);
+    let rd_full = (h >> 7) & 31;
+    let rs2_full = (h >> 2) & 31;
+    let rd3 = 8 + ((h >> 2) & 7); // the registers x8..x15 of the compact forms
+    let rs1_3 = 8 + ((h >> 7) & 7);
+    // The sign-extended 6-bit immediate of C.ADDI, C.LI and C.ANDI
+    let imm6 = (((h >> 7) & 0x20) | ((h >> 2) & 0x1f)) as i32;
+    let imm6 = (imm6 << 26 >> 26) as u32;
+    let i_type = |imm: u32, rs1: u32, f3: u32, rd: u32, op: u32| {
+        (imm & 0xfff) << 20 | rs1 << 15 | f3 << 12 | rd << 7 | op
+    };
+    let r_type = |f7: u32, rs2: u32, rs1: u32, f3: u32, rd: u32| {
+        f7 << 25 | rs2 << 20 | rs1 << 15 | f3 << 12 | rd << 7 | 0x33
+    };
+    let s_type = |imm: u32, rs2: u32, rs1: u32| {
+        ((imm >> 5) & 0x7f) << 25 | rs2 << 20 | rs1 << 15 | 2 << 12 | (imm & 0x1f) << 7 | 0x23
+    };
+    let b_type = |imm: u32, rs1: u32, f3: u32| {
+        ((imm >> 12) & 1) << 31
+            | ((imm >> 5) & 0x3f) << 25
+            | rs1 << 15
+            | f3 << 12
+            | ((imm >> 1) & 0xf) << 8
+            | ((imm >> 11) & 1) << 7
+            | 0x63
+    };
+    let j_type = |imm: u32, rd: u32| {
+        ((imm >> 20) & 1) << 31
+            | ((imm >> 1) & 0x3ff) << 21
+            | ((imm >> 11) & 1) << 20
+            | ((imm >> 12) & 0xff) << 12
+            | rd << 7
+            | 0x6f
+    };
+    // C.J and C.JAL's offset, sign-extended from 12 bits
+    let j_imm = {
+        let imm = ((h >> 1) & 0x800)
+            | ((h << 2) & 0x400)
+            | ((h >> 1) & 0x300)
+            | ((h << 1) & 0x80)
+            | ((h >> 1) & 0x40)
+            | ((h << 3) & 0x20)
+            | ((h >> 7) & 0x10)
+            | ((h >> 2) & 0xe);
+        (imm << 20) as i32 >> 20
+    } as u32;
+    // C.BEQZ and C.BNEZ's offset, sign-extended from 9 bits
+    let b_imm = {
+        let imm = ((h >> 4) & 0x100)
+            | ((h << 1) & 0xc0)
+            | ((h << 3) & 0x20)
+            | ((h >> 7) & 0x18)
+            | ((h >> 2) & 0x6);
+        (imm << 23) as i32 >> 23
+    } as u32;
+    // The offsets of the word loads and stores
+    let lw_imm = ((h >> 7) & 0x38) | ((h >> 4) & 0x4) | ((h << 1) & 0x40);
+    let shamt = (h >> 2) & 0x1f;
+    let shamt_ok = h & 0x1000 == 0; // a shift past 31 is RV64's
+
+    match (h & 3, h >> 13) {
+        // C.ADDI4SPN: addi rd', x2, nzuimm
+        (0, 0) => {
+            let imm = ((h >> 7) & 0x30) | ((h >> 1) & 0x3c0) | ((h >> 4) & 0x4) | ((h >> 2) & 0x8);
+            (imm != 0).then(|| i_type(imm, 2, 0, rd3, 0x13))
+        }
+        (0, 2) => Some(i_type(lw_imm, rs1_3, 2, rd3, 0x03)), // C.LW
+        (0, 6) => Some(s_type(lw_imm, rd3, rs1_3)),          // C.SW
+        (1, 0) => Some(i_type(imm6, rd_full, 0, rd_full, 0x13)), // C.ADDI, C.NOP
+        (1, 1) => Some(j_type(j_imm, 1)),                    // C.JAL
+        (1, 2) => Some(i_type(imm6, 0, 0, rd_full, 0x13)),   // C.LI
+        (1, 3) if rd_full == 2 => {
+            // C.ADDI16SP
+            let imm = ((h >> 3) & 0x200)
+                | ((h >> 2) & 0x10)
+                | ((h << 1) & 0x40)
+                | ((h << 4) & 0x180)
+                | ((h << 3) & 0x20);
+            let imm = ((imm << 22) as i32 >> 22) as u32;
+            (imm != 0).then(|| i_type(imm, 2, 0, 2, 0x13))
+        }
+        (1, 3) => {
+            // C.LUI
+            (imm6 != 0).then_some((imm6 << 12 & 0xffff_f000) | rd_full << 7 | 0x37)
+        }
+        (1, 4) => {
+            let rd = rs1_3;
+            match (h >> 10) & 3 {
+                0 => shamt_ok.then(|| i_type(shamt, rd, 5, rd, 0x13)), // C.SRLI
+                1 => shamt_ok.then(|| i_type(0x400 | shamt, rd, 5, rd, 0x13)), // C.SRAI
+                2 => Some(i_type(imm6, rd, 7, rd, 0x13)),              // C.ANDI
+                _ if h & 0x1000 != 0 => None,
+                _ => {
+                    let (f7, f3) = [(0x20, 0), (0, 4), (0, 6), (0, 7)][((h >> 5) & 3) as usize];
+                    Some(r_type(f7, rd3, rd, f3, rd)) // C.SUB, C.XOR, C.OR, C.AND
+                }
+            }
+        }
+        (1, 5) => Some(j_type(j_imm, 0)),        // C.J
+        (1, 6) => Some(b_type(b_imm, rs1_3, 0)), // C.BEQZ
+        (1, 7) => Some(b_type(b_imm, rs1_3, 1)), // C.BNEZ
+        (2, 0) => shamt_ok.then(|| i_type(shamt, rd_full, 1, rd_full, 0x13)), // C.SLLI
+        (2, 2) => {
+            // C.LWSP
+            let imm = ((h >> 2) & 0x1c) | ((h >> 7) & 0x20) | ((h << 4) & 0xc0);
+            (rd_full != 0).then(|| i_type(imm, 2, 2, rd_full, 0x03))
+        }
+        (2, 4) => Some(match (h & 0x1000 != 0, rs2_full) {
+            (false, 0) if rd_full != 0 => i_type(0, rd_full, 0, 0, 0x67), // C.JR
+            (false, 0) => return None,
+            (false, rs2) => r_type(0, rs2, 0, 0, rd_full), // C.MV
+            (true, 0) if rd_full == 0 => 0x0010_0073,      // C.EBREAK
+            (true, 0) => i_type(0, rd_full, 0, 1, 0x67),   // C.JALR
+            (true, rs2) => r_type(0, rs2, rd_full, 0, rd_full), // C.ADD
+        }),
+        (2, 6) => {
+            // C.SWSP
+            let imm = ((h >> 7) & 0x3c) | ((h >> 1) & 0xc0);
+            Some(s_type(imm, rs2_full, 2))
+        }
+        _ => None,
+    }
 }

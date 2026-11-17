@@ -40,9 +40,11 @@ RUN curl -fsSL "https://github.com/riscv-software-src/riscv-tests/archive/$RISCV
 COPY riscv-tests/riscv_test.h env/shem/riscv_test.h
 # -mno-relax: the tests use gp as their test counter, so the linker must not
 # relax addresses against it.
+# rv32uc is built with the C extension, which only the reference vCPU runs.
 RUN mkdir /out \
-    && for suite in rv32ui rv32um rv32ua; do \
+    && for suite in rv32ui rv32um rv32ua rv32uc; do \
         for src in isa/"$suite"/*.S; do \
+            if [ "$suite" = rv32uc ]; then export RV32_C=1; else unset RV32_C; fi; \
             rv32-cc -nostdlib -mno-relax -I env/shem -I isa/macros/scalar \
                 -o "/out/$suite-$(basename "$src" .S)" "$src" || exit 1; \
         done; \

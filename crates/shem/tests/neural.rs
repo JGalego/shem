@@ -119,6 +119,14 @@ fn riscv_tests_run_identically_on_both_vcpus() {
     let mut tests: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("build riscv-tests first: just neural-tests")
         .map(|entry| entry.unwrap().path())
+        // rv32uc is compressed code, which only the reference vCPU runs
+        .filter(|path| {
+            !path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("rv32uc")
+        })
         .collect();
     tests.sort();
     assert!(tests.len() >= 60);

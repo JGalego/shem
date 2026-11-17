@@ -182,6 +182,82 @@ fn program(seed: u64, ops: usize) -> Vec<u8> {
     elf(&code, &data)
 }
 
+/// The compressed instructions a random program may use: the register and
+/// immediate ones of `data/compressed.txt`, which cannot fault, and leave
+/// gp (x3, the data's address) and sp (whose value is the host's) alone.
+fn compressed_pool() -> Vec<u16> {
+    const FORMS: [&str; 14] = [
+        "c.addi ", "c.li ", "c.lui ", "c.slli ", "c.srli ", "c.srai ", "c.andi ", "c.mv ",
+        "c.add ", "c.sub ", "c.xor ", "c.or ", "c.and ", "c.nop",
+    ];
+    include_str!("data/compressed.txt")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let half = u16::from_str_radix(fields.next()?, 16).ok()?;
+            let text = line.splitn(3, ' ').nth(2)?;
+            // gp holds the data's address, and sp is where QEMU puts the stack and shem does not
+            let uses_gp_or_sp = text
+                .split([' ', ','])
+                .any(|token| token == "x3" || token == "x2");
+            (FORMS.iter().any(|form| text.starts_with(form)) && !uses_gp_or_sp).then_some(half)
+        })
+        .collect()
+}
+
+/// As `program`, with compressed instructions among the others, and 32-bit ones on any halfword.
+fn program_c(seed: u64, ops: usize) -> Vec<u8> {
+    let pool = compressed_pool();
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let mut halves: Vec<u16> = Vec::new();
+    let full = |code: &mut Vec<u16>, word: u32| code.extend([word as u16, (word >> 16) as u16]);
+    for word in li(GP, DATA) {
+        full(&mut halves, word);
+    }
+    for &reg in &REGS {
+        for word in li(reg, rng.value()) {
+            full(&mut halves, word);
+        }
+    }
+    for _ in 0..ops {
+        if rng.below(2) == 0 {
+            halves.push(rng.pick(&pool));
+            continue;
+        }
+        let word = instruction(&mut rng);
+        full(&mut halves, word);
+        if word & 0x7f == 0x63 {
+            let (rd, rs1) = (rng.pick(&REGS), rng.pick(&REGS));
+            full(&mut halves, r(0x00, 0, rd, rs1, rs1));
+        }
+    }
+    let mut tail: Vec<u32> = Vec::new();
+    for (slot, &reg) in REGS.iter().enumerate() {
+        tail.push(sw(reg, GP, 4 * slot as i32));
+    }
+    tail.extend([addi(A0, ZERO, 1)]);
+    tail.extend(li(A1, DATA));
+    tail.extend([
+        addi(A2, ZERO, (4 * REGS.len()) as i32),
+        addi(A7, ZERO, 64),
+        ECALL,
+    ]);
+    tail.extend([addi(A0, ZERO, 0), addi(A7, ZERO, 93), ECALL]);
+    for word in tail {
+        full(&mut halves, word);
+    }
+    if halves.len() & 1 == 1 {
+        halves.push(0x0001); // c.nop, to fill the last word
+    }
+    let code: Vec<u32> = halves
+        .chunks(2)
+        .map(|pair| u32::from(pair[0]) | u32::from(pair[1]) << 16)
+        .collect();
+    let data: Vec<u8> = (0..DATA_BYTES).map(|_| rng.next() as u8).collect();
+    elf_with_flags(&code, &data, 0x1)
+}
+
 /// What the program writes when shem runs it.
 fn on_shem(program: &[u8]) -> Vec<u8> {
     let (mut container, stdout) = start(program, &["p"], &[], 1 << 20).unwrap();
@@ -220,6 +296,35 @@ fn random_programs_end_with_every_register_stored_on_shem() {
     // And the same program gives the same answer
     assert_eq!(on_shem(&program(7, 150)), on_shem(&program(7, 150)));
     assert_ne!(on_shem(&program(7, 150)), on_shem(&program(8, 150)));
+}
+
+#[test]
+fn random_compressed_programs_end_with_every_register_stored_on_shem() {
+    assert!(compressed_pool().len() > 1000);
+    for seed in 0..20 {
+        assert_eq!(
+            on_shem(&program_c(seed, 150)).len(),
+            4 * REGS.len(),
+            "seed {seed}"
+        );
+    }
+    assert_ne!(on_shem(&program_c(7, 150)), on_shem(&program_c(8, 150)));
+}
+
+#[test]
+#[ignore = "needs qemu-riscv32 (the qemu-user package), which CI installs"]
+fn the_reference_vcpu_agrees_with_qemu_on_random_compressed_programs() {
+    let qemu = qemu().expect("qemu-riscv32 (or SHEM_QEMU) is needed");
+    let dir = tempfile::tempdir().unwrap();
+    let count: u64 = std::env::var("SHEM_RANDOM_PROGRAMS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(300);
+    for seed in 0..count {
+        let program = program_c(seed, 200);
+        let (ours, theirs) = (on_shem(&program), on_qemu(&qemu, &program, dir.path()));
+        assert_eq!(ours, theirs, "seed {seed}: the registers differ");
+    }
 }
 
 #[test]

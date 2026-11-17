@@ -274,6 +274,9 @@ impl Vcpu for NeuralVcpu {
     }
 
     fn restore(&mut self, state: &MachineState) -> Result<(), SnapshotError> {
+        if state.compressed {
+            return Err(SnapshotError::Compressed);
+        }
         if state.mem.len() != self.mem_size as usize {
             return Err(SnapshotError::MemorySize {
                 expected: self.mem_size as usize,

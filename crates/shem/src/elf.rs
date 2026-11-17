@@ -24,8 +24,9 @@ const AT_PAGESZ: u32 = 6;
 const AT_ENTRY: u32 = 9;
 const AT_HWCAP: u32 = 16;
 const AT_RANDOM: u32 = 25;
-/// One bit per single-letter ISA extension: I and M.
+/// One bit per single-letter ISA extension: I and M, and C when the program has it.
 const HWCAP_RV32IM: u32 = (1 << (b'I' - b'A')) | (1 << (b'M' - b'A'));
+const HWCAP_C: u32 = 1 << (b'C' - b'A');
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ElfError {
@@ -35,7 +36,9 @@ pub enum ElfError {
     WrongArch,
     #[error("only static executables are supported (link with -static or -static-pie)")]
     NotStatic,
-    #[error("compressed instructions are not supported (build with -march=rv32im)")]
+    #[error(
+        "this vCPU does not run compressed instructions (build with -march=rv32im, or use the reference vCPU)"
+    )]
     Compressed,
     #[error("hardware floating-point ABIs are not supported (build with -mabi=ilp32)")]
     FloatAbi,
@@ -54,6 +57,8 @@ pub struct Image {
     /// Guest address of the program headers, if a loaded segment covers them.
     pub phdr: Option<u32>,
     pub phnum: u32,
+    /// The program uses compressed (16-bit) instructions
+    pub compressed: bool,
     segments: Vec<Segment>,
 }
 
@@ -82,9 +87,6 @@ pub fn parse(data: &[u8], mem_size: u32) -> Result<Image, ElfError> {
         _ => return Err(ElfError::NotStatic),
     };
     let flags = u32_at(data, 36)?;
-    if flags & EF_RISCV_RVC != 0 {
-        return Err(ElfError::Compressed);
-    }
     if flags & EF_RISCV_FLOAT_ABI != 0 {
         return Err(ElfError::FloatAbi);
     }
@@ -140,6 +142,7 @@ pub fn parse(data: &[u8], mem_size: u32) -> Result<Image, ElfError> {
         brk,
         phdr,
         phnum,
+        compressed: flags & EF_RISCV_RVC != 0,
         segments,
     })
 }
@@ -147,6 +150,10 @@ pub fn parse(data: &[u8], mem_size: u32) -> Result<Image, ElfError> {
 /// Place the executable `data` in guest memory.
 pub fn load(vcpu: &mut dyn Vcpu, data: &[u8]) -> Result<Image, ElfError> {
     let image = parse(data, vcpu.mem_size())?;
+    // A vCPU that cannot run them refuses the program; one that can, runs it as it is built
+    if !vcpu.set_compressed(image.compressed) {
+        return Err(ElfError::Compressed);
+    }
     for segment in &image.segments {
         let fits = |_: MemoryFault| ElfError::DoesNotFit(segment.vaddr);
         let bytes = &data[segment.offset..segment.offset + segment.filesz as usize];
@@ -187,7 +194,7 @@ pub fn setup_stack(
         AT_ENTRY,
         image.entry,
         AT_HWCAP,
-        HWCAP_RV32IM,
+        HWCAP_RV32IM | if image.compressed { HWCAP_C } else { 0 },
         AT_RANDOM,
         random,
         AT_NULL,

@@ -172,11 +172,6 @@ fn step_limit_stops_runaway_guests() {
 #[test]
 fn rejects_executables_it_cannot_run() {
     let start_err = |elf: &[u8]| start(elf, &["prog"], &[], MEM).err().map(|e| e.to_string());
-    let compressed = elf_with_flags(&[ECALL], &[], 0x1);
-    assert_eq!(
-        start_err(&compressed),
-        Some(ElfError::Compressed.to_string())
-    );
     let hard_float = elf_with_flags(&[ECALL], &[], 0x4);
     assert_eq!(start_err(&hard_float), Some(ElfError::FloatAbi.to_string()));
     assert_eq!(start_err(b"#!/bin/sh"), Some(ElfError::NotElf.to_string()));

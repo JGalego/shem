@@ -56,7 +56,7 @@ fn riscv_tests_pass() {
     tests.sort();
     assert!(
         tests.len() >= 60,
-        "expected the rv32ui, rv32um and rv32ua suites"
+        "expected the rv32ui, rv32um, rv32ua and rv32uc suites"
     );
 
     let failures: Vec<String> = tests
@@ -89,6 +89,29 @@ fn c_program_runs_against_musl() {
          sum of squares below 100000 = 333328333350000\n"
     );
     assert_eq!(out.unsupported, [] as [u32; 0], "unsupported system calls");
+}
+
+#[test]
+#[ignore = "needs guest binaries: run `just guest-tests`"]
+fn a_program_and_its_libc_built_with_the_c_extension_run() {
+    let out = run(&built("guests/hello-c"), &["hello", "one", "two"]);
+    assert_eq!(out.result, Ok(3));
+    assert_eq!(
+        out.stdout,
+        "argv[0] = hello\nargv[1] = one\nargv[2] = two\n\
+         sum of squares below 100000 = 333328333350000\n"
+    );
+    assert_eq!(out.unsupported, [] as [u32; 0], "unsupported system calls");
+    // It really is compressed: the ELF header says so, and the program is smaller than without
+    let elf = std::fs::read(built("guests/hello-c")).unwrap();
+    assert_eq!(elf[36] & 1, 1, "e_flags has the RVC bit");
+    let plain = std::fs::read(built("guests/hello")).unwrap();
+    assert!(
+        elf.len() < plain.len(),
+        "{} against {}",
+        elf.len(),
+        plain.len()
+    );
 }
 
 #[test]

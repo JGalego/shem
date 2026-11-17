@@ -45,7 +45,7 @@ cc *args: toolchain
     docker run --rm -u "$(id -u):$(id -g)" \
         -v "{{ invocation_directory() }}:/src" \
         -v "{{ justfile_directory() }}/target/zig-cache:/zig-cache" \
-        -e ZIG_GLOBAL_CACHE_DIR=/zig-cache -e RV32_PIE \
+        -e ZIG_GLOBAL_CACHE_DIR=/zig-cache -e RV32_PIE -e RV32_C \
         {{ toolchain_image }} rv32-cc "$@"
 
 # Build the guest programs (riscv-tests, guests/, BusyBox, examples/) and run them; needs Docker
@@ -57,6 +57,7 @@ guest-tests: toolchain busybox-image
     just cc -O2 -o target/guests/threads guests/threads.c
     just cc -O2 -o target/guests/sockets guests/sockets.c
     RV32_PIE=1 just cc -O2 -o target/guests/hello-pie guests/hello.c
+    RV32_C=1 just cc -O2 -o target/guests/hello-c guests/hello.c
     cargo test --release --test guests -- --ignored
 
 # Test the neural vCPU: its own unit tests, then against the reference vCPU; needs Docker and uv
