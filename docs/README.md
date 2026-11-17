@@ -32,4 +32,6 @@ Programs use the reference interpreter by default. `--vcpu neural` selects a sta
 | Run and benchmark the compiled CPU | [Neural vCPU](neural.md) |
 | Understand the runtime and its limits | [Architecture](architecture.md) |
 
+shem is experimental, and not fast: the project README says [when to use it, and when not to](https://github.com/JGalego/shem#when-to-use-shem-and-when-not-to), against Ollama, Docker Model Runner, RamaLama and KitOps.
+
 The source is at [github.com/JGalego/shem](https://github.com/JGalego/shem).

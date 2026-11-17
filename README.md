@@ -143,6 +143,28 @@ sudo rm /usr/local/bin/containerd-shim-shem-v1
 
 shem runs a ModelPack artifact through its [image twin](docs/models.md#modelpack-artifacts): an image over the artifact's own layers, plus a layer with `shem.json`, whose `subject` is the artifact. `shem run` and `FROM` take an artifact like an image. When the artifact's layers are tars, the twin and the artifact share their weights' blobs in a registry. Raw layers, modctl's default, have to be wrapped, and so copied. The other way, `shem push --modelpack` publishes a model image as a ModelPack artifact over the image's own blobs, with the image as its `subject`. Those blobs are compressed with zstd, which modctl 0.2 can't extract; `--uncompressed` writes plain tars, with the files at the root as modctl packs them, which it extracts into a checkpoint that transformers loads.
 
+## When to use shem, and when not to
+
+shem is a research project that is also a working tool. Reach for it when what you want is the **container** half of the idea: a model as an OCI image that `docker build`, `docker push`, `docker run`, Kubernetes and `oras` handle like any other, with its prompt, tools and a primed session frozen in layers, replies you can check with a [receipt](docs/models.md#receipts), and a runtime small enough to read. Reach for something else when what you want is raw speed.
+
+| | shem | [Ollama](https://ollama.com) | [Docker Model Runner](https://docs.docker.com/ai/model-runner/) | [RamaLama](https://ramalama.ai) | [KitOps](https://kitops.org) |
+|---|---|---|---|---|---|
+| What it is | A container runtime whose images are models, programs and VMs | A local model server with its own library and Modelfiles | Docker's feature for running models pulled as OCI artifacts | A tool that runs models in containers on Podman or Docker | Packaging of ML projects as OCI artifacts (ModelKits) |
+| Inference engine | PyTorch, from the checkpoint's own tensors | llama.cpp | llama.cpp (and others) on the host | llama.cpp, vLLM and others, in a container | None: it packages and unpacks |
+| Model in a registry | A container image, or [a ModelPack artifact](docs/models.md#modelpack-artifacts) | Its own registry's blobs | An OCI artifact | OCI artifacts and others | An OCI artifact |
+| Speed on a CPU | Slow: float32 or bfloat16 PyTorch, or int8 weights; 7 tokens a second for Qwen3-0.6B on one machine's CPU | The reference for local speed, with quantized weights | As llama.cpp | As llama.cpp | Not applicable |
+| Beyond chat | Programs and VMs as images, tools on a compiled CPU, receipts | Library of models, embeddings, multimodal | Part of Docker's tooling | Container-based isolation of the runtime | Versioned, signed project bundles |
+
+The rows for other tools are as their documentation describe them at the time of writing; they change, so check them. None of them is a replacement for the others.
+
+What shem does not do, today:
+
+- **Run fast.** It is not tuned: PyTorch on a CPU is far slower than llama.cpp's quantized kernels on the same machine (not benchmarked here), and there are no paged attention, no speculative decoding and only int8, not 4-bit, weights. GGUF files are dequantized at import.
+- **Run every model.** The families in the [list](docs/models.md#imported-models), text only: no vision towers, no JSON-constrained decoding.
+- **Run a general guest.** Programs are static RV32IM Linux executables (musl, soft-float, no compressed instructions); VMs boot no-MMU Linux with no block or network devices. The neural vCPU runs about a thousand instructions a second, so it is a demonstration of the idea more than a way to run programs.
+- **Join the CPU and the model.** They are [separate networks](docs/architecture.md#what-is-in-the-weights-and-what-is-not).
+- **Be stable.** The status is experimental: formats and flags may change between releases.
+
 ## Architecture
 
 [![OCI registries store the images. Docker reaches the host through the containerd shim; the shem CLI drives it directly. The host provides syscalls or VM devices and runs a neural or reference vCPU.](https://raw.githubusercontent.com/JGalego/shem/main/docs/assets/architecture.svg)](https://github.com/JGalego/shem/blob/main/docs/architecture.md)
