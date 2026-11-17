@@ -49,6 +49,7 @@ dev = [
     "accelerate>=1.15.0",
     "gguf>=0.19.0",
     "pytest>=8",
+    "pytest-cov>=7.1.0",
     "transformers>=5.22.2",
 ]
 

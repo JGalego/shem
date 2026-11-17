@@ -28,6 +28,7 @@ cargo test --workspace
 uv run --project neural pytest neural/tests
 (cd frontend && go vet ./... && go test ./...)
 cargo deny check                              # requires cargo-deny
+scripts/mypy-ratchet                          # no new type errors in neural/
 ```
 
 The hooks also lint Dockerfiles and Shemfiles with [hadolint](https://github.com/hadolint/hadolint), in its Docker image, through [`scripts/hadolint`](scripts/hadolint), which turns shem's own instructions into comments first. Run it alone with `pre-commit run hadolint --all-files`.

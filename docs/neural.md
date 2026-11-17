@@ -87,7 +87,7 @@ The **dense** executor defines the network. The **fused** executor computes the 
 | Byte to bits, 5-bit index | One-hot times a table | Index into the table |
 | Division | 32 unrolled layers | Integer division, with RISC-V's rules for zero |
 
-Both skip multiplication, division and the shifter, and the fused one the memory read and write, when no guest in the batch needs them: an ALU loop's instruction costs about two thirds of what it did. What would cut it further is not done: several instructions per forward pass, narrower types for bits, and the server's vCPUs on a GPU (only [the harness](#on-gpus) runs there). Tests compare unit results, edge cases and whole programs.
+Both skip multiplication, division and the shifter, and the fused one the memory read and write, when no guest in the batch needs them: an ALU loop's instruction costs about half of what it did. What would cut it further is not done: several instructions per forward pass, narrower types for bits, and the server's vCPUs on a GPU (only [the harness](#on-gpus) runs there). Tests compare unit results, edge cases and whole programs.
 
 For GPUs, **static** mode runs every unit and uses **flat** memory: one byte array per guest, with disabled writes sent to a scratch byte. This removes data-dependent control flow for compilation and CUDA graphs ([On GPUs](#on-gpus)).
 
@@ -115,13 +115,13 @@ Recorded CPU results from [`bench.py`](../neural/bench.py), using one core and a
 
 | Guests | Instructions/s, total | Per guest | Memory pages |
 |---|---|---|---|
-| 1 | 881 | 881 | 2 |
-| 8 | 5,725 | 716 | 9 |
-| 32 | 18,384 | 575 | 33 |
-| 64 | 27,985 | 437 | 65 |
-| 128 | 29,318 | 229 | 129 |
+| 1 | 1,569 | 1,569 | 2 |
+| 8 | 10,999 | 1,375 | 9 |
+| 32 | 41,468 | 1,296 | 33 |
+| 64 | 76,320 | 1,193 | 65 |
+| 128 | 82,897 | 648 | 129 |
 
-At 64 guests, aggregate throughput is about 32 times the single-guest result, but per-guest throughput has fallen from 881 to 437 instructions/s. Batching improves throughput, not individual guest latency. The pages column includes the shared zero page and one private 4 KiB page per guest; a dense float64 state for 1 MiB of guest RAM takes 8 MiB.
+At 64 guests, aggregate throughput is about 49 times the single-guest result, but per-guest throughput has fallen from 1,569 to 1,193 instructions/s. (An earlier release's numbers on another machine were 881 and 28,000 at 1 and 64 guests; CI checks the ratio, [`bench.py --check`](../neural/bench.py), as machines' speeds differ.) Batching improves throughput, not individual guest latency. The pages column includes the shared zero page and one private 4 KiB page per guest; a dense float64 state for 1 MiB of guest RAM takes 8 MiB.
 
 ## The protocol
 
@@ -157,7 +157,7 @@ just gpu-job l4x1
 
 It compares 1,024 random-program guests against the CPU executor for 512 steps in each GPU mode, then benchmarks batches of 1–32,768 guests with 64 KiB each. Registers, memory, pc, instruction count and exits match bit-for-bit on L4 and A100. Integer intermediates stay below 2^53 and are exactly representable in float64.
 
-Instructions per second, with torch 2.15 and CUDA 13.2 (the CPU row is the paged executor on one core, from [Speed](#speed)):
+Instructions per second, with torch 2.15 and CUDA 13.2 (the CPU row is the paged executor on one core, from [Speed](#speed), as measured for an earlier release):
 
 | Guests | CPU | L4, best mode | A100, eager | A100, compiled + graph | A100, eager + graph |
 |---|---|---|---|---|---|

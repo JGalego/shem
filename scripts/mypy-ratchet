@@ -1,0 +1,29 @@
+#!/bin/sh
+# Type-check the neural package with mypy, and fail on any error that is not in
+# neural/mypy-baseline.txt: the errors there are known, and the list should
+# only shrink. Line numbers are left out of it, so editing code near a known
+# error does not make a new one.
+#
+#   scripts/mypy-ratchet            check
+#   scripts/mypy-ratchet --update   write the baseline from what mypy says now
+set -eu
+cd "$(dirname "$0")/../neural"
+baseline=mypy-baseline.txt
+current=$(mktemp)
+trap 'rm -f "$current"' EXIT
+uv run --quiet --with mypy mypy --ignore-missing-imports --no-error-summary --no-pretty src \
+    | grep ': error:' | sed -E 's/:[0-9]+: /: /' | sort -u > "$current" || true
+if [ "${1:-}" = "--update" ]; then
+    cp "$current" "$baseline"
+    echo "wrote $(wc -l < "$baseline") known errors to neural/$baseline"
+    exit 0
+fi
+new=$(comm -13 "$baseline" "$current")
+if [ -n "$new" ]; then
+    echo "mypy found errors that are not in neural/$baseline:"
+    echo "$new"
+    echo "Fix them, or, if they are known, run scripts/mypy-ratchet --update."
+    exit 1
+fi
+fixed=$(comm -23 "$baseline" "$current" | wc -l)
+echo "no new type errors ($(wc -l < "$current") known, $fixed fixed since the baseline: --update drops them)"

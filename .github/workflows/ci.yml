@@ -74,6 +74,60 @@ jobs:
       - name: Run random RV32IM programs here and on QEMU, and compare their registers
         run: cargo test --release --test external -- --ignored
 
+  types:
+    name: Types (no new mypy errors)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: neural/uv.lock
+      - name: Type-check the neural package against its baseline of known errors
+        run: scripts/mypy-ratchet
+
+  coverage:
+    name: Coverage (Rust and Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: neural/uv.lock
+      - name: Rust coverage of the tests that need nothing built
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path target/rust.lcov
+          cargo llvm-cov report --summary-only | tee target/rust-coverage.txt
+          { echo '### Rust coverage'; echo '```'; tail -n 3 target/rust-coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Python coverage
+        run: |
+          uv run --project neural pytest -q neural/tests --cov=shem_neural --cov-report=term --cov-report=xml:target/python.xml | tee target/python-coverage.txt
+          { echo '### Python coverage'; echo '```'; tail -n 4 target/python-coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: target/*.lcov target/python.xml target/*-coverage.txt
+
+  benchmark:
+    name: Benchmark (batching still pays)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: neural/uv.lock
+      - name: Run the neural vCPU's benchmark, and fail if 64 guests no longer beat one by eight times
+        run: uv run --project neural python neural/bench.py --check
+
   neural:
     name: Neural vCPU (against the reference)
     runs-on: ubuntu-latest
