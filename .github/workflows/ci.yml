@@ -63,6 +63,17 @@ jobs:
       - name: Build guests in Docker and run them
         run: just guest-tests
 
+  isa:
+    name: ISA (reference vCPU against QEMU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user
+      - name: Run random RV32IM programs here and on QEMU, and compare their registers
+        run: cargo test --release --test external -- --ignored
+
   neural:
     name: Neural vCPU (against the reference)
     runs-on: ubuntu-latest

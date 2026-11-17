@@ -86,6 +86,7 @@ Both vCPUs must satisfy:
 | Docker, containerd and Kubernetes | [containerd shim](containerd.md) and [RuntimeClass](kubernetes.md) |
 | Builds | `shem build` and a Go [BuildKit frontend](shemfile.md#with-docker-build) |
 | Guest toolchain | Zig targeting `riscv32-linux-musl`, in [`toolchain/Dockerfile`](../toolchain/Dockerfile) |
+| ISA | The reference vCPU passes the riscv-tests, and agrees with QEMU's user-mode emulator on random RV32IM programs ([`tests/external.rs`](../crates/shem/tests/external.rs), in CI) |
 | Tests | `cargo test --workspace`, `just guest-tests`, `just neural-tests`, and the integration jobs in [CI](../.github/workflows/ci.yml) |
 
 ## Roadmap
