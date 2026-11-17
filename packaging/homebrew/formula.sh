@@ -18,6 +18,10 @@ class Shem < Formula
       url "$url/shem-$version-aarch64-apple-darwin.tar.gz"
       sha256 "$(sha aarch64-apple-darwin)"
     end
+    on_intel do
+      url "$url/shem-$version-x86_64-apple-darwin.tar.gz"
+      sha256 "$(sha x86_64-apple-darwin)"
+    end
   end
 
   on_linux do

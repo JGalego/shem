@@ -59,6 +59,8 @@ jobs:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, packages: -p shem -p containerd-shim-shem }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, packages: -p shem -p containerd-shim-shem }
           - { os: macos-latest, target: aarch64-apple-darwin, packages: -p shem }
+          # Built on Apple Silicon for Intel Macs, which GitHub's runners no longer offer
+          - { os: macos-latest, target: x86_64-apple-darwin, packages: -p shem }
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -67,18 +69,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked ${{ matrix.packages }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.packages }}
       - name: Package
         run: |
           name="shem-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          out="target/${{ matrix.target }}/release"
           mkdir "$name"
-          cp target/release/shem LICENSE README.md "$name/"
-          # Completions for the shells, and the manual pages, made by the binary they describe
-          mkdir -p "$name/completions"
-          for shell in bash zsh fish; do target/release/shem completions "$shell" > "$name/completions/shem.$shell"; done
-          target/release/shem man "$name/man"
-          if [ -f target/release/containerd-shim-shem-v1 ]; then cp target/release/containerd-shim-shem-v1 "$name/"; fi
+          cp "$out/shem" LICENSE README.md "$name/"
+          if [ -f "$out/containerd-shim-shem-v1" ]; then cp "$out/containerd-shim-shem-v1" "$name/"; fi
+          # Completions for the shells, and the manual pages, made by the binary they describe,
+          # which a build for another architecture than the runner's may not be able to run
+          if "$out/shem" --version >/dev/null 2>&1; then
+            mkdir -p "$name/completions"
+            for shell in bash zsh fish; do "$out/shem" completions "$shell" > "$name/completions/shem.$shell"; done
+            "$out/shem" man "$name/man"
+          fi
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/attest-build-provenance@v4
