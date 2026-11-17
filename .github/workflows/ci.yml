@@ -72,7 +72,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y qemu-user
       - name: Run random RV32IM programs here and on QEMU, and compare their registers
-        run: cargo test --release --test external -- --ignored
+        run: cargo test --release --test external -- --ignored qemu
+
+  spike:
+    name: ISA (reference vCPU against Spike)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y device-tree-compiler libboost-regex-dev libboost-system-dev
+      # Spike takes minutes to build: kept until its pinned commit changes
+      - uses: actions/cache@v6
+        id: spike
+        with:
+          path: ~/spike
+          key: spike-${{ hashFiles('scripts/install-spike') }}
+      - if: steps.spike.outputs.cache-hit != 'true'
+        run: PREFIX=$HOME/spike scripts/install-spike
+      - name: Run random RV32IM programs, plain and compressed, here and on Spike, and compare what they computed
+        run: PATH=$HOME/spike/bin:$PATH cargo test --release --test external -- --ignored spike
 
   types:
     name: Types (no new mypy errors)
