@@ -41,6 +41,7 @@ from pathlib import Path
 import torch
 
 from . import sampling
+from .vision import plain
 
 FORMAT = "shem.receipt/v1"
 #: The margin under which another device may choose another token, by the
@@ -120,7 +121,7 @@ def record_messages(
     The `prompt` is the last user message, for whoever reads it."""
     choices = session.choices or []
     drawn = session.sampler is not None and not session.sampler.greedy
-    user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+    user = next((plain(m["content"]) for m in reversed(messages) if m["role"] == "user"), "")
     return {
         "format": FORMAT,
         **(subjects or {}),
@@ -148,6 +149,7 @@ def replay_messages(model, tokenizer, checked: dict, out=None) -> tuple[int, str
     session.choices = []
     if checked.get("sampling"):
         session.sampler = Sampler(**checked["sampling"])
+    session.attach_images(messages)
     session.feed(tokenizer.chat(messages))
     made = Reply(
         session,

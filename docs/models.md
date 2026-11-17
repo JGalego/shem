@@ -154,6 +154,7 @@ Unsupported settings, such as dynamic NTK scaling or activations other than SiLU
 | [google/gemma-3-270m-it](https://huggingface.co/google/gemma-3-270m-it) | 18 attention (15 with sliding windows) with norms around them and on queries and keys, 18 GeGLU MLP | 39 layers | The same, against transformers' Gemma 3 |
 | [allenai/OLMo-2-0425-1B-Instruct](https://huggingface.co/allenai/OLMo-2-0425-1B-Instruct) | 16 attention with norms after them and on all queries and keys, 16 MLP | 35 layers | The same, against transformers' OLMo 2 |
 | [ibm-granite/granite-3.1-1b-a400m-instruct](https://huggingface.co/ibm-granite/granite-3.1-1b-a400m-instruct) | 24 attention, 24 mixtures of 32 stacked experts, 8 per token, with Granite's multipliers | 51 layers | The same, against transformers' GraniteMoe |
+| [HuggingFaceTB/SmolVLM-256M-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) | 30 attention, 30 MLP, and the [image encoder](#images): 12 SigLIP-style layers and a pixel-shuffle connector | 60 layers and the encoder | The same, against transformers' Idefics3, with an image: the processor's tokens, its pixels (1e-7) and the logits of the pass (3e-5 in float32) |
 | [state-spaces/mamba-130m-hf](https://huggingface.co/state-spaces/mamba-130m-hf) | 24 Mamba | 27 layers | The same, against transformers' Mamba, with a template that runs a base model's text together |
 | [Qwen/Qwen3-0.6B-GGUF](https://huggingface.co/Qwen/Qwen3-0.6B-GGUF) `:Q8_0` | As Qwen3-0.6B, dequantized | 59 layers | Logits within 1e-3 of transformers' own dequantization, and the same chat template |
 
@@ -171,7 +172,7 @@ Larger float32 comparisons use a [Hugging Face Job](https://huggingface.co/docs/
 | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) | 48 attention, 48 mixtures of 128 experts, 8 per token | The same, against transformers' Qwen3-MoE |
 | [mistralai/Mixtral-8x7B-Instruct-v0.1](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1) | 32 attention, 32 mixtures of 8 experts, 2 per token | In bfloat16, as below: its 47 billion parameters take 188 GB in float32 |
 
-Qwen3.5 and Gemma 3 4B imports are text-only: vision encoders are omitted, as is Qwen3.5's multi-token prediction layer, and the API takes no images. A vision tower is a block type that does not exist yet (the importers would read its tensors, a `vision` block would turn pixels into the embeddings a prompt holds); that is not started.
+Qwen3.5 and Gemma 3 4B imports are text-only: their vision encoders are omitted, as is Qwen3.5's multi-token prediction layer, and the API takes no images for them. SmolVLM and Idefics3 are the vision-language families whose [encoder](#images) shem runs.
 
 Download-based tests in [`test_model.py`](../neural/tests/test_model.py) require `SHEM_MODEL_TESTS=1`. Add the larger-model flags as needed:
 
@@ -187,6 +188,26 @@ SHEM_MODEL_TESTS=1 SHEM_LARGE_MODEL_TESTS=1 \
 ```
 
 Bfloat16 checks require next-token agreement at 90% or more of prompt positions and final-logit cosine similarity above 0.99. Gated models require access and a Hugging Face token; CI skips them, while `just models-job` forwards your token.
+
+## Images
+
+A vision-language model of the SmolVLM family (its `SmolVLMForConditionalGeneration` and `Idefics3ForConditionalGeneration` checkpoints) reads pictures. The import keeps its image encoder beside the language model, as a `vision` section of the manifest whose tensors count in the fingerprint, and writes into the tokenizer's section how an image is written in the chat: the image token, how many of them an image takes, and the tokens around them. A model without one refuses an image with a 400 rather than ignoring it.
+
+An image reaches the model in three steps:
+
+1. **Pixels.** The picture is decoded with Pillow (the `images` extra of shem-neural, in the `shem-neural` image), converted to RGB and resized as the model's processor does: its longest edge made 4 times the encoder's size with Lanczos resampling, then the encoder's square, then scaled to [0, 1] and normalized. The pixels match transformers' for the same picture to 1e-7. Pictures past 64 megapixels are refused before they are decoded.
+2. **Rows.** The encoder, a transformer over 16-pixel patches, and the connector that folds neighbouring patches into one (SmolVLM-256M: 1,024 patches into 64) and projects them to the language model's width, make one row for each image token. They are computed once for a picture and kept for the next turns of the conversation.
+3. **Tokens.** The chat template writes one `<image>` where a message has an image, and the tokenizer expands it into the run the model was trained on (`<fake_token_around_image><global-img>`, 64 image tokens and `<fake_token_around_image>`). The session puts the rows in place of those tokens' embeddings as it reads them, so what the model attends to is the picture, and its state afterwards, saved or committed, is the same as for any session.
+
+`shem run` takes `--image FILE`, as many as the first prompt needs:
+
+```sh
+shem run hf.co/HuggingFaceTB/SmolVLM-256M-Instruct --image cat.png "What is in this picture?"
+```
+
+The API takes them as OpenAI's does, in a user's message: `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`, beside text parts, in any order. The URL must be a `data:` URL: shem never fetches a link, which would let a request make the server reach into the network around it. The image's tokens count in `usage`, and count against the context window. A `shem_receipt` carries the pictures, as data URLs, with the messages, so `shem replay` reads the same ones; check the receipt's size before you share it.
+
+What shem leaves out: the processor's default for a large picture is to cut it into 512-pixel tiles and read them beside a smaller view of the whole. shem reads the whole picture in one view (the processor's `do_image_splitting=False`), 64 tokens for any picture, so a large one comes through with less detail than it would with the tiles. Videos, and families whose encoders are not SigLIP-style, are not read.
 
 ## Adapters as layers
 
@@ -424,6 +445,7 @@ docker run -d -p 8000:8000 --runtime io.containerd.shem.v1 --platform linux/risc
 - The image's system prompt comes first unless a request gives its own, and a conversation that starts with the image's [primed session](#sessions-as-layers) goes on from it rather than reading it again.
 - Requests are answered together: up to 16 replies share each pass over the model's weights, which decoding is bound by reading, so several clients cost far less than one after another (a prompt is read alone, in turn, and a reply that fails or whose client leaves does not stop the others). Up to 32 requests wait, after which the API answers `429` with `Retry-After`. Gated DeltaNet and Mamba blocks step their sessions one after another within a pass, so batching helps those models less. Messages are text; tools in requests, and images, are not understood yet.
 - `tools` in a chat request are offered to the model through its chat template, and a reply that calls them comes back as `tool_calls` with `finish_reason` `tool_calls` (in a stream, as a chunk of `tool_calls`); `tool` and `assistant` messages with `tool_calls` carry the conversation on. The caller runs the tools, as with OpenAI. `tool_choice` is `auto` or `none`: shem does not force a call.
+- A user's message can hold `image_url` parts with `data:` URLs for a model that [reads images](#images).
 - `logprobs` (with `top_logprobs` in a chat request) gives the log probability of each token of the reply and of the likeliest others, from the model's own distribution, before any temperature; in a stream, each chunk carries those of the tokens chosen since the last.
 - `response_format` can be `text`, `{"type": "json_object"}` or `{"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}`. With the last two, only tokens that keep the reply the start of a JSON object (of the schema) can be chosen (a mask on the model's logits, each step), and once the object closes only the end of the reply can, so what comes back parses and fits, whatever the model would have said. The schema keywords shem enforces are `type` (one or a list), `enum` and `const` of scalars, `properties` (only those keys are written, each once), `required`, `items`, `minItems` and `maxItems`, with `additionalProperties` only as `false`; anything else is refused with a 400 rather than quietly ignored. The top level must be an object. Neither can go with `shem_receipt`, which cannot replay a mask yet.
 - It listens on `127.0.0.1` unless given `--host`. Set `SHEM_API_KEY` in the environment, and every request but `/health` must send `Authorization: Bearer KEY`; under Docker, the model server's environment is the one that counts. A key is read from the environment, not an option, so that `ps` does not show it.

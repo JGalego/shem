@@ -31,6 +31,7 @@ from .manifest import locate
 from .sampling import Sampler
 from .tokenizer import Detokenizer, Tokenizer
 from .tools import Tools, compiled_layers, tool_calls
+from .vision import data_url, image_urls, plain
 
 SESSION_FORMAT = "shem.session/v1"
 #: Tool calls a turn may make before the model must answer
@@ -69,6 +70,9 @@ class Session:
         self.top_logprobs = 0
         #: Limits what the model may choose, if a reply must be a JSON object
         self.constraint: Any = None
+        #: What the model reads in place of the image tokens it has yet to
+        #: read: a row for each, from `attach_images`
+        self.pending: torch.Tensor | None = None
 
     def choose(self) -> int:
         token = self._choose()
@@ -109,6 +113,22 @@ class Session:
         context = self.model.manifest.context
         return None if context is None else context - len(self.tokens)
 
+    def attach_images(self, messages: list[dict]) -> None:
+        """Encode the images of `messages`, a conversation that goes on from
+        what the session has read, that it has not read yet, for `feed` to
+        put in place of their tokens. Images are in a model that reads them,
+        and only there."""
+        urls = image_urls(messages)
+        vision = self.model.vision
+        if not urls:
+            self.pending = None
+            return
+        if vision is None:
+            raise ValueError("this model reads text only: it has no vision encoder")
+        read = sum(token == vision.image_token_id for token in self.tokens) // vision.count
+        rows = [vision.encode(url) for url in urls[read:]]
+        self.pending = torch.cat(rows) if rows else None
+
     def feed(self, tokens: list[int]) -> None:
         room = self.room()
         if room is not None and len(tokens) > room:
@@ -117,7 +137,16 @@ class Session:
                 f"past the model's context window of {self.model.manifest.context}"
             )
         if tokens:
-            logits = self.model.forward(torch.tensor([tokens]), self.state, len(self.tokens))
+            images = None
+            vision = self.model.vision
+            if vision is not None and self.pending is not None:
+                # The image tokens read now take the next rows of the images attached
+                count = sum(token == vision.image_token_id for token in tokens)
+                if count:
+                    if count > len(self.pending):
+                        raise ValueError("the conversation has image tokens that no image was attached to")
+                    images, self.pending = self.pending[:count], self.pending[count:]
+            logits = self.model.forward(torch.tensor([tokens]), self.state, len(self.tokens), images)
             self.tokens += tokens
             self.logits = logits[0, -1]
 
@@ -190,6 +219,7 @@ class Session:
         session.tools = meta.get("tools", [])
         if stale := staleness(model, meta):
             print(f"shem: the session was saved {stale}: reading its {len(meta['tokens'])} tokens again", file=err)
+            session.attach_images(session.messages)
             session.feed(meta["tokens"])
             return session
         session.tokens = meta["tokens"]
@@ -219,6 +249,15 @@ def staleness(model: Model, meta: dict) -> str | None:
 
 
 def next_turn(session: Session, tokenizer: Tokenizer, new: list[dict]) -> list[int]:
+    """The tokens that take `session` to the start of the model's reply to the
+    `new` messages, with the images in them attached for the session to read
+    (see `turn`)."""
+    tokens = turn(session, tokenizer, new)
+    session.attach_images(session.messages + new)
+    return tokens
+
+
+def turn(session: Session, tokenizer: Tokenizer, new: list[dict]) -> list[int]:
     """The tokens that take `session` from where it is to the start of the
     model's reply to the `new` messages: a user's turn, or tools' replies.
 
@@ -248,8 +287,9 @@ def next_turn(session: Session, tokenizer: Tokenizer, new: list[dict]) -> list[i
     at, _ = max(stops, default=(-1, ""))
     if before and after.startswith(before) and at >= 0:
         return tokenizer.encode(before[at:] + after[len(before) :])
-    last = session.messages[-1]["content"].strip()
-    end = after.rfind(new[-1]["content"]) if new[-1]["content"] else len(after)
+    last = plain(session.messages[-1]["content"]).strip()
+    text = plain(new[-1]["content"])
+    end = after.rfind(text) if text else len(after)
     at = after.rfind(last, 0, end if end >= 0 else len(after)) if last else -1
     if at < 0:
         session.state, session.tokens = session.model.init_state(), []
@@ -265,12 +305,14 @@ def converse(
     out=sys.stdout,
     err=sys.stderr,
     stops: list[str] | None = None,
+    images: list[str] | None = None,
 ):
-    """One turn: the user's `text`, then the model's reply, written to `out`
-    as it comes. When the reply calls tools, the host runs them on the
+    """One turn: the user's `text` with its `images` (`data:` URLs), then the
+    model's reply, written to `out` as it comes. When the reply calls tools, the host runs them on the
     compiled layer and the model replies again, up to `MAX_TOOL_ROUNDS`
     times. The session remembers it all. Returns the last reply's tokens."""
-    new = [{"role": "user", "content": text}]
+    parts = [*({"type": "image", "url": url} for url in images or []), {"type": "text", "text": text}]
+    new = [{"role": "user", "content": parts if images else text}]
     for _ in range(MAX_TOOL_ROUNDS + 1):
         session.feed(next_turn(session, tokenizer, new))
         replied = reply(session, tokenizer, max_tokens, out, hold=session.runner is not None, stops=stops)
@@ -414,6 +456,13 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
         "--stop", action="append", default=[], help="end the reply where it reaches this text; may be given again"
     )
     parser.add_argument("--system", help="a system prompt")
+    parser.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        type=Path,
+        help="a picture for the first prompt, for a model that reads them; may be given again",
+    )
     parser.add_argument(
         "--system-file", help="a file of the image whose text the system prompt ends with, such as a document"
     )
@@ -587,6 +636,11 @@ def start(
     return session
 
 
+def images(args: argparse.Namespace) -> list[str]:
+    """The pictures `--image` names, as the `data:` URLs messages hold them."""
+    return [data_url(path.read_bytes()) for path in getattr(args, "image", [])]
+
+
 def run(
     model: Model, tokenizer: Tokenizer, args: argparse.Namespace, prompt: str, out=sys.stdout, err=sys.stderr
 ) -> int:
@@ -610,7 +664,7 @@ def run(
         # Drawn tokens are checked by drawing them again: from the receipt's seed
         session.sampler = Sampler(**checked["sampling"])
     started = time.perf_counter()
-    replied = converse(session, tokenizer, prompt, args.max_tokens, out, err, args.stop)
+    replied = converse(session, tokenizer, prompt, args.max_tokens, out, err, args.stop, images(args))
     if args.stats:
         print(f"shem: {len(replied)} tokens in {time.perf_counter() - started:.1f} s", file=err)
     if args.receipt:
@@ -647,6 +701,7 @@ def chat(
             pass
         print("shem: a conversation; /clear starts over, /exit or Ctrl-D ends it", file=err)
     text = prompt
+    attached = images(args)
     while True:
         if not text:
             try:
@@ -663,8 +718,8 @@ def chat(
                 continue
             if not text:
                 continue
-        converse(session, tokenizer, text, args.max_tokens, out, err, args.stop)
-        text = ""
+        converse(session, tokenizer, text, args.max_tokens, out, err, args.stop, attached)
+        text, attached = "", []
     return 0
 
 

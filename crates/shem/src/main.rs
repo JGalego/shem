@@ -186,6 +186,10 @@ struct RunArgs {
     /// For a model image, start the draws from this number: a receipt records it
     #[arg(long, value_name = "N")]
     seed: Option<u64>,
+    /// For a model image that reads pictures, a picture for the prompt: a
+    /// file, as many times as there are pictures
+    #[arg(long, value_name = "FILE")]
+    image: Vec<PathBuf>,
     /// For a model image, have a conversation: each line of input is a turn,
     /// until its end or `/exit`, after the prompt if there is one, and the
     /// image's own CMD does not count as one
@@ -595,7 +599,7 @@ fn launch<V: Vcpu + Clone>(
                 &args.args,
                 receipt,
                 args.interactive,
-                &drawing(args),
+                &drawing(args)?,
             );
         }
         if args.interactive {
@@ -809,9 +813,15 @@ fn parse_subject(subject: &str) -> (Option<&str>, &str) {
 /// Run the model image `image`, found as `target`, with `args`, or its CMD.
 /// `state` is a published session to continue, and the digest it must have,
 /// if a receipt gave one.
-/// The driver's options that say how to draw tokens, from the ones `shem run` was given.
-fn drawing(args: &RunArgs) -> Vec<String> {
+/// The driver's options that say how to draw tokens, and which pictures to read, from the ones `shem run` was given.
+fn drawing(args: &RunArgs) -> anyhow::Result<Vec<String>> {
     let mut options = Vec::new();
+    for image in &args.image {
+        // The model server reads it from where it runs, not from here
+        let path =
+            std::fs::canonicalize(image).with_context(|| format!("--image {}", image.display()))?;
+        options.extend(["--image".to_string(), path.display().to_string()]);
+    }
     if let Some(temperature) = args.temperature {
         options.extend(["--temperature".to_string(), temperature.to_string()]);
     }
@@ -824,7 +834,7 @@ fn drawing(args: &RunArgs) -> Vec<String> {
     if let Some(seed) = args.seed {
         options.extend(["--seed".to_string(), seed.to_string()]);
     }
-    options
+    Ok(options)
 }
 
 fn run_model(

@@ -50,6 +50,7 @@ from .constrain import JsonConstraint, check_schema
 from .generate import ContextFull, Reply, Session
 from .sampling import Sampler
 from .tools import tool_calls
+from .vision import picture
 
 #: Replies made in one pass over the model's weights, the rest waiting for room
 MAX_BATCH = 16
@@ -175,6 +176,8 @@ class Chat:
                 session.logprobs, session.top_logprobs = [], logprobs
             if json_object or schema is not None:
                 session.constraint = JsonConstraint(self.tokenizer, schema)
+            if messages is not None:
+                session.attach_images(messages)
             session.feed(prompt[len(session.tokens) :])
         job.made = Reply(session, self.tokenizer, max_tokens, text, hold=bool(tools), stops=[*self.stops, *stops])
         self.batcher.submit(job)
@@ -350,15 +353,32 @@ class _Text:
         pass
 
 
+def content_part(part: dict) -> dict:
+    """A part of a message's content as sessions hold it: text, or an image,
+    given as OpenAI's `image_url` is, by a `data:` URL, which is all shem
+    reads: it does not fetch a link."""
+    if part["type"] == "text":
+        return {"type": "text", "text": part["text"]}
+    url = part["image_url"]
+    url = url.get("url") if isinstance(url, dict) else url
+    picture(url or "")  # refused here, with a reason, if it is not a data URL
+    return {"type": "image", "url": url}
+
+
 def message(raw: dict) -> dict:
     """A chat message as the template takes it: its role and its text, whose
     parts, if it has them, are joined, and an assistant's tool calls, whose
-    arguments, JSON in OpenAI's API, are the objects templates take. Only
-    text is understood."""
+    arguments, JSON in OpenAI's API, are the objects templates take. A user's
+    message can hold images, which stay as parts beside its text."""
     role, content = raw["role"], raw.get("content") or ""
     if isinstance(content, list):
-        if any(part.get("type") != "text" for part in content):
-            raise ValueError("only text content is understood")
+        kinds = {part.get("type") for part in content}
+        if not kinds <= {"text", "image_url"}:
+            raise ValueError("a message's content can be text and images (image_url)")
+        if "image_url" in kinds:
+            if role != "user":
+                raise ValueError("images are in a user's message")
+            return {"role": role, "content": [content_part(part) for part in content]}
         content = "".join(part["text"] for part in content)
     if role not in ("system", "user", "assistant", "developer", "tool") or not isinstance(content, str):
         raise ValueError(f"a message must be a system, user, assistant or tool's text, not {role!r}")

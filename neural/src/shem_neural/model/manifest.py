@@ -12,8 +12,12 @@
       "embed": {"type": "embedding", "tensors": {"weight": "model.embed_tokens.weight"}},
       "blocks": [{"type": "attention", "params": {...},
                   "tensors": {"q": "model.layers.0.self_attn.q_proj.weight", ...}}, ...],
-      "head": {"type": "head", "params": {"tied": true, ...}, "tensors": {"norm": "model.norm.weight"}}
+      "head": {"type": "head", "params": {"tied": true, ...}, "tensors": {"norm": "model.norm.weight"}},
+      "vision": {"type": "vision", "params": {"family": "smolvlm", ...}, "tensors": {...}}
     }
+
+A vision-language model's `vision` (see `vision`) is its image encoder, whose
+tensors count in the fingerprint after the head's; a text model has none.
 
 A block maps the names its type uses to the checkpoint's own tensor names.
 `weights` is a Hugging Face sharded-checkpoint index, which says which
@@ -81,6 +85,10 @@ class Manifest:
     #: The most tokens a session may hold: the model's context window, if it
     #: has one. A recurrent model such as Mamba has none
     context: int | None = None
+    #: A vision-language model's encoder: a block of type `vision` whose
+    #: params describe it and its tokens, and whose tensors are its weights.
+    #: Its tokenizer's `image` section says how an image is written in text
+    vision: BlockSpec | None = None
     format: str = FORMAT
 
     def save(self, directory: Path) -> None:
@@ -105,6 +113,8 @@ class Manifest:
             "blocks": [block.to_json() for block in self.blocks],
             "head": self.head.to_json(),
         }
+        if self.vision is not None:
+            data["vision"] = self.vision.to_json()
         (Path(directory) / FILE).write_text(json.dumps(data, indent=1) + "\n")
 
     @classmethod
@@ -124,6 +134,7 @@ class Manifest:
             precision=data.get("precision", []),
             fingerprint=data.get("fingerprint"),
             context=data.get("context"),
+            vision=BlockSpec.from_json(data["vision"]) if data.get("vision") else None,
             format=data["format"],
         )
 

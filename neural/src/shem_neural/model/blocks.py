@@ -30,6 +30,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file
 
 from .manifest import BlockSpec, Manifest
+from .vision import Vision
 
 
 def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float, offset: float = 0.0) -> torch.Tensor:
@@ -742,6 +743,8 @@ class Model:
                 raise ValueError(f"unknown block type {spec.type!r}: this runtime has {sorted(BLOCKS)}")
             self.blocks.append(BLOCKS[spec.type](spec.params, tensors(spec)))
         head = tensors(m.head)
+        #: A vision-language model's encoder, which turns pictures into the rows read in place of image tokens
+        self.vision = Vision(m.vision.params, tensors(m.vision), dtype, self.device) if m.vision else None
         for adapter in self.adapters:
             if missing := adapter.unused(used):
                 raise ValueError(
@@ -793,25 +796,36 @@ class Model:
         return softcap(logits, p.get("softcap"))
 
     @torch.no_grad()
-    def hidden(self, tokens: torch.Tensor, state: list, start: int) -> torch.Tensor:
+    def hidden(self, tokens: torch.Tensor, state: list, start: int, images: torch.Tensor | None = None) -> torch.Tensor:
         """What the model has made of `tokens` (batch, tokens, hidden), after
         its last block and its final norm: what the head reads, and what an
         embedding is taken from. They continue a session at position `start`
-        whose blocks' state is `state`."""
-        x = self.embed[tokens.to(self.device)]
+        whose blocks' state is `state`. `images` (rows, hidden) are what the
+        model reads in place of its image tokens', in the order they come."""
+        tokens = tokens.to(self.device)
+        x = self.embed[tokens]
         if self.embed_scale:
             x = x * self.embed_scale
+        if images is not None:
+            assert self.vision is not None, "this model reads no images"
+            where = tokens == self.vision.image_token_id
+            if int(where.sum()) != len(images):
+                raise ValueError(f"{int(where.sum())} image tokens, and {len(images)} rows of images to put in them")
+            x[where] = images.to(x.device, x.dtype)
         for block, block_state in zip(self.blocks, state, strict=True):
             x = block.forward(x, block_state, start)
         p = self.head_params
         return rmsnorm(x, self.head_norm, p["eps"], p.get("norm_offset", 0.0))
 
     @torch.no_grad()
-    def forward(self, tokens: torch.Tensor, state: list, start: int) -> torch.Tensor:
+    def forward(
+        self, tokens: torch.Tensor, state: list, start: int, images: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Next-token logits (batch, tokens, vocabulary) for `tokens`, which
-        continue a session at position `start` whose blocks' state is `state`."""
+        continue a session at position `start` whose blocks' state is `state`,
+        reading `images` (see `hidden`) where they have image tokens."""
         p = self.head_params
-        logits = self.hidden(tokens, state, start) @ self.head_weight.T
+        logits = self.hidden(tokens, state, start, images) @ self.head_weight.T
         if p.get("logit_divisor"):
             logits = logits / p["logit_divisor"]
         return softcap(logits, p.get("softcap"))

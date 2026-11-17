@@ -9,6 +9,8 @@ from jinja2.ext import Extension
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import Tokenizer as HfTokenizer
 
+from .vision import image_urls
+
 
 def _raise(message: str):
     raise ValueError(message)
@@ -25,6 +27,14 @@ class Generation(Extension):
         return parser.parse_statements(("name:endgeneration",), drop_needle=True)
 
 
+def parts(message: dict) -> dict:
+    """`message` with its content as a list of parts, `{"type": "text", "text": ...}`
+    and `{"type": "image", ...}`, which the templates of vision-language models read."""
+    if isinstance(message.get("content"), str):
+        return {**message, "content": [{"type": "text", "text": message["content"]}]}
+    return message
+
+
 class Tokenizer:
     def __init__(self, directory: Path, spec: dict):
         directory = Path(directory)
@@ -39,6 +49,9 @@ class Tokenizer:
         self.eos = set(spec["eos"])
         #: The special tokens the template sees, such as `bos_token`
         self.special = spec.get("special", {})
+        #: How a vision-language model's images are written: its image token,
+        #: how many of them an image takes, and the tokens around them
+        self.image = spec.get("image")
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> list[int]:
         """The tokens of `messages`, ready for the assistant's reply."""
@@ -47,9 +60,24 @@ class Tokenizer:
     def render(self, messages: list[dict], tools: list[dict] | None = None, reply: bool = True) -> str:
         """The text of `messages` in the chat template, offering `tools`, and
         with `reply`, ready for the assistant's reply."""
-        return self.template.render(
+        if self.image:
+            messages = [parts(message) for message in messages]
+        text = self.template.render(
             messages=messages, tools=tools or None, add_generation_prompt=reply, enable_thinking=False, **self.special
         )
+        return self.expand(text, len(image_urls(messages))) if self.image else text
+
+    def expand(self, text: str, images: int) -> str:
+        """`text`, the template's, with each image token it holds written as
+        the run of them that the model reads an image as."""
+        assert self.image is not None
+        token = self.image["token"]
+        if text.count(token) != images:
+            raise ValueError(
+                f"the conversation has {images} images, and the chat template wrote {text.count(token)} "
+                f"{token} tokens: the template must write one for each image, and the text no other"
+            )
+        return text.replace(token, self.image["before"] + token * self.image["count"] + self.image["after"])
 
     def stop_texts(self) -> list[str]:
         """The text of each token that ends a reply, such as `<|im_end|>`."""

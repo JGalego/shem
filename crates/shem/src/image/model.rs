@@ -48,7 +48,8 @@ const IMPORTER: &str = "shem_neural.model.importers";
 
 /// Run a module of the neural package with uv: from its source when there
 /// is one, otherwise the release on PyPI that matches this binary. The
-/// importer gets the `gguf` extra too, which reads GGUF files.
+/// importer gets the `gguf` extra too, which reads GGUF files, and the
+/// rest the `images` one, which reads pictures.
 pub fn python(module: &str) -> Command {
     let mut command = Command::new("uv");
     command.args(["run", "--quiet"]);
@@ -56,7 +57,7 @@ pub fn python(module: &str) -> Command {
         Some(project) => command.arg("--project").arg(project),
         None => command.args(["--no-project", "--with"]).arg(match module {
             IMPORTER => concat!("shem-neural[gguf]==", env!("CARGO_PKG_VERSION")),
-            _ => concat!("shem-neural==", env!("CARGO_PKG_VERSION")),
+            _ => concat!("shem-neural[images]==", env!("CARGO_PKG_VERSION")),
         }),
     };
     command.args(["python", "-m", module]);

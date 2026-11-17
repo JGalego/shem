@@ -39,6 +39,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 from huggingface_hub import snapshot_download
@@ -471,6 +472,79 @@ def decoder(w: Writer, family: "Family") -> tuple[BlockSpec, BlockSpec, dict]:
     return embed, BlockSpec("head", params, w.file("head.safetensors", names)), cfg
 
 
+def smolvlm_vision(w: Writer, directory: Path) -> tuple[BlockSpec, dict]:
+    """SmolVLM's encoder: a SigLIP-style transformer over the patches of a
+    picture, and the connector that folds neighbouring patches into one and
+    projects them to the language model's width. Returns the block, and
+    the tokenizer's `image` section: the image token, how many of them an
+    image takes, and the tokens that wrap them."""
+    config, ckpt = w.ckpt.config, w.ckpt
+    vision = config["vision_config"]
+    for key in ("hidden_size", "image_size", "patch_size", "num_hidden_layers", "num_attention_heads"):
+        if key not in vision:
+            raise SystemExit(f"{directory}: the vision config has no {key}")
+    prefix = next((p for p in ("model.", "") if ckpt.has(f"{p}vision_model.embeddings.patch_embedding.weight")), None)
+    if prefix is None:
+        raise SystemExit(f"{directory}: no vision encoder in the checkpoint's tensors")
+    names = {
+        "patch.weight": f"{prefix}vision_model.embeddings.patch_embedding.weight",
+        "patch.bias": f"{prefix}vision_model.embeddings.patch_embedding.bias",
+        "position.weight": f"{prefix}vision_model.embeddings.position_embedding.weight",
+        "post_norm.weight": f"{prefix}vision_model.post_layernorm.weight",
+        "post_norm.bias": f"{prefix}vision_model.post_layernorm.bias",
+        "connector.weight": f"{prefix}connector.modality_projection.proj.weight",
+    }
+    layers = vision["num_hidden_layers"]
+    for i in range(layers):
+        layer = f"{prefix}vision_model.encoder.layers.{i}."
+        for local, name in (
+            ("q", "self_attn.q_proj"),
+            ("k", "self_attn.k_proj"),
+            ("v", "self_attn.v_proj"),
+            ("out", "self_attn.out_proj"),
+            ("norm1", "layer_norm1"),
+            ("norm2", "layer_norm2"),
+            ("fc1", "mlp.fc1"),
+            ("fc2", "mlp.fc2"),
+        ):
+            names[f"{i}.{local}.weight"] = f"{layer}{name}.weight"
+            names[f"{i}.{local}.bias"] = f"{layer}{name}.bias"
+    scale = config.get("scale_factor", 2)
+    side = vision["image_size"] // vision["patch_size"]
+    if side % scale:
+        raise SystemExit(f"{directory}: a {side}x{side} grid of patches does not fold by {scale}")
+    count = side * side // scale**2
+    # How the processor wraps an image: the tokens around it, and one that says it is the whole picture
+    listed = json.loads((directory / "tokenizer.json").read_text()).get("added_tokens", [])
+    added = {token["content"]: token["id"] for token in listed}
+    image = next((token for token, id_ in added.items() if id_ == config["image_token_id"]), None)
+    fake, whole = "<fake_token_around_image>", "<global-img>"
+    if image is None or fake not in added or whole not in added:
+        raise SystemExit(f"{directory}: the tokenizer has no {image or 'image token'}, {fake} or {whole}")
+    mean, std, edge = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 4 * vision["image_size"]
+    if (directory / "preprocessor_config.json").exists():
+        settings = json.loads((directory / "preprocessor_config.json").read_text())
+        mean, std = settings.get("image_mean", mean), settings.get("image_std", std)
+        edge = settings.get("size", {}).get("longest_edge", edge)
+    params = {
+        "family": "smolvlm",
+        "image_size": vision["image_size"],
+        "patch_size": vision["patch_size"],
+        "layers": layers,
+        "heads": vision["num_attention_heads"],
+        "eps": vision.get("layer_norm_eps", 1e-6),
+        "act": vision.get("hidden_act", "gelu_pytorch_tanh"),
+        "scale": scale,
+        "count": count,
+        "image_token_id": config["image_token_id"],
+        "mean": mean,
+        "std": std,
+        "edge": edge,
+    }
+    section = {"token": image, "id": config["image_token_id"], "before": fake + whole, "after": fake, "count": count}
+    return BlockSpec("vision", params, w.file("vision.safetensors", names)), section
+
+
 def mamba(w: Writer, family: "Family") -> tuple[BlockSpec, BlockSpec, dict]:
     """Mamba: its embedding, then a block per layer, each a norm and a mixer,
     then a final norm and a head, tied to the embedding or not. A block's
@@ -611,9 +685,12 @@ class Family:
     embed_scale: bool = False
     #: What reads the checkpoint: a decoder in Llama's layout, or another
     reader: Callable[[Writer, "Family"], tuple[BlockSpec, BlockSpec, dict]] = decoder
+    #: What reads the checkpoint's image encoder, if shem runs it: its block,
+    #: and how its images are written in the chat's tokens
+    vision: Callable[[Writer, Path], tuple[BlockSpec, dict]] | None = None
 
 
-GEMMA = {"offset": 1.0, "embed_scale": True}
+GEMMA: dict[str, Any] = {"offset": 1.0, "embed_scale": True}
 #: The architectures shem imports, by the name in their config. Llama,
 #: Mistral, Qwen2, Qwen3 and OLMo 2 differ only in what their checkpoints
 #: and configs turn on; Phi-3 fuses projections, which the blocks split;
@@ -643,6 +720,9 @@ FAMILIES: dict[str, Family] = {
     "MambaForCausalLM": Family(reader=mamba),
     "Qwen3_5ForCausalLM": Family(offset=1.0),
     "Qwen3_5ForConditionalGeneration": Family(text_config, ("model.language_model.",), offset=1.0),
+    # SmolVLM is Idefics3 made smaller: the same encoder and connector
+    "SmolVLMForConditionalGeneration": Family(text_config, ("model.text_model.",), vision=smolvlm_vision),
+    "Idefics3ForConditionalGeneration": Family(text_config, ("model.text_model.",), vision=smolvlm_vision),
 }
 
 
@@ -826,6 +906,7 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
     writer = Writer(out, checkpoint, in_place)
     family = FAMILIES[architecture]
     embed, head, cfg = family.reader(writer, family)
+    vision, image = family.vision(writer, directory) if family.vision else (None, None)
     writer.index()
 
     if not in_place:
@@ -844,12 +925,12 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
         settings = json.loads(config.read_text()) if config.exists() else {}
         # A base model without one gets a template that runs on from its text
         (out / "chat_template.jinja").write_text(settings.get("chat_template") or PLAIN_TEMPLATE)
-    # What the model holds: the tensors it runs, the vision encoder of a
-    # vision-language model's checkpoint not among them
-    used = {name for spec in [embed, *writer.blocks, head] for name in spec.tensors.values()}
+    # What the model holds: the tensors it runs, and the vision encoder of a
+    # vision-language model's checkpoint only for the families shem reads
+    specs = [embed, *writer.blocks, head] + ([vision] if vision else [])
+    used = {name for spec in specs for name in spec.tensors.values()}
     infos = [checkpoint.info(name) for name in sorted(used)]
     family = {"family": checkpoint.config["model_type"]} if checkpoint.config.get("model_type") else {}
-    specs = [embed, *writer.blocks, head]
     manifest = Manifest(
         hidden_size=cfg["hidden_size"],
         tokenizer={
@@ -857,6 +938,7 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
             "chat_template": "chat_template.jinja",
             "eos": eos_tokens(checkpoint, cfg),
             "special": special_tokens(directory),
+            **({"image": image} if image else {}),
         },
         embed=embed,
         blocks=writer.blocks,
@@ -866,6 +948,7 @@ def import_checkpoint(directory: Path, out: Path, source: dict | None = None, in
         precision=sorted({PRECISIONS.get(dtype, dtype.lower()) for _, dtype in infos}),
         fingerprint=fingerprint(checkpoint, specs),
         context=context_window(cfg, checkpoint.config),
+        vision=vision,
     )
     manifest.save(out)
     return manifest
