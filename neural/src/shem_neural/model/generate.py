@@ -31,7 +31,7 @@ from .manifest import locate
 from .sampling import Sampler
 from .tokenizer import Detokenizer, Tokenizer
 from .tools import Tools, compiled_layers, tool_calls
-from .vision import data_url, image_urls, plain
+from .vision import data_url, image_parts, plain
 
 SESSION_FORMAT = "shem.session/v1"
 #: Tool calls a turn may make before the model must answer
@@ -118,15 +118,20 @@ class Session:
         what the session has read, that it has not read yet, for `feed` to
         put in place of their tokens. Images are in a model that reads them,
         and only there."""
-        urls = image_urls(messages)
+        parts = image_parts(messages)
         vision = self.model.vision
-        if not urls:
+        if not parts:
             self.pending = None
             return
         if vision is None:
             raise ValueError("this model reads text only: it has no vision encoder")
-        read = sum(token == vision.image_token_id for token in self.tokens) // vision.count
-        rows = [vision.encode(url) for url in urls[read:]]
+        # The pictures the tokens read so far were, whole: those that come after are the ones to attach
+        read, skipped = sum(token == vision.image_token_id for token in self.tokens), 0
+        for part in parts:
+            if read < vision.tokens(part):
+                break
+            read, skipped = read - vision.tokens(part), skipped + 1
+        rows = [vision.encode(part) for part in parts[skipped:]]
         self.pending = torch.cat(rows) if rows else None
 
     def feed(self, tokens: list[int]) -> None:
@@ -306,12 +311,15 @@ def converse(
     err=sys.stderr,
     stops: list[str] | None = None,
     images: list[str] | None = None,
+    detail: str | None = None,
 ):
-    """One turn: the user's `text` with its `images` (`data:` URLs), then the
+    """One turn: the user's `text` with its `images` (`data:` URLs, read at
+    the `detail` given: `low` is the whole of each in one view), then the
     model's reply, written to `out` as it comes. When the reply calls tools, the host runs them on the
     compiled layer and the model replies again, up to `MAX_TOOL_ROUNDS`
     times. The session remembers it all. Returns the last reply's tokens."""
-    parts = [*({"type": "image", "url": url} for url in images or []), {"type": "text", "text": text}]
+    shown = {"detail": detail} if detail else {}
+    parts = [*({"type": "image", "url": url, **shown} for url in images or []), {"type": "text", "text": text}]
     new = [{"role": "user", "content": parts if images else text}]
     for _ in range(MAX_TOOL_ROUNDS + 1):
         session.feed(next_turn(session, tokenizer, new))
@@ -462,6 +470,12 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
         default=[],
         type=Path,
         help="a picture for the first prompt, for a model that reads them; may be given again",
+    )
+    parser.add_argument(
+        "--image-detail",
+        choices=["auto", "low", "high"],
+        help="how closely --image pictures are read: low is the whole of each in one view, which takes far fewer "
+        "tokens than the tiles that auto and high cut a large one in",
     )
     parser.add_argument(
         "--system-file", help="a file of the image whose text the system prompt ends with, such as a document"
@@ -664,7 +678,9 @@ def run(
         # Drawn tokens are checked by drawing them again: from the receipt's seed
         session.sampler = Sampler(**checked["sampling"])
     started = time.perf_counter()
-    replied = converse(session, tokenizer, prompt, args.max_tokens, out, err, args.stop, images(args))
+    replied = converse(
+        session, tokenizer, prompt, args.max_tokens, out, err, args.stop, images(args), args.image_detail
+    )
     if args.stats:
         print(f"shem: {len(replied)} tokens in {time.perf_counter() - started:.1f} s", file=err)
     if args.receipt:
@@ -718,7 +734,17 @@ def chat(
                 continue
             if not text:
                 continue
-        converse(session, tokenizer, text, args.max_tokens, out, err, args.stop, attached)
+        converse(
+            session,
+            tokenizer,
+            text,
+            args.max_tokens,
+            out,
+            err,
+            args.stop,
+            attached,
+            getattr(args, "image_detail", None),
+        )
         text, attached = "", []
     return 0
 

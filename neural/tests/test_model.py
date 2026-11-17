@@ -399,7 +399,7 @@ def test_a_vision_language_model_reads_an_image_as_transformers_does(tmp_path):
     from PIL import Image
 
     from shem_neural.model.generate import Session
-    from shem_neural.model.vision import data_url, picture
+    from shem_neural.model.vision import data_url
 
     out = tmp_path / "model"
     import_model(SMOLVLM, out)
@@ -415,18 +415,25 @@ def test_a_vision_language_model_reads_an_image_as_transformers_does(tmp_path):
     model = Model(out, verify=True)
     tokenizer = Tokenizer(out, model.manifest.tokenizer)
     processor = transformers.AutoProcessor.from_pretrained(SMOLVLM)
+    reference = transformers.AutoModelForImageTextToText.from_pretrained(SMOLVLM, dtype=torch.float32).eval()
     chat = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What colors?"}]}]
     text = processor.apply_chat_template(chat, add_generation_prompt=True)
-    theirs = processor(text=text, images=[[picture_]], do_image_splitting=False, return_tensors="pt")
-    tokens = tokenizer.chat(messages)
-    assert tokens == theirs["input_ids"][0].tolist()
-    assert torch.allclose(model.vision.pixels(picture(url)), theirs["pixel_values"][0, 0], atol=1e-5)
-
-    reference = transformers.AutoModelForImageTextToText.from_pretrained(SMOLVLM, dtype=torch.float32).eval()
-    with torch.no_grad():
-        expected = reference(**theirs).logits[0, -1]
-    session = Session(model)
-    session.attach_images(messages)
-    session.feed(tokens)
-    assert torch.allclose(session.logits, expected, atol=1e-3), (session.logits - expected).abs().max()
-    assert session.logits.argmax() == expected.argmax()
+    # The processor's default cuts a picture of 640 x 480 in 4 x 3 tiles and reads the whole beside them;
+    # shem does as the checkpoint's preprocessor says, and can be told to read the whole alone
+    for split, views in ((True, 13), (False, 1)):
+        messages[0]["content"][0]["detail"] = "auto" if split else "low"
+        theirs = processor(text=text, images=[[picture_]], do_image_splitting=split, return_tensors="pt")
+        tokens = tokenizer.chat(messages)
+        assert tokens == theirs["input_ids"][0].tolist()
+        assert tokens.count(model.vision.image_token_id) == 64 * views
+        ours = torch.stack(model.vision.views(messages[0]["content"][0]))
+        assert torch.allclose(ours, theirs["pixel_values"][0, :views], atol=1e-5), (
+            (ours - theirs["pixel_values"][0, :views]).abs().max()
+        )
+        with torch.no_grad():
+            expected = reference(**theirs).logits[0, -1]
+        session = Session(model)
+        session.attach_images(messages)
+        session.feed(tokens)
+        assert torch.allclose(session.logits, expected, atol=1e-3), (session.logits - expected).abs().max()
+        assert session.logits.argmax() == expected.argmax()

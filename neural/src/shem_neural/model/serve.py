@@ -362,7 +362,10 @@ def content_part(part: dict) -> dict:
     url = part["image_url"]
     url = url.get("url") if isinstance(url, dict) else url
     picture(url or "")  # refused here, with a reason, if it is not a data URL
-    return {"type": "image", "url": url}
+    detail = part["image_url"].get("detail") if isinstance(part["image_url"], dict) else None
+    if detail not in (None, "auto", "low", "high"):
+        raise ValueError("an image's detail is auto, low or high")
+    return {"type": "image", "url": url, **({"detail": detail} if detail else {})}
 
 
 def message(raw: dict) -> dict:

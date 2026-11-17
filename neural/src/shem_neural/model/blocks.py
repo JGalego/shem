@@ -744,7 +744,9 @@ class Model:
             self.blocks.append(BLOCKS[spec.type](spec.params, tensors(spec)))
         head = tensors(m.head)
         #: A vision-language model's encoder, which turns pictures into the rows read in place of image tokens
-        self.vision = Vision(m.vision.params, tensors(m.vision), dtype, self.device) if m.vision else None
+        self.vision = (
+            Vision(m.vision.params, tensors(m.vision), dtype, self.device, m.tokenizer["image"]) if m.vision else None
+        )
         for adapter in self.adapters:
             if missing := adapter.unused(used):
                 raise ValueError(

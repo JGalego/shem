@@ -9,7 +9,7 @@ from jinja2.ext import Extension
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import Tokenizer as HfTokenizer
 
-from .vision import image_urls
+from .vision import grid, image_parts, written
 
 
 def _raise(message: str):
@@ -65,19 +65,20 @@ class Tokenizer:
         text = self.template.render(
             messages=messages, tools=tools or None, add_generation_prompt=reply, enable_thinking=False, **self.special
         )
-        return self.expand(text, len(image_urls(messages))) if self.image else text
+        return self.expand(text, image_parts(messages)) if self.image else text
 
-    def expand(self, text: str, images: int) -> str:
+    def expand(self, text: str, images: list[dict]) -> str:
         """`text`, the template's, with each image token it holds written as
-        the run of them that the model reads an image as."""
+        the run of tokens that the model reads that picture as."""
         assert self.image is not None
-        token = self.image["token"]
-        if text.count(token) != images:
+        pieces = text.split(self.image["token"])
+        if len(pieces) - 1 != len(images):
             raise ValueError(
-                f"the conversation has {images} images, and the chat template wrote {text.count(token)} "
-                f"{token} tokens: the template must write one for each image, and the text no other"
+                f"the conversation has {len(images)} images, and the chat template wrote {len(pieces) - 1} "
+                f"{self.image['token']} tokens: the template must write one for each image, and the text no other"
             )
-        return text.replace(token, self.image["before"] + token * self.image["count"] + self.image["after"])
+        runs = [written(self.image, *grid(part, self.image)) for part in images]
+        return pieces[0] + "".join(run + piece for run, piece in zip(runs, pieces[1:], strict=True))
 
     def stop_texts(self) -> list[str]:
         """The text of each token that ends a reply, such as `<|im_end|>`."""

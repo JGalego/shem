@@ -521,11 +521,20 @@ def smolvlm_vision(w: Writer, directory: Path) -> tuple[BlockSpec, dict]:
     fake, whole = "<fake_token_around_image>", "<global-img>"
     if image is None or fake not in added or whole not in added:
         raise SystemExit(f"{directory}: the tokenizer has no {image or 'image token'}, {fake} or {whole}")
-    mean, std, edge = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 4 * vision["image_size"]
+    mean, std, edge, split = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 4 * vision["image_size"], True
     if (directory / "preprocessor_config.json").exists():
         settings = json.loads((directory / "preprocessor_config.json").read_text())
         mean, std = settings.get("image_mean", mean), settings.get("image_std", std)
         edge = settings.get("size", {}).get("longest_edge", edge)
+        split = settings.get("do_image_splitting", split)
+    if split:
+        # The tokens that name a tile by its row and column, as many as the longest edge makes
+        tiles = -(-edge // vision["image_size"])
+        missing = [f"<row_{r}_col_{c}>" for r in range(1, tiles + 1) for c in range(1, tiles + 1)]
+        if absent := [token for token in missing if token not in added]:
+            raise SystemExit(
+                f"{directory}: the tokenizer has no {absent[0]}, which a picture cut in tiles is written with"
+            )
     params = {
         "family": "smolvlm",
         "image_size": vision["image_size"],
@@ -535,13 +544,20 @@ def smolvlm_vision(w: Writer, directory: Path) -> tuple[BlockSpec, dict]:
         "eps": vision.get("layer_norm_eps", 1e-6),
         "act": vision.get("hidden_act", "gelu_pytorch_tanh"),
         "scale": scale,
-        "count": count,
         "image_token_id": config["image_token_id"],
         "mean": mean,
         "std": std,
-        "edge": edge,
     }
-    section = {"token": image, "id": config["image_token_id"], "before": fake + whole, "after": fake, "count": count}
+    section = {
+        "token": image,
+        "id": config["image_token_id"],
+        "count": count,
+        "fake": fake,
+        "global": whole,
+        "edge": edge,
+        "tile": vision["image_size"],
+        "split": split,
+    }
     return BlockSpec("vision", params, w.file("vision.safetensors", names)), section
 
 

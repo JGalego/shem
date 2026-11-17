@@ -160,7 +160,7 @@ The rows for other tools are as their documentation describe them at the time of
 What shem does not do, today:
 
 - **Run fast.** It is not tuned: PyTorch on a CPU is far slower than llama.cpp's quantized kernels on the same machine (not benchmarked here), and there are no paged attention, no speculative decoding and only int8, not 4-bit, weights. GGUF files are dequantized at import.
-- **Run every model.** The families in the [list](docs/models.md#imported-models): text, and [images](docs/models.md#images) for SmolVLM and Idefics3 only, with no tiles for large ones.
+- **Run every model.** The families in the [list](docs/models.md#imported-models): text, and [images](docs/models.md#images) for SmolVLM and Idefics3 only.
 - **Run a general guest.** Programs are static RV32IM Linux executables (musl, soft-float; compressed instructions run on both vCPUs for a program built with `RV32_C=1`); VMs boot no-MMU Linux with no block or network devices. The neural vCPU runs about a thousand instructions a second, so it is a demonstration of the idea more than a way to run programs.
 - **Join the CPU and the model.** They are [separate networks](docs/architecture.md#what-is-in-the-weights-and-what-is-not).
 - **Be stable.** The status is experimental: formats and flags may change between releases.

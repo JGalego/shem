@@ -29,8 +29,10 @@ let a request make it reach into the network around it.
 
 import base64
 import binascii
+import functools
 import hashlib
 import io
+import math
 from collections import OrderedDict
 
 import numpy as np
@@ -39,6 +41,8 @@ import torch.nn.functional as F
 
 #: Pictures larger than this many pixels are refused before they are decoded
 MAX_PIXELS = 1 << 26
+#: Views of a picture the encoder reads in one pass
+VIEWS_AT_ONCE = 4
 #: Encoded pictures held, to read one that comes back in a conversation again
 CACHED = 16
 FAMILIES = ("smolvlm",)
@@ -51,10 +55,11 @@ ACTIVATIONS = {
 }
 
 
-def image_urls(messages: list[dict]) -> list[str]:
-    """The pictures in `messages`, as their URLs, in the order they are read."""
+def image_parts(messages: list[dict]) -> list[dict]:
+    """The pictures in `messages`, as their parts (`url`, and `detail` if it
+    has one), in the order they are read."""
     return [
-        part["url"]
+        part
         for message in messages
         if isinstance(message.get("content"), list)
         for part in message["content"]
@@ -86,11 +91,84 @@ def picture(url: str) -> bytes:
         raise ValueError(f"an image's data is not base64: {error}") from None
 
 
+@functools.lru_cache(maxsize=32)
+def dimensions(url: str) -> tuple[int, int]:
+    """The width and height of the picture a `data:` URL holds, read from its header."""
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ValueError("reading images needs Pillow: pip install 'shem-neural[images]'") from None
+    try:
+        with Image.open(io.BytesIO(picture(url))) as image:
+            if image.width * image.height > MAX_PIXELS:
+                raise ValueError(f"the image is {image.width}x{image.height}, past {MAX_PIXELS} pixels")
+            return image.size
+    except OSError as error:  # Pillow's UnidentifiedImageError and the decoders' failures
+        raise ValueError(f"not an image shem can read: {error}") from None
+
+
+def larger(size: tuple[int, int], edge: int) -> tuple[int, int]:
+    """The size a picture of `size` (width, height) is first resized to: its
+    longest edge `edge` long and the other in proportion, rounded down and
+    then up to an even number, as the processor does."""
+    width, height = size
+    ratio = width / height
+    if width >= height:
+        width = edge
+        height = int(width / ratio)
+        height += height % 2
+    else:
+        height = edge
+        width = int(height * ratio)
+        width += width % 2
+    return max(width, 1), max(height, 1)
+
+
+def tiles(size: tuple[int, int], image: dict) -> tuple[int, int, int, int]:
+    """How a picture of `size` is cut into tiles, if `image` (the tokenizer's
+    section) says it is: the size it is resized to, a multiple of the tile's
+    on each side (width, height), and the rows and columns of tiles that has.
+    One tile is no cutting: the picture is its own view."""
+    width, height = larger(size, image["edge"])
+    ratio, tile = width / height, image["tile"]
+    if width >= height:
+        width = math.ceil(width / tile) * tile
+        height = math.ceil(int(width / ratio) / tile) * tile
+    else:
+        height = math.ceil(height / tile) * tile
+        width = math.ceil(int(height * ratio) / tile) * tile
+    return width, height, height // tile, width // tile
+
+
+def grid(part: dict, image: dict) -> tuple[int, int]:
+    """The rows and columns of tiles the picture of `part` is read as, or
+    (0, 0) when it is read whole, in one view: when the model is not one
+    that cuts pictures, or the part's `detail` is `low`, or it is small."""
+    if not image.get("split") or part.get("detail") == "low":
+        return 0, 0
+    _, _, rows, cols = tiles(dimensions(part["url"]), image)
+    return (rows, cols) if rows * cols > 1 else (0, 0)
+
+
+def written(image: dict, rows: int, cols: int) -> str:
+    """The run of tokens that stands for one picture, laid out in `rows` by
+    `cols` tiles read each by its own tokens (as the processor writes them)
+    and the whole picture after them, or in one view with (0, 0)."""
+    token, fake, whole = image["token"], image["fake"], image["global"]
+    view = token * image["count"]
+    if not rows:
+        return f"{fake}{whole}{view}{fake}"
+    lines = ("".join(f"{fake}<row_{r + 1}_col_{c + 1}>{view}" for c in range(cols)) for r in range(rows))
+    return "\n".join([*lines, ""]) + f"\n{fake}{whole}{view}{fake}"
+
+
 class Vision:
     """The encoder of a vision-language model, from its manifest's `vision`
     section `params` and its `tensors`, loaded as the language model is."""
 
-    def __init__(self, params: dict, tensors: dict[str, torch.Tensor], dtype: torch.dtype, device: torch.device):
+    def __init__(
+        self, params: dict, tensors: dict[str, torch.Tensor], dtype: torch.dtype, device: torch.device, image: dict
+    ):
         if params["family"] not in FAMILIES:
             raise ValueError(f"no vision encoder for {params['family']!r}: shem reads {list(FAMILIES)}")
         if params["act"] not in ACTIVATIONS:
@@ -98,57 +176,58 @@ class Vision:
         self.params, self.t, self.dtype, self.device = params, tensors, dtype, device
         self.size, self.patch = params["image_size"], params["patch_size"]
         self.image_token_id = params["image_token_id"]
-        self.count = params["count"]
-        self.edge = params.get("edge", 4 * self.size)
+        #: The tokenizer's section: how a picture is laid out in tiles and written
+        self.image = dict(image)
         self.mean = torch.tensor(params["mean"], dtype=torch.float32).view(3, 1, 1)
         self.std = torch.tensor(params["std"], dtype=torch.float32).view(3, 1, 1)
         self.cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
-    def pixels(self, data: bytes) -> torch.Tensor:
-        """The picture in `data` as the encoder reads it: (3, size, size)
-        floats, the picture in RGB resized to the square with Lanczos
-        resampling, scaled to [0, 1] and normalized."""
+    def views(self, part: dict) -> list[torch.Tensor]:
+        """The picture of `part` as the encoder reads it: a (3, size, size)
+        tensor for each view, normalized. Each tile of a picture cut in tiles
+        is a view, row by row, and the whole picture, resized to the square,
+        is the last. A picture not cut has that one."""
         try:
             from PIL import Image
         except ImportError:
             raise ValueError("reading images needs Pillow: pip install 'shem-neural[images]'") from None
+        lanczos, side = Image.Resampling.LANCZOS, self.size
         try:
-            with Image.open(io.BytesIO(data)) as image:
+            with Image.open(io.BytesIO(picture(part["url"]))) as image:
                 if image.width * image.height > MAX_PIXELS:
                     raise ValueError(f"the image is {image.width}x{image.height}, past {MAX_PIXELS} pixels")
-                lanczos = Image.Resampling.LANCZOS
-                # As the family's processor does: the longest edge made `edge` long, then the square
-                resized = (
-                    image.convert("RGB").resize(self.larger(image.size), lanczos).resize((self.size,) * 2, lanczos)
-                )
+                # As the family's processor does: the longest edge made `edge` long first
+                whole = image.convert("RGB").resize(larger(image.size, self.image["edge"]), lanczos)
         except OSError as error:  # Pillow's UnidentifiedImageError and the decoders' failures
             raise ValueError(f"not an image shem can read: {error}") from None
-        array = torch.from_numpy(np.asarray(resized, dtype=np.float32).copy()).permute(2, 0, 1)
-        return (array * (1 / 255) - self.mean) / self.std
-
-    def larger(self, size: tuple[int, int]) -> tuple[int, int]:
-        """The size a picture of `size` (width, height) is first resized to:
-        its longest edge `edge` long and the other in proportion, rounded
-        down and then up to an even number, as the processor does."""
-        width, height = size
-        ratio = width / height
-        if width >= height:
-            width = self.edge
-            height = int(width / ratio)
-            height += height % 2
+        rows, cols = grid(part, self.image)
+        if rows:
+            width, height, _, _ = tiles(dimensions(part["url"]), self.image)
+            whole = whole.resize((width, height), lanczos)
+            crops = [
+                whole.crop((c * side, r * side, (c + 1) * side, (r + 1) * side))
+                for r in range(rows)
+                for c in range(cols)
+            ]
+            views = [*crops, whole.resize((side, side), lanczos)]
         else:
-            height = self.edge
-            width = int(height * ratio)
-            width += width % 2
-        return max(width, 1), max(height, 1)
+            views = [whole.resize((side, side), lanczos)]
+        arrays = [torch.from_numpy(np.asarray(view, dtype=np.float32).copy()).permute(2, 0, 1) for view in views]
+        return [(array * (1 / 255) - self.mean) / self.std for array in arrays]
 
-    def encode(self, url: str) -> torch.Tensor:
-        """The rows the picture at `url` is read as: (count, hidden size)."""
-        key = hashlib.sha256(url.encode()).hexdigest()
+    def tokens(self, part: dict) -> int:
+        """How many image tokens the picture of `part` is written as."""
+        rows, cols = grid(part, self.image)
+        return self.image["count"] * (rows * cols + 1 if rows else 1)
+
+    def encode(self, part: dict) -> torch.Tensor:
+        """The rows the picture of `part` is read as: (tokens, hidden size)."""
+        key = hashlib.sha256(f"{part.get('detail')}\0{part['url']}".encode()).hexdigest()
         if key in self.cache:
             self.cache.move_to_end(key)
             return self.cache[key]
-        rows = self.rows(self.pixels(picture(url)))
+        # A few views at a time: their attention over 1,024 patches each is megabytes a head
+        rows = torch.cat([self.rows(chunk) for chunk in torch.stack(self.views(part)).split(VIEWS_AT_ONCE)])
         self.cache[key] = rows
         if len(self.cache) > CACHED:
             self.cache.popitem(last=False)
@@ -156,9 +235,11 @@ class Vision:
 
     @torch.no_grad()
     def rows(self, pixels: torch.Tensor) -> torch.Tensor:
-        """The encoder and the connector over `pixels` (3, size, size)."""
+        """The encoder and the connector over `pixels`, a view each
+        (views, 3, size, size): `count` rows for each, one view's after
+        another's."""
         p, t = self.params, self.t
-        x = pixels.to(self.device, self.dtype)[None]
+        x = pixels.to(self.device, self.dtype)
         patches = F.conv2d(x, t["patch.weight"], t["patch.bias"], stride=self.patch)
         h = patches.flatten(2).transpose(1, 2) + t["position.weight"][self.positions(patches.shape[2:])]
         eps, heads = p["eps"], p["heads"]
@@ -180,7 +261,7 @@ class Vision:
             norm = F.layer_norm(h, h.shape[-1:], w("norm2.weight"), w("norm2.bias"), eps)
             h = h + F.linear(activation(F.linear(norm, w("fc1.weight"), w("fc1.bias"))), w("fc2.weight"), w("fc2.bias"))
         h = F.layer_norm(h, h.shape[-1:], t["post_norm.weight"], t["post_norm.bias"], eps)
-        return F.linear(self.shuffle(h), t["connector.weight"])[0]
+        return F.linear(self.shuffle(h), t["connector.weight"]).flatten(0, 1)
 
     def positions(self, grid: tuple[int, ...]) -> torch.Tensor:
         """Which of the encoder's learned positions each patch of a picture

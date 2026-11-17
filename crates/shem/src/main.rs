@@ -190,6 +190,11 @@ struct RunArgs {
     /// file, as many times as there are pictures
     #[arg(long, value_name = "FILE")]
     image: Vec<PathBuf>,
+    /// For a model image that reads pictures, how closely: `low` reads each
+    /// whole in one view, and takes far fewer tokens than the tiles a large
+    /// picture is cut in with `auto` or `high`
+    #[arg(long, value_name = "DETAIL", value_parser = ["auto", "low", "high"])]
+    image_detail: Option<String>,
     /// For a model image, have a conversation: each line of input is a turn,
     /// until its end or `/exit`, after the prompt if there is one, and the
     /// image's own CMD does not count as one
@@ -821,6 +826,9 @@ fn drawing(args: &RunArgs) -> anyhow::Result<Vec<String>> {
         let path =
             std::fs::canonicalize(image).with_context(|| format!("--image {}", image.display()))?;
         options.extend(["--image".to_string(), path.display().to_string()]);
+    }
+    if let Some(detail) = &args.image_detail {
+        options.extend(["--image-detail".to_string(), detail.clone()]);
     }
     if let Some(temperature) = args.temperature {
         options.extend(["--temperature".to_string(), temperature.to_string()]);

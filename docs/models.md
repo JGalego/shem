@@ -154,7 +154,7 @@ Unsupported settings, such as dynamic NTK scaling or activations other than SiLU
 | [google/gemma-3-270m-it](https://huggingface.co/google/gemma-3-270m-it) | 18 attention (15 with sliding windows) with norms around them and on queries and keys, 18 GeGLU MLP | 39 layers | The same, against transformers' Gemma 3 |
 | [allenai/OLMo-2-0425-1B-Instruct](https://huggingface.co/allenai/OLMo-2-0425-1B-Instruct) | 16 attention with norms after them and on all queries and keys, 16 MLP | 35 layers | The same, against transformers' OLMo 2 |
 | [ibm-granite/granite-3.1-1b-a400m-instruct](https://huggingface.co/ibm-granite/granite-3.1-1b-a400m-instruct) | 24 attention, 24 mixtures of 32 stacked experts, 8 per token, with Granite's multipliers | 51 layers | The same, against transformers' GraniteMoe |
-| [HuggingFaceTB/SmolVLM-256M-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) | 30 attention, 30 MLP, and the [image encoder](#images): 12 SigLIP-style layers and a pixel-shuffle connector | 60 layers and the encoder | The same, against transformers' Idefics3, with an image: the processor's tokens, its pixels (1e-7) and the logits of the pass (3e-5 in float32) |
+| [HuggingFaceTB/SmolVLM-256M-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) | 30 attention, 30 MLP, and the [image encoder](#images): 12 SigLIP-style layers and a pixel-shuffle connector | 60 layers and the encoder | The same, against transformers' Idefics3, with an image: the processor's tokens, its tiles' pixels and the logits of the pass over them |
 | [state-spaces/mamba-130m-hf](https://huggingface.co/state-spaces/mamba-130m-hf) | 24 Mamba | 27 layers | The same, against transformers' Mamba, with a template that runs a base model's text together |
 | [Qwen/Qwen3-0.6B-GGUF](https://huggingface.co/Qwen/Qwen3-0.6B-GGUF) `:Q8_0` | As Qwen3-0.6B, dequantized | 59 layers | Logits within 1e-3 of transformers' own dequantization, and the same chat template |
 
@@ -195,19 +195,21 @@ A vision-language model of the SmolVLM family (its `SmolVLMForConditionalGenerat
 
 An image reaches the model in three steps:
 
-1. **Pixels.** The picture is decoded with Pillow (the `images` extra of shem-neural, in the `shem-neural` image), converted to RGB and resized as the model's processor does: its longest edge made 4 times the encoder's size with Lanczos resampling, then the encoder's square, then scaled to [0, 1] and normalized. The pixels match transformers' for the same picture to 1e-7. Pictures past 64 megapixels are refused before they are decoded.
+1. **Pixels.** The picture is decoded with Pillow (the `images` extra of shem-neural, in the `shem-neural` image), converted to RGB and resized as the model's processor does: its longest edge made 4 times the encoder's size with Lanczos resampling, then cut as below, then scaled to [0, 1] and normalized. The pixels match transformers' for the same picture to 1e-7. Pictures past 64 megapixels are refused before they are decoded.
 2. **Rows.** The encoder, a transformer over 16-pixel patches, and the connector that folds neighbouring patches into one (SmolVLM-256M: 1,024 patches into 64) and projects them to the language model's width, make one row for each image token. They are computed once for a picture and kept for the next turns of the conversation.
-3. **Tokens.** The chat template writes one `<image>` where a message has an image, and the tokenizer expands it into the run the model was trained on (`<fake_token_around_image><global-img>`, 64 image tokens and `<fake_token_around_image>`). The session puts the rows in place of those tokens' embeddings as it reads them, so what the model attends to is the picture, and its state afterwards, saved or committed, is the same as for any session.
+3. **Tokens.** The chat template writes one `<image>` where a message has an image, and the tokenizer expands it into the run the model was trained on, which the processor writes: a picture is cut into 512-pixel tiles, each between `<fake_token_around_image>` and its own `<row_R_col_C>` and 64 image tokens, and the whole picture, resized to a tile, follows them after `<global-img>`. The session puts the rows in place of those tokens' embeddings as it reads them, so what the model attends to is the picture, and its state afterwards, saved or committed, is the same as for any session.
+
+**Tiles** are how SmolVLM sees detail: the processor makes a picture's longest edge 2,048 pixels, whatever it was, and cuts the result into tiles, so a 4:3 picture is 4 by 3 of them and a square one 4 by 4, with the whole picture as the last view: 13 to 17 views of 64 tokens each, 832 to 1,088 tokens, and an encoder pass for each, a few seconds on a CPU. The tiles and their tokens match the processor's (`do_image_splitting`, which the checkpoint's `preprocessor_config.json` turns on or off, and shem follows). `detail` chooses per picture: `high` and `auto` (the default) cut it in tiles, and `low` reads the whole picture in one view, 64 tokens, as OpenAI's API does with its `low`. `--image-detail low` on `shem run` and `"detail": "low"` in an `image_url` part, set it.
 
 `shem run` takes `--image FILE`, as many as the first prompt needs:
 
 ```sh
-shem run hf.co/HuggingFaceTB/SmolVLM-256M-Instruct --image cat.png "What is in this picture?"
+shem run hf.co/HuggingFaceTB/SmolVLM-256M-Instruct --image cat.png --image-detail low "What is in this picture?"
 ```
 
-The API takes them as OpenAI's does, in a user's message: `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`, beside text parts, in any order. The URL must be a `data:` URL: shem never fetches a link, which would let a request make the server reach into the network around it. The image's tokens count in `usage`, and count against the context window. A `shem_receipt` carries the pictures, as data URLs, with the messages, so `shem replay` reads the same ones; check the receipt's size before you share it.
+The API takes them as OpenAI's does, in a user's message: `{"type": "image_url", "image_url": {"url": "data:image/png;base64,...", "detail": "low"}}`, beside text parts, in any order. The URL must be a `data:` URL: shem never fetches a link, which would let a request make the server reach into the network around it. The image's tokens count in `usage`, and count against the context window. A `shem_receipt` carries the pictures, as data URLs, with the messages, so `shem replay` reads the same ones; check the receipt's size before you share it.
 
-What shem leaves out: the processor's default for a large picture is to cut it into 512-pixel tiles and read them beside a smaller view of the whole. shem reads the whole picture in one view (the processor's `do_image_splitting=False`), 64 tokens for any picture, so a large one comes through with less detail than it would with the tiles. Videos, and families whose encoders are not SigLIP-style, are not read.
+What shem leaves out: videos, and families whose encoders are not SigLIP-style.
 
 ## Adapters as layers
 

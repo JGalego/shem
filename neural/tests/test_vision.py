@@ -22,7 +22,7 @@ from shem_neural.model.importers import import_checkpoint
 from shem_neural.model.manifest import Manifest
 from shem_neural.model.serve import message
 from shem_neural.model.tokenizer import Tokenizer
-from shem_neural.model.vision import data_url, picture
+from shem_neural.model.vision import data_url, grid, larger, picture, tiles, written
 
 transformers = pytest.importorskip("transformers")
 Image = pytest.importorskip("PIL.Image")
@@ -60,7 +60,7 @@ def config():
     )
 
 
-def tokenizer_files(directory):
+def tokenizer_files(directory, split=False):
     """A word-level tokenizer whose special tokens are SmolVLM's, and its chat template."""
     from tokenizers import AddedToken, models, pre_tokenizers
     from tokenizers import Tokenizer as Hf
@@ -68,6 +68,8 @@ def tokenizer_files(directory):
     vocab = {f"t{i}": i for i in range(VOCAB)}
     names = {IMAGE: "<image>", FAKE: "<fake_token_around_image>", WHOLE: "<global-img>"}
     names |= {3: "<|im_start|>", 4: "<end_of_utterance>", 5: "User", 6: "Assistant", 7: "System", 8: ":"}
+    # The tokens that name a tile by its row and column
+    names |= {40 + 4 * r + c: f"<row_{r + 1}_col_{c + 1}>" for r in range(4) for c in range(4)}
     for id_, name in names.items():
         vocab.pop(f"t{id_}")
         vocab[name] = id_
@@ -77,12 +79,12 @@ def tokenizer_files(directory):
     inner.save(str(directory / "tokenizer.json"))
     settings = {"chat_template": TEMPLATE, "eos_token": "<end_of_utterance>"}
     (directory / "tokenizer_config.json").write_text(json.dumps(settings))
-    (directory / "preprocessor_config.json").write_text(json.dumps({"image_mean": [0.5] * 3, "image_std": [0.5] * 3}))
+    settings = {"image_mean": [0.5] * 3, "image_std": [0.5] * 3, "do_image_splitting": split}
+    (directory / "preprocessor_config.json").write_text(json.dumps(settings))
 
 
-@pytest.fixture(scope="module")
-def vlm(tmp_path_factory):
-    """The reference model, and the checkpoint imported from it."""
+def build(tmp_path_factory, split):
+    """The reference model, and the checkpoint imported from it, whose pictures are cut in tiles or not."""
     torch.manual_seed(0)
     reference = transformers.SmolVLMForConditionalGeneration(config()).eval()
     with torch.no_grad():
@@ -90,10 +92,22 @@ def vlm(tmp_path_factory):
             parameter.add_(torch.randn_like(parameter) * 0.1)
     checkpoint = tmp_path_factory.mktemp("smolvlm")
     reference.save_pretrained(checkpoint)
-    tokenizer_files(checkpoint)
+    tokenizer_files(checkpoint, split)
     out = tmp_path_factory.mktemp("imported")
     import_checkpoint(checkpoint, out)
     return reference, out
+
+
+@pytest.fixture(scope="module")
+def vlm(tmp_path_factory):
+    """A tiny SmolVLM that reads each picture whole."""
+    return build(tmp_path_factory, split=False)
+
+
+@pytest.fixture(scope="module")
+def tiled(tmp_path_factory):
+    """The same, with pictures cut in tiles, as the processor does by default."""
+    return build(tmp_path_factory, split=True)
 
 
 def png(seed: int, size=(20, 27), mode="RGB") -> str:
@@ -102,6 +116,11 @@ def png(seed: int, size=(20, 27), mode="RGB") -> str:
     buffer = io.BytesIO()
     Image.fromarray(pixels).convert(mode).save(buffer, "PNG")
     return data_url(buffer.getvalue())
+
+
+def img(url: str, **more) -> dict:
+    """A picture as a message holds it."""
+    return {"type": "image", "url": url, **more}
 
 
 def ask(text: str, *urls: str) -> dict:
@@ -113,8 +132,8 @@ def ask(text: str, *urls: str) -> dict:
 
 def reference_logits(reference, model, tokens: list[int], urls: list[str]) -> torch.Tensor:
     """transformers' logits for `tokens`, with the pixels shem reads the pictures as."""
-    pixels = torch.stack([model.vision.pixels(picture(url)) for url in urls])[None]
-    ones = torch.ones(1, len(urls), 32, 32, dtype=torch.long)
+    pixels = torch.stack([view for url in urls for view in model.vision.views(img(url))])[None]
+    ones = torch.ones(1, pixels.shape[1], 32, 32, dtype=torch.long)
     with torch.no_grad():
         return reference(input_ids=torch.tensor([tokens]), pixel_values=pixels, pixel_attention_mask=ones).logits
 
@@ -123,13 +142,16 @@ def test_the_import_keeps_the_encoder_and_describes_how_images_are_written(vlm):
     _, out = vlm
     manifest = Manifest.load(out)
     assert manifest.vision.type == "vision"
-    assert manifest.vision.params["count"] == 4, "a 4x4 grid of patches, folded 2x2"
+    assert manifest.tokenizer["image"]["count"] == 4, "a 4x4 grid of patches, folded 2x2"
     assert manifest.tokenizer["image"] == {
         "token": "<image>",
         "id": IMAGE,
-        "before": "<fake_token_around_image><global-img>",
-        "after": "<fake_token_around_image>",
         "count": 4,
+        "fake": "<fake_token_around_image>",
+        "global": "<global-img>",
+        "edge": 128,
+        "tile": 32,
+        "split": False,
     }
     # The encoder's tensors are counted among the model's, and in its fingerprint
     assert any("vision_model" in name for name in manifest.vision.tensors.values())
@@ -180,12 +202,12 @@ def test_the_whole_pass_and_the_encoder_alone_match(vlm):
     urls = [png(3), png(4, size=(31, 9))]
     tokenizer = Tokenizer(out, Manifest.load(out).tokenizer)
     tokens = tokenizer.chat([ask("t9", *urls)])
-    rows = torch.cat([model.vision.encode(url) for url in urls])
+    rows = torch.cat([model.vision.encode(img(url)) for url in urls])
     got = model.forward(torch.tensor([tokens]), model.init_state(), 0, rows)
     expected = reference_logits(reference, model, tokens, urls)
     assert torch.allclose(got, expected, atol=1e-4), (got - expected).abs().max()
     # The encoder's own rows: what transformers puts in the image tokens' places
-    pixels = torch.stack([model.vision.pixels(picture(url)) for url in urls])
+    pixels = torch.stack([view for url in urls for view in model.vision.views(img(url))])
     with torch.no_grad():
         features = reference.model.get_image_features(
             pixels[None], torch.ones(1, 2, 32, 32, dtype=torch.long)
@@ -232,25 +254,25 @@ def test_pictures_become_the_normalized_square_the_encoder_reads(vlm):
     vision = Model(out).vision
     solid = io.BytesIO()
     Image.new("RGB", (5, 40), (255, 0, 51)).save(solid, "PNG")
-    pixels = vision.pixels(solid.getvalue())
+    pixels = vision.views(img(data_url(solid.getvalue())))[0]
     assert pixels.shape == (3, 32, 32)
     assert torch.allclose(pixels[0], torch.full((32, 32), 1.0))
     assert torch.allclose(pixels[1], torch.full((32, 32), -1.0))
     assert torch.allclose(pixels[2], torch.full((32, 32), -0.6), atol=1e-6)
     # Whatever the mode, the same picture in RGB: palette, grey and transparent ones too
-    rgb = vision.pixels(picture(png(7)))
+    rgb = vision.views(img(png(7)))[0]
     for mode in ("RGBA", "P", "L"):
-        converted = vision.pixels(picture(png(7, mode=mode)))
+        converted = vision.views(img(png(7, mode=mode)))[0]
         assert converted.shape == rgb.shape
-    assert torch.equal(vision.pixels(picture(png(7, mode="RGBA"))), rgb)
-    assert torch.equal(vision.pixels(picture(png(7))), rgb), "the same bytes, the same pixels"
+    assert torch.equal(vision.views(img(png(7, mode="RGBA")))[0], rgb)
+    assert torch.equal(vision.views(img(png(7)))[0], rgb), "the same bytes, the same pixels"
 
 
 def test_what_is_not_a_picture_the_runtime_reads_is_refused(vlm):
     _, out = vlm
     vision = Model(out).vision
     with pytest.raises(ValueError, match="not an image"):
-        vision.pixels(b"this is not a picture")
+        vision.views(img(data_url(b"this is not a picture")))
     for url, why in [
         ("https://example.com/cat.png", "fetch"),
         ("file:///etc/passwd", "fetch"),
@@ -263,7 +285,7 @@ def test_what_is_not_a_picture_the_runtime_reads_is_refused(vlm):
     bomb = io.BytesIO()
     Image.new("1", (9000, 9000)).save(bomb, "PNG")
     with pytest.raises(ValueError, match="pixels"):
-        vision.pixels(bomb.getvalue())
+        vision.views(img(data_url(bomb.getvalue())))
 
 
 def test_the_api_takes_images_as_data_urls_in_a_users_message():
@@ -396,15 +418,108 @@ def test_the_server_answers_a_request_with_an_image(vlm):
         server.server_close()
 
 
-def test_pictures_are_resized_as_the_processor_does(vlm):
+def test_pictures_are_resized_as_the_processor_does():
     """The longest edge first made 4 times the encoder's size, and the other
     in proportion, rounded down to an integer and then up to an even one."""
-    _, out = vlm
-    vision = Model(out).vision
-    assert vision.edge == 128
-    assert vision.larger((640, 480)) == (128, 96)
-    assert vision.larger((480, 640)) == (96, 128)
-    assert vision.larger((100, 100)) == (128, 128)
+    assert larger((640, 480), 128) == (128, 96)
+    assert larger((480, 640), 128) == (96, 128)
+    assert larger((100, 100), 128) == (128, 128)
     # Sizes as transformers' own function gives them, for pictures of odd shapes
     for size, expected in [((7, 1000), (1, 128)), ((1000, 7), (128, 1)), ((5, 40), (16, 128)), ((333, 111), (128, 42))]:
-        assert vision.larger(size) == expected
+        assert larger(size, 128) == expected
+
+
+SPLIT = {"token": "<image>", "count": 4, "fake": "<f>", "global": "<g>", "edge": 128, "tile": 32, "split": True}
+
+
+def test_large_pictures_are_cut_in_tiles_and_small_ones_are_not():
+    # 128 x 96 is 4 x 3 tiles of 32; the processor's own rounding up gives the rest
+    assert tiles((640, 480), SPLIT) == (128, 96, 3, 4)
+    assert tiles((480, 640), SPLIT) == (96, 128, 4, 3)
+    assert tiles((100, 100), SPLIT) == (128, 128, 4, 4)
+    assert tiles((333, 111), SPLIT) == (128, 64, 2, 4), "42 high is rounded up to 64"
+    assert tiles((7, 1000), SPLIT) == (32, 128, 4, 1)
+    one = SPLIT | {"edge": 32}
+    assert tiles((50, 50), one) == (32, 32, 1, 1)
+    # One tile is no cutting, and a model told not to cut never does
+    url = png(1, size=(50, 50))
+    assert grid(img(url), one) == (0, 0)
+    assert grid(img(url), SPLIT) == (4, 4)
+    assert grid(img(url), SPLIT | {"split": False}) == (0, 0)
+    assert grid(img(url, detail="low"), SPLIT) == (0, 0), "low detail is the whole picture in one view"
+    assert grid(img(url, detail="high"), SPLIT) == (4, 4)
+
+
+def test_tiles_are_written_as_the_processor_writes_them():
+    from transformers.models.smolvlm.processing_smolvlm import get_image_prompt_string
+
+    for rows, cols in [(0, 0), (1, 2), (3, 4), (4, 1)]:
+        expected = get_image_prompt_string(
+            rows,
+            cols,
+            SPLIT["count"],
+            fake_token_around_image="<f>",
+            image_token="<image>",
+            global_image_token="<g>",
+        )
+        assert written(SPLIT, rows, cols) == expected
+
+
+def test_a_picture_cut_in_tiles_gives_transformers_logits(tiled):
+    reference, out = tiled
+    model = Model(out)
+    tokenizer = Tokenizer(out, Manifest.load(out).tokenizer)
+    urls = [png(12, size=(40, 30)), png(13, size=(25, 25))]
+    # 40 x 30 is 4 x 3 tiles and the whole, the square one 4 x 4 and the whole
+    messages = [ask("t9", *urls)]
+    tokens = tokenizer.chat(messages)
+    assert tokens.count(IMAGE) == 4 * (12 + 1) + 4 * (16 + 1) == sum(model.vision.tokens(img(url)) for url in urls)
+    assert tokens.count(40) == 2, "<row_1_col_1> is written once for each picture"
+    session = Session(model)
+    session.attach_images(messages)
+    session.feed(tokens)
+    expected = reference_logits(reference, model, tokens, urls)
+    assert torch.allclose(session.logits, expected[0, -1], atol=1e-4), (session.logits - expected[0, -1]).abs().max()
+
+
+def test_pictures_cut_in_tiles_are_read_turn_by_turn(tiled):
+    reference, out = tiled
+    model = Model(out)
+    tokenizer = Tokenizer(out, Manifest.load(out).tokenizer)
+    first, second = ask("t9", png(5, size=(40, 30))), ask("t10", png(6, size=(20, 60)))
+    session = Session(model)
+    session.feed(next_turn(session, tokenizer, [first]))
+    session.feed([20, 21])
+    session.messages = [first, {"role": "assistant", "content": "t20 t21"}]
+    session.feed(next_turn(session, tokenizer, [second]))
+    assert session.pending is None or len(session.pending) == 0
+    expected = reference_logits(reference, model, session.tokens, [png(5, size=(40, 30)), png(6, size=(20, 60))])
+    assert torch.allclose(session.logits, expected[0, -1], atol=1e-4)
+
+
+def test_low_detail_reads_a_large_picture_whole_and_in_far_fewer_tokens(tiled):
+    reference, out = tiled
+    model = Model(out)
+    tokenizer = Tokenizer(out, Manifest.load(out).tokenizer)
+    url = png(14, size=(40, 30))
+    cut, low = [ask("t9", url)], [{"role": "user", "content": [img(url, detail="low"), {"type": "text", "text": "t9"}]}]
+    assert len(tokenizer.chat(cut)) - len(tokenizer.chat(low)) > 4 * 12
+    assert tokenizer.chat(low).count(IMAGE) == 4
+    session = Session(model)
+    session.attach_images(low)
+    session.feed(tokenizer.chat(low))
+    # One view: what transformers gives for that picture read whole
+    pixels = torch.stack(model.vision.views(low[0]["content"][0]))[None]
+    assert pixels.shape[1] == 1
+    with torch.no_grad():
+        expected = reference(
+            input_ids=torch.tensor([tokenizer.chat(low)]),
+            pixel_values=pixels,
+            pixel_attention_mask=torch.ones(1, 1, 32, 32, dtype=torch.long),
+        ).logits[0, -1]
+    assert torch.allclose(session.logits, expected, atol=1e-4)
+    # The API takes it as OpenAI's `detail`
+    part = {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
+    assert message({"role": "user", "content": [part]})["content"] == [img(url, detail="low")]
+    with pytest.raises(ValueError, match="detail"):
+        message({"role": "user", "content": [{"type": "image_url", "image_url": {"url": url, "detail": "max"}}]})
