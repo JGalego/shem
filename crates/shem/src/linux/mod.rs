@@ -16,6 +16,7 @@
 
 mod abi;
 mod files;
+mod net;
 mod proc;
 mod rootfs;
 mod signal;
@@ -23,7 +24,7 @@ mod signal;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -198,6 +199,8 @@ pub struct Linux {
     pub terminal: Option<i32>,
     /// The terminal's foreground process group, which typed signals go to.
     pub foreground: u32,
+    /// The container's network, which its processes' sockets are in (see `net`)
+    net: Arc<Mutex<net::Net>>,
 }
 
 /// What each process owns.
@@ -259,6 +262,7 @@ impl Linux {
             processes: Vec::new(),
             terminal: None,
             foreground: 1,
+            net: Arc::default(),
         }
     }
 
@@ -277,6 +281,7 @@ impl Linux {
             processes: Vec::new(),
             terminal: None,
             foreground: 1,
+            net: Arc::default(),
         }
     }
 
@@ -382,6 +387,20 @@ impl Linux {
             nr::OPENAT => p.openat(vcpu, a[0], a[1], a[2], a[3], s),
             nr::CLOSE => p.close(a[0]),
             nr::PIPE2 => p.pipe2(vcpu, a[0], a[1]),
+            nr::SOCKET => self.socket(p, a[0], a[1], a[2]),
+            nr::SOCKETPAIR => self.socketpair(p, vcpu, a[0], a[1], a[2], a[3]),
+            nr::BIND => self.bind(p, vcpu, a[0], a[1], a[2]),
+            nr::LISTEN => self.listen(p, a[0], a[1]),
+            nr::ACCEPT => self.accept(p, vcpu, a[0], a[1], a[2], 0),
+            nr::ACCEPT4 => self.accept(p, vcpu, a[0], a[1], a[2], a[3]),
+            nr::CONNECT => self.connect(p, vcpu, a[0], a[1], a[2]),
+            nr::GETSOCKNAME => self.sockname(p, vcpu, a[0], a[1], a[2], false),
+            nr::GETPEERNAME => self.sockname(p, vcpu, a[0], a[1], a[2], true),
+            nr::SHUTDOWN => self.shutdown(p, a[0], a[1]),
+            nr::SETSOCKOPT => self.setsockopt(p, a[0]),
+            nr::GETSOCKOPT => self.getsockopt(p, vcpu, &a),
+            nr::SENDTO => self.sendto(p, vcpu, a[0], a[1], a[2], a[3]),
+            nr::RECVFROM => self.recvfrom(p, vcpu, a[0], a[1], a[2], a[3]),
             nr::LLSEEK => p.llseek(vcpu, a[0], (a[1], a[2]), a[3], a[4]),
             nr::GETDENTS64 => p.getdents64(vcpu, a[0], a[1], a[2]),
             nr::STATX => p.statx(vcpu, a[0], a[1], a[2], a[4], s),

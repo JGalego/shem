@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use super::abi::*;
+use super::net::Socket;
 use super::proc::{self, Node, Snapshot};
 use super::rootfs::{PATH_MAX, Resolved, RootFs};
 use super::{Exec, IOV_MAX, MAX_IO, NS_PER_SEC, Process, Stdio};
@@ -34,12 +35,32 @@ pub struct Description {
     flags: u32,
 }
 
+impl Description {
+    pub(super) fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    pub(super) fn set_flags(&mut self, flags: u32) {
+        self.flags = flags;
+    }
+
+    /// The socket this describes, if it is one.
+    pub(super) fn socket_mut(&mut self) -> Option<&mut Socket> {
+        match &mut self.kind {
+            Kind::Socket(socket) => Some(socket),
+            _ => None,
+        }
+    }
+}
+
 enum Kind {
     Input(Box<dyn Read + Send>),
     Output(Box<dyn Write + Send>),
     File(File),
     Dir(Dir),
     Pipe(PipeEnd),
+    /// A stream socket among the container's processes (see `net`).
+    Socket(Socket),
     Device(Device),
     /// A file under `/proc`, generated when it was opened.
     Proc {
@@ -84,17 +105,82 @@ impl Device {
     }
 }
 
-struct Pipe {
-    buffer: VecDeque<u8>,
-    readers: usize,
-    writers: usize,
+pub(super) struct Pipe {
+    pub(super) buffer: VecDeque<u8>,
+    pub(super) readers: usize,
+    pub(super) writers: usize,
+}
+
+impl Pipe {
+    /// A pipe with one reader and one writer, whose ends the caller makes.
+    pub(super) fn shared() -> Arc<Mutex<Pipe>> {
+        Arc::new(Mutex::new(Pipe {
+            buffer: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+        }))
+    }
 }
 
 /// One end of a pipe. Dropping the last description that holds an end closes
 /// it, which is how readers see end-of-file and writers see EPIPE.
-struct PipeEnd {
-    pipe: Arc<Mutex<Pipe>>,
-    writer: bool,
+pub(super) struct PipeEnd {
+    pub(super) pipe: Arc<Mutex<Pipe>>,
+    pub(super) writer: bool,
+}
+
+impl PipeEnd {
+    /// Take what the pipe holds, up to `buf`: nothing yet blocks, and end of
+    /// file is what a pipe with no writers left reads.
+    pub(super) fn read(&self, buf: &mut [u8], nonblock: bool) -> Result<usize, Errno> {
+        let mut pipe = self.pipe.lock().unwrap();
+        if pipe.buffer.is_empty() {
+            return if pipe.writers == 0 {
+                Ok(0)
+            } else {
+                Err(blocked(nonblock))
+            };
+        }
+        let n = buf.len().min(pipe.buffer.len());
+        for (slot, byte) in buf.iter_mut().zip(pipe.buffer.drain(..n)) {
+            *slot = byte;
+        }
+        Ok(n)
+    }
+
+    /// Put `data` in the pipe as far as it has room, which none left blocks.
+    pub(super) fn write(&self, data: &[u8], nonblock: bool) -> Result<usize, Errno> {
+        let mut pipe = self.pipe.lock().unwrap();
+        if pipe.readers == 0 {
+            return Err(Errno::EPIPE);
+        }
+        let room = PIPE_CAPACITY - pipe.buffer.len();
+        if room == 0 && !data.is_empty() {
+            return Err(blocked(nonblock));
+        }
+        let n = data.len().min(room);
+        pipe.buffer.extend(&data[..n]);
+        Ok(n)
+    }
+
+    /// The `poll` events this end is ready for.
+    pub(super) fn ready(&self) -> u16 {
+        const POLLIN: u16 = 0x1;
+        const POLLOUT: u16 = 0x4;
+        const POLLERR: u16 = 0x8;
+        const POLLHUP: u16 = 0x10;
+        let pipe = self.pipe.lock().unwrap();
+        if self.writer {
+            match pipe.readers {
+                0 => POLLERR,
+                _ if pipe.buffer.len() < PIPE_CAPACITY => POLLOUT,
+                _ => 0,
+            }
+        } else {
+            let data = if pipe.buffer.is_empty() { 0 } else { POLLIN };
+            data | if pipe.writers == 0 { POLLHUP } else { 0 }
+        }
+    }
 }
 
 impl Drop for PipeEnd {
@@ -261,21 +347,8 @@ impl Description {
                 }
                 Ok(buf.len())
             }
-            Kind::Pipe(end) => {
-                let mut pipe = end.pipe.lock().unwrap();
-                if pipe.buffer.is_empty() {
-                    return if pipe.writers == 0 {
-                        Ok(0)
-                    } else {
-                        Err(blocked(nonblock))
-                    };
-                }
-                let n = buf.len().min(pipe.buffer.len());
-                for (slot, byte) in buf.iter_mut().zip(pipe.buffer.drain(..n)) {
-                    *slot = byte;
-                }
-                Ok(n)
-            }
+            Kind::Pipe(end) => end.read(buf, nonblock),
+            Kind::Socket(socket) => socket.read(buf, nonblock),
             // Input that has nothing yet, as a containerd shim's stdin while
             // the program is to stop, is waited for like an empty pipe
             Kind::Input(input) => match input.read(buf) {
@@ -297,19 +370,8 @@ impl Description {
         match &mut self.kind {
             Kind::Device(Device::Full) => return Err(Errno::ENOSPC),
             Kind::Device(_) => return Ok(data.len()),
-            Kind::Pipe(end) => {
-                let mut pipe = end.pipe.lock().unwrap();
-                if pipe.readers == 0 {
-                    return Err(Errno::EPIPE);
-                }
-                let room = PIPE_CAPACITY - pipe.buffer.len();
-                if room == 0 && !data.is_empty() {
-                    return Err(blocked(nonblock));
-                }
-                let n = data.len().min(room);
-                pipe.buffer.extend(&data[..n]);
-                return Ok(n);
-            }
+            Kind::Pipe(end) => return end.write(data, nonblock),
+            Kind::Socket(socket) => return socket.write(data, nonblock),
             Kind::Output(output) => {
                 output.write_all(data)?;
                 output.flush()?;
@@ -331,6 +393,7 @@ impl Description {
             Kind::Proc { path, .. } => Ok(proc::stat(path, &Node::File(Vec::new()))),
             Kind::Input(_) | Kind::Output(_) => Ok(Stat::char_device()),
             Kind::Pipe(_) => Ok(Stat::fifo()),
+            Kind::Socket(_) => Ok(Stat::socket()),
             Kind::Device(device) => Ok(device.stat()),
         }
     }
@@ -551,19 +614,8 @@ impl Process {
         let description = description.lock().unwrap();
         let ready = match &description.kind {
             Kind::Input(_) if terminal => return (0, true),
-            Kind::Pipe(end) => {
-                let pipe = end.pipe.lock().unwrap();
-                if end.writer {
-                    match pipe.readers {
-                        0 => POLLERR,
-                        _ if pipe.buffer.len() < PIPE_CAPACITY => POLLOUT,
-                        _ => 0,
-                    }
-                } else {
-                    let data = if pipe.buffer.is_empty() { 0 } else { POLLIN };
-                    data | if pipe.writers == 0 { POLLHUP } else { 0 }
-                }
-            }
+            Kind::Pipe(end) => end.ready(),
+            Kind::Socket(socket) => socket.ready(),
             Kind::Input(_) => POLLIN,
             Kind::Output(_) => POLLOUT,
             _ => POLLIN | POLLOUT,
@@ -617,6 +669,25 @@ impl Process {
             Kind::Device(Device::Zero) => Ok(Vec::new()), // the same as anonymous memory
             _ => Err(Errno::ENODEV),
         }
+    }
+
+    /// Open `socket` on the lowest free descriptor.
+    pub(super) fn install_socket(
+        &mut self,
+        socket: Socket,
+        nonblock: u32,
+        cloexec: bool,
+    ) -> Result<u32, Errno> {
+        let description = Description {
+            kind: Kind::Socket(socket),
+            flags: O_RDWR | nonblock,
+        };
+        self.files.install(description, 0, cloexec)
+    }
+
+    /// The description open on `fd`, which a socket call then checks is a socket.
+    pub(super) fn socket_of(&self, fd: u32) -> Result<Arc<Mutex<Description>>, Errno> {
+        self.files.get(fd)
     }
 
     pub(super) fn close(&mut self, fd: u32) -> Result<u32, Errno> {
@@ -741,7 +812,9 @@ impl Process {
                 _ => return Err(Errno::EINVAL),
             })?,
             Kind::Device(_) => 0,
-            Kind::Input(_) | Kind::Output(_) | Kind::Pipe(_) => return Err(Errno::ESPIPE),
+            Kind::Input(_) | Kind::Output(_) | Kind::Pipe(_) | Kind::Socket(_) => {
+                return Err(Errno::ESPIPE);
+            }
         };
         vcpu.write_mem(result, &position.to_le_bytes())?;
         Ok(0)
@@ -1097,6 +1170,7 @@ impl Process {
                 | Kind::Input(_)
                 | Kind::Output(_)
                 | Kind::Pipe(_)
+                | Kind::Socket(_)
                 | Kind::Device(_) => return Ok(0),
             }
         } else {

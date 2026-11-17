@@ -71,6 +71,7 @@ Both vCPUs must satisfy:
 
 - The only way out of a guest is an exit, so the attack surface is the exit handler. The [system-call layer](../crates/shem/src/linux/) treats every guest pointer and length as hostile: transfers are capped, and bad pointers return `EFAULT`.
 - Guest paths resolve inside the root directory with chroot semantics ([`rootfs.rs`](../crates/shem/src/linux/rootfs.rs)): `..` stops at the root, and symlinks, absolute ones included, resolve relative to it. Resolution and the final open are separate host calls, so a concurrent writer to the host directory could race them; a single guest cannot. `openat2` with `RESOLVE_IN_ROOT` would close that gap on Linux hosts.
+- A container has a network of its own and no other: its processes can listen on `AF_UNIX` paths and loopback ports, connect to them and talk over stream sockets, and `socketpair` works, but no socket leaves the container, so an untrusted guest can serve and call its siblings and reach no host or network ([`linux/net.rs`](../crates/shem/src/linux/net.rs)). A connection is two pipes, so it blocks, polls and closes as a pipe does. Not yet: datagrams, `AF_INET6`, addresses beyond loopback, `sendmsg` and `recvmsg`, descriptor passing, and a file for a Unix socket's path.
 - Tool calls run on a separate vCPU; the language model does not share its residual stream or state with the compiled CPU.
 - Tool output is untrusted model context. Executing a tool on a vCPU does not prevent prompt injection through its output.
 

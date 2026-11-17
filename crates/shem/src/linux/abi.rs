@@ -83,6 +83,20 @@ pub mod nr {
     pub const STATFS64: u32 = 43;
     pub const FSTATFS64: u32 = 44;
     pub const SYSINFO: u32 = 179;
+    pub const SOCKET: u32 = 198;
+    pub const SOCKETPAIR: u32 = 199;
+    pub const BIND: u32 = 200;
+    pub const LISTEN: u32 = 201;
+    pub const ACCEPT: u32 = 202;
+    pub const CONNECT: u32 = 203;
+    pub const GETSOCKNAME: u32 = 204;
+    pub const GETPEERNAME: u32 = 205;
+    pub const SENDTO: u32 = 206;
+    pub const RECVFROM: u32 = 207;
+    pub const SETSOCKOPT: u32 = 208;
+    pub const GETSOCKOPT: u32 = 209;
+    pub const SHUTDOWN: u32 = 210;
+    pub const ACCEPT4: u32 = 242;
 }
 
 /// A Linux errno. Guests see these numbers, so they must not come from the host OS.
@@ -122,6 +136,16 @@ impl Errno {
     pub const ENAMETOOLONG: Self = Self(36);
     pub const ENOSYS: Self = Self(38);
     pub const ETIMEDOUT: Self = Self(110);
+    pub const ENOTSOCK: Self = Self(88);
+    pub const EPROTONOSUPPORT: Self = Self(93);
+    pub const ESOCKTNOSUPPORT: Self = Self(94);
+    pub const EOPNOTSUPP: Self = Self(95);
+    pub const EAFNOSUPPORT: Self = Self(97);
+    pub const EADDRINUSE: Self = Self(98);
+    pub const EADDRNOTAVAIL: Self = Self(99);
+    pub const EISCONN: Self = Self(106);
+    pub const ENOTCONN: Self = Self(107);
+    pub const ECONNREFUSED: Self = Self(111);
     pub const ENOTEMPTY: Self = Self(39);
     pub const ELOOP: Self = Self(40);
     /// Not a real errno: the call cannot finish yet, so the process blocks and
@@ -246,6 +270,7 @@ pub const RLIM_INFINITY: u64 = u64::MAX;
 
 const S_IFCHR: u32 = 0o020000;
 const S_IFIFO: u32 = 0o010000;
+const S_IFSOCK: u32 = 0o140000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
@@ -328,6 +353,15 @@ impl Stat {
             ctime: (0, 0),
             dev: 0,
             rdev: 0,
+        }
+    }
+
+    /// A socket.
+    pub fn socket() -> Self {
+        Self {
+            mode: S_IFSOCK | 0o777,
+            blksize: 4096,
+            ..Self::char_device()
         }
     }
 

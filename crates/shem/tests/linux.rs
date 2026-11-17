@@ -52,6 +52,27 @@ const CLOCK_GETTIME64: u32 = 403;
 const CLOCK_NANOSLEEP_TIME64: u32 = 407;
 const UTIMENSAT_TIME64: u32 = 412;
 const SENDFILE64: u32 = 71;
+const SOCKET: u32 = 198;
+const SOCKETPAIR: u32 = 199;
+const BIND: u32 = 200;
+const LISTEN: u32 = 201;
+const ACCEPT: u32 = 202;
+const CONNECT: u32 = 203;
+const GETSOCKNAME: u32 = 204;
+const GETPEERNAME: u32 = 205;
+const SENDTO: u32 = 206;
+const RECVFROM: u32 = 207;
+const SETSOCKOPT: u32 = 208;
+const GETSOCKOPT: u32 = 209;
+const SHUTDOWN: u32 = 210;
+const ACCEPT4: u32 = 242;
+const AF_UNIX: u32 = 1;
+const AF_INET: u32 = 2;
+const SOCK_STREAM: u32 = 1;
+const SOCK_DGRAM: u32 = 2;
+const SOCK_NONBLOCK: u32 = 0o4000;
+const SHUT_WR: u32 = 1;
+const MSG_DONTWAIT: u32 = 0x40;
 
 const AT_FDCWD: u32 = -100i32 as u32;
 const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -94,6 +115,13 @@ const EPIPE: i32 = -32;
 const EBUSY: i32 = -16;
 const ENODEV: i32 = -19;
 const ENOTTY: i32 = -25;
+const ENOTSOCK: i32 = -88;
+const ESOCKTNOSUPPORT: i32 = -94;
+const EAFNOSUPPORT: i32 = -97;
+const EADDRINUSE: i32 = -98;
+const EADDRNOTAVAIL: i32 = -99;
+const ENOTCONN: i32 = -107;
+const ECONNREFUSED: i32 = -111;
 
 const MEM: u32 = 1 << 20;
 
@@ -1016,4 +1044,219 @@ fn execve_reads_the_program_and_follows_shebang_lines() {
     let (junk, plain) = (g.cstr("/bin/junk"), g.cstr("/bin/plain"));
     assert_eq!(g.call(EXECVE, &[junk, argv, 0]), ENOEXEC);
     assert_eq!(g.call(EXECVE, &[plain, argv, 0]), EACCES);
+}
+
+fn sockaddr_in(port: u16, ip: [u8; 4]) -> Vec<u8> {
+    [&[2, 0][..], &port.to_be_bytes(), &ip, &[0; 8]].concat()
+}
+
+fn sockaddr_un(path: &str) -> Vec<u8> {
+    [&[1, 0][..], path.as_bytes(), &[0]].concat()
+}
+
+impl Guest {
+    fn socket(&mut self, domain: u32, kind: u32) -> i32 {
+        self.call(SOCKET, &[domain, kind, 0])
+    }
+
+    fn bind(&mut self, fd: i32, addr: &[u8]) -> i32 {
+        let at = self.put(addr);
+        self.call(BIND, &[fd as u32, at, addr.len() as u32])
+    }
+
+    fn connect(&mut self, fd: i32, addr: &[u8]) -> i32 {
+        let at = self.put(addr);
+        self.call(CONNECT, &[fd as u32, at, addr.len() as u32])
+    }
+
+    /// A stream socket listening at `addr`.
+    fn listener(&mut self, domain: u32, addr: &[u8]) -> i32 {
+        let fd = self.socket(domain, SOCK_STREAM);
+        assert_eq!(self.bind(fd, addr), 0);
+        assert_eq!(self.call(LISTEN, &[fd as u32, 8]), 0);
+        fd
+    }
+
+    fn accept(&mut self, fd: i32) -> i32 {
+        self.call(ACCEPT, &[fd as u32, 0, 0])
+    }
+
+    fn name(&mut self, call: u32, fd: i32) -> Vec<u8> {
+        let buf = self.buf(32);
+        let len = self.put(&32u32.to_le_bytes());
+        assert_eq!(self.call(call, &[fd as u32, buf, len]), 0);
+        let size = word(&self.get(len, 4), 0) as usize;
+        self.get(buf, size.min(32))
+    }
+}
+
+#[test]
+fn processes_talk_over_a_unix_socket_by_its_path() {
+    let mut g = Guest::new();
+    let server = g.listener(AF_UNIX, &sockaddr_un("/run/app.sock"));
+    // Nobody has connected yet: accept waits, and does not, when non-blocking
+    assert_eq!(g.action(ACCEPT, &[server as u32, 0, 0]), Action::Block);
+    let client = g.socket(AF_UNIX, SOCK_STREAM);
+    assert_eq!(g.connect(client, &sockaddr_un("/run/app.sock")), 0);
+    let served = g.accept(server);
+    assert!(served > client);
+    assert_eq!(g.write(client, b"ping"), 4);
+    assert_eq!(g.read(served, 16), b"ping");
+    assert_eq!(g.write(served, b"pong"), 4);
+    assert_eq!(g.read(client, 16), b"pong");
+    // Closing one end is end of file for the other
+    assert_eq!(g.call(CLOSE, &[client as u32]), 0);
+    assert_eq!(g.read(served, 16), b"");
+    // The name goes when the listener does, and then no one can connect
+    assert_eq!(g.call(CLOSE, &[server as u32]), 0);
+    let late = g.socket(AF_UNIX, SOCK_STREAM);
+    assert_eq!(g.connect(late, &sockaddr_un("/run/app.sock")), ECONNREFUSED);
+}
+
+#[test]
+fn an_inet_server_and_its_client_see_each_others_ports() {
+    let mut g = Guest::new();
+    let server = g.listener(AF_INET, &sockaddr_in(8080, [127, 0, 0, 1]));
+    let client = g.socket(AF_INET, SOCK_STREAM);
+    assert_eq!(g.connect(client, &sockaddr_in(8080, [127, 0, 0, 1])), 0);
+    let at = g.buf(32);
+    let len = g.put(&32u32.to_le_bytes());
+    let served = g.call(ACCEPT4, &[server as u32, at, len, SOCK_NONBLOCK]);
+    assert!(served >= 0);
+    let from = g.get(at, 16);
+    assert_eq!(&from[..2], &[2, 0]);
+    let client_port = u16::from_be_bytes([from[2], from[3]]);
+    assert!(client_port >= 32768, "the client has a port of its own");
+    assert_eq!(
+        g.name(GETSOCKNAME, server),
+        sockaddr_in(8080, [127, 0, 0, 1])
+    );
+    assert_eq!(
+        g.name(GETPEERNAME, client),
+        sockaddr_in(8080, [127, 0, 0, 1])
+    );
+    assert_eq!(
+        g.name(GETSOCKNAME, client),
+        sockaddr_in(client_port, [127, 0, 0, 1])
+    );
+    assert_eq!(
+        g.name(GETPEERNAME, served),
+        sockaddr_in(client_port, [127, 0, 0, 1])
+    );
+    // The accepted socket took the non-blocking flag
+    let buf = g.buf(8);
+    assert_eq!(g.call(READ, &[served as u32, buf, 8]), EAGAIN);
+    assert_eq!(g.write(client, b"GET /"), 5);
+    assert_eq!(g.read(served, 16), b"GET /");
+}
+
+#[test]
+fn a_port_is_taken_until_its_socket_closes_and_nothing_leaves_the_container() {
+    let mut g = Guest::new();
+    let first = g.socket(AF_INET, SOCK_STREAM);
+    assert_eq!(g.bind(first, &sockaddr_in(9000, [0, 0, 0, 0])), 0);
+    let second = g.socket(AF_INET, SOCK_STREAM);
+    assert_eq!(
+        g.bind(second, &sockaddr_in(9000, [127, 0, 0, 1])),
+        EADDRINUSE
+    );
+    assert_eq!(g.call(CLOSE, &[first as u32]), 0);
+    assert_eq!(g.bind(second, &sockaddr_in(9000, [127, 0, 0, 1])), 0);
+    // Port 0 is any free port, and an address that is not the container's is not reachable
+    let ephemeral = g.socket(AF_INET, SOCK_STREAM);
+    assert_eq!(g.bind(ephemeral, &sockaddr_in(0, [127, 0, 0, 1])), 0);
+    let port = u16::from_be_bytes(g.name(GETSOCKNAME, ephemeral)[2..4].try_into().unwrap());
+    assert!(port >= 32768);
+    let out = g.socket(AF_INET, SOCK_STREAM);
+    assert_eq!(
+        g.connect(out, &sockaddr_in(80, [93, 184, 216, 34])),
+        EADDRNOTAVAIL
+    );
+    assert_eq!(
+        g.connect(out, &sockaddr_in(80, [127, 0, 0, 1])),
+        ECONNREFUSED
+    );
+}
+
+#[test]
+fn socketpairs_are_connected_and_shutdown_ends_one_way() {
+    let mut g = Guest::new();
+    let fds = g.buf(8);
+    assert_eq!(g.call(SOCKETPAIR, &[AF_UNIX, SOCK_STREAM, 0, fds]), 0);
+    let (a, b) = (
+        word(&g.get(fds, 8), 0) as i32,
+        word(&g.get(fds, 8), 4) as i32,
+    );
+    assert_eq!(g.write(a, b"to b"), 4);
+    assert_eq!(g.write(b, b"to a"), 4);
+    assert_eq!(g.read(b, 16), b"to b");
+    assert_eq!(g.read(a, 16), b"to a");
+    assert_eq!(g.call(SHUTDOWN, &[a as u32, SHUT_WR]), 0);
+    assert_eq!(g.read(b, 16), b"", "the other side sees end of file");
+    assert_eq!(g.write(b, b"still"), 5, "and can still write back");
+    assert_eq!(g.read(a, 16), b"still");
+}
+
+#[test]
+fn sockets_are_polled_and_sent_and_received_with_flags() {
+    let mut g = Guest::new();
+    let server = g.listener(AF_UNIX, &sockaddr_un("/s"));
+    // A pollfd: fd, events, revents
+    let pollfd = |fd: i32| [fd.to_le_bytes().as_slice(), &[1, 0, 0, 0]].concat();
+    let fds = g.put(&pollfd(server));
+    let zero = g.put(&[0; 16]);
+    assert_eq!(
+        g.call(PPOLL_TIME64, &[fds, 1, zero, 0, 0]),
+        0,
+        "no one is waiting to be accepted"
+    );
+    let client = g.socket(AF_UNIX, SOCK_STREAM);
+    assert_eq!(g.connect(client, &sockaddr_un("/s")), 0);
+    assert_eq!(g.call(PPOLL_TIME64, &[fds, 1, zero, 0, 0]), 1);
+    let served = g.accept(server);
+    let data = g.put(b"hello");
+    assert_eq!(g.call(SENDTO, &[client as u32, data, 5, 0, 0, 0]), 5);
+    let buf = g.buf(16);
+    assert_eq!(g.call(RECVFROM, &[served as u32, buf, 16, 0, 0, 0]), 5);
+    // Nothing more to read, which MSG_DONTWAIT says instead of waiting
+    assert_eq!(
+        g.call(RECVFROM, &[served as u32, buf, 16, MSG_DONTWAIT, 0, 0]),
+        EAGAIN
+    );
+    assert_eq!(
+        g.action(RECVFROM, &[served as u32, buf, 16, 0, 0, 0]),
+        Action::Block
+    );
+}
+
+#[test]
+fn what_sockets_do_not_do_is_refused_in_words_programs_know() {
+    let mut g = Guest::new();
+    assert_eq!(g.socket(AF_INET, SOCK_DGRAM), ESOCKTNOSUPPORT);
+    assert_eq!(g.socket(10, SOCK_STREAM), EAFNOSUPPORT);
+    let file = g.open("/f", O_RDWR | O_CREAT) as u32;
+    let pair = g.socket(AF_UNIX, SOCK_STREAM) as u32;
+    let buf = g.buf(8);
+    assert_eq!(g.call(BIND, &[file, buf, 8]), ENOTSOCK);
+    assert_eq!(
+        g.call(LISTEN, &[pair, 1]),
+        EINVAL,
+        "an unbound socket cannot listen"
+    );
+    assert_eq!(g.call(ACCEPT, &[pair, 0, 0]), EINVAL);
+    assert_eq!(g.call(SHUTDOWN, &[pair, 1]), ENOTCONN);
+    assert_eq!(g.call(READ, &[pair, buf, 1]), ENOTCONN);
+}
+
+#[test]
+fn socket_options_are_accepted_and_report_what_a_stream_socket_is() {
+    let mut g = Guest::new();
+    let fd = g.socket(AF_INET, SOCK_STREAM) as u32;
+    let one = g.put(&1u32.to_le_bytes());
+    assert_eq!(g.call(SETSOCKOPT, &[fd, 1, 2, one, 4]), 0, "SO_REUSEADDR");
+    let value = g.buf(4);
+    let len = g.put(&4u32.to_le_bytes());
+    assert_eq!(g.call(GETSOCKOPT, &[fd, 1, 3, value, len]), 0);
+    assert_eq!(word(&g.get(value, 4), 0), SOCK_STREAM, "SO_TYPE");
+    assert_eq!(g.call(GETSOCKOPT, &[99, 1, 3, value, len]), EBADF);
 }

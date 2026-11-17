@@ -110,6 +110,22 @@ fn pthreads_share_memory_and_take_turns() {
 
 #[test]
 #[ignore = "needs guest binaries: run `just guest-tests`"]
+fn processes_serve_and_call_each_other_over_unix_and_loopback_sockets() {
+    let path = built("guests/sockets");
+    let elf = std::fs::read(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+    let (mut container, stdout) = start(&elf, &["sockets"], &[], 64 << 20).unwrap();
+    assert_eq!(container.run(Some(MAX_STEPS)), Ok(0));
+    let out = String::from_utf8_lossy(&stdout.contents()).into_owned();
+    assert_eq!(out, "hello from unix\nhello from inet\n");
+    assert!(
+        container.linux.unsupported.is_empty(),
+        "{:?}",
+        container.linux.unsupported
+    );
+}
+
+#[test]
+#[ignore = "needs guest binaries: run `just guest-tests`"]
 fn busybox_applets_run_in_a_root_filesystem() {
     let busybox = built("busybox/bin/busybox");
     let root = tempfile::tempdir().unwrap();

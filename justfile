@@ -55,6 +55,7 @@ guest-tests: toolchain busybox-image
     mkdir -p target/guests
     just cc -O2 -o target/guests/hello guests/hello.c
     just cc -O2 -o target/guests/threads guests/threads.c
+    just cc -O2 -o target/guests/sockets guests/sockets.c
     cargo test --release --test guests -- --ignored
 
 # Test the neural vCPU: its own unit tests, then against the reference vCPU; needs Docker and uv
