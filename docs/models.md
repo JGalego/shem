@@ -45,6 +45,7 @@ A `shem:` entrypoint selects a host-side driver, not a guest executable.
 |---|---|
 | `--max-tokens N` | Maximum reply length; default 256 |
 | `--dtype bfloat16` | Compute in bfloat16, which halves the memory weights and sessions take and is faster on GPUs; default `float32` |
+| `--quantize int8` | Hold the projections' weights as int8 with a scale for each output row, a quarter of float32's memory and half of bfloat16's, applied with PyTorch's int8 kernel on a CPU; embeddings stay as they are. Sessions and receipts record it (`float32+int8`), so they are not mixed with unquantized ones |
 | `--system TEXT` | System prompt |
 | `--system-file PATH` | Append a file from the image to the system prompt |
 | `--stop TEXT` | End the reply at this text; useful for [base models](../examples/mamba/Shemfile) |

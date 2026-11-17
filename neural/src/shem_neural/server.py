@@ -100,18 +100,18 @@ class Models:
         self.users: dict[str, set[str]] = {}
         self.lock = threading.Lock()
 
-    def get(self, directory: Path, dtype: str = "float32", user: str = ""):
+    def get(self, directory: Path, dtype: str = "float32", user: str = "", quantize: str | None = None):
         """The model in `directory`, computing in `dtype`, and its tokenizer,
         for `user`, a session ID, until `release(user)`."""
         from .model.blocks import Model
         from .model.generate import dtype as torch_dtype
         from .model.tokenizer import Tokenizer
 
-        key = f"{Path(directory).resolve()}\0{dtype}"
+        key = f"{Path(directory).resolve()}\0{dtype}\0{quantize or ''}"
         with self.lock:
             self.idle.pop(key, None)
             if key not in self.loaded:
-                model = Model(directory, dtype=torch_dtype(dtype), device=self.device)
+                model = Model(directory, dtype=torch_dtype(dtype), device=self.device, quantize=quantize)
                 self.loaded[key] = (model, Tokenizer(directory, model.manifest.tokenizer))
             self.users.setdefault(key, set()).add(user)
             return self.loaded[key]
@@ -156,7 +156,7 @@ class Models:
         if request.get("session"):
             args.session = Path(request["session"])
         user = request.get("session_id") or f"run-{uuid.uuid4()}"
-        model, tokenizer = self.get(args.model, args.dtype, user)
+        model, tokenizer = self.get(args.model, args.dtype, user, args.quantize)
         kept = False
         try:
             if args.serve:

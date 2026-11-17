@@ -96,7 +96,7 @@ def rope_frequencies(p: dict, device: torch.device, end: int) -> tuple[torch.Ten
 
 def project(h: torch.Tensor, t: dict, name: str) -> torch.Tensor:
     """`h` through the projection `name`, and its bias if it has one."""
-    out = h @ t[name].T
+    out = linear(h, t[name])
     bias = t.get(f"{name}_bias")
     return out if bias is None else out + bias
 
@@ -104,6 +104,59 @@ def project(h: torch.Tensor, t: dict, name: str) -> torch.Tensor:
 def softcap(x: torch.Tensor, cap: float | None) -> torch.Tensor:
     """`x` squashed smoothly into (-cap, cap), as Gemma 2 bounds its scores."""
     return x if not cap else torch.tanh(x / cap) * cap
+
+
+class QWeight:
+    """A linear layer's weight as int8 with a scale for each output row:
+    a quarter of float32's memory, and half of bfloat16's. It is applied
+    with PyTorch's int8 kernel where there is one, and otherwise dequantized
+    for the one matrix being applied, never for the whole model."""
+
+    __slots__ = ("q", "scale", "shape", "dtype", "device")
+
+    def __init__(self, weight: torch.Tensor, dtype: torch.dtype):
+        w = weight.float()
+        self.scale = (w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 127).squeeze(-1)
+        self.q = (w / self.scale[..., None]).round().clamp(-127, 127).to(torch.int8)
+        self.shape, self.dtype, self.device = weight.shape, dtype, self.q.device
+
+    def __getitem__(self, index) -> "QWeight":
+        """One expert of a stack of them."""
+        part = object.__new__(QWeight)
+        part.q, part.scale, part.dtype, part.device = self.q[index], self.scale[index], self.dtype, self.device
+        part.shape = part.q.shape
+        return part
+
+    def apply(self, h: torch.Tensor) -> torch.Tensor:
+        """`h` times the transposed weight, as `F.linear` does."""
+        if hasattr(torch, "_weight_int8pack_mm") and h.device.type == "cpu" and self.q.dim() == 2:
+            try:
+                flat = h.reshape(-1, h.shape[-1])
+                out = torch._weight_int8pack_mm(flat.contiguous(), self.q, self.scale.to(flat.dtype))
+                return out.reshape(*h.shape[:-1], -1)
+            except (RuntimeError, TypeError):
+                pass  # a build or type without the kernel
+        return F.linear(h, (self.q.to(h.dtype) * self.scale.to(h.dtype)[..., None]))
+
+
+def linear(h: torch.Tensor, weight) -> torch.Tensor:
+    """`h` through the weight, quantized or not."""
+    return weight.apply(h) if isinstance(weight, QWeight) else F.linear(h, weight)
+
+
+#: The weights quantization applies to: those of each block's projections, not norms, biases or recurrent parameters
+LINEAR = {
+    "attention": {"q", "k", "v", "qkv", "o"},
+    "gated_deltanet": {"in_qkv", "in_z", "out"},
+    "mlp": {"gate", "up", "gate_up", "down"},
+    "moe": {"gate_up", "down", "shared_gate", "shared_up", "shared_down"},
+}
+
+
+def quantizable(kind: str, name: str) -> bool:
+    return name in LINEAR.get(kind, ()) or (
+        kind == "moe" and name.split(".", 1)[0] in {"gate", "up", "down"} and "." in name
+    )
 
 
 #: The gates of `mlp` blocks: SwiGLU's SiLU, and GeGLU's GELU, exact or tanh-approximated
@@ -281,7 +334,7 @@ class GatedDeltaNet(Block):
         h = rmsnorm(x, t["norm"], p["eps"], p.get("norm_offset", 0.0))
 
         # Causal depthwise convolution over the projected queries, keys and values
-        mixed = torch.cat((state["conv"], (h @ t["in_qkv"].T).transpose(1, 2)), dim=-1)
+        mixed = torch.cat((state["conv"], linear(h, t["in_qkv"]).transpose(1, 2)), dim=-1)
         state["conv"] = mixed[:, :, -(p["conv_kernel"] - 1) :]
         mixed = F.silu(F.conv1d(mixed, t["conv"], groups=mixed.shape[1])).transpose(1, 2)
         q, k, v = mixed.split([k_heads * k_dim, k_heads * k_dim, v_heads * v_dim], dim=-1)
@@ -311,9 +364,9 @@ class GatedDeltaNet(Block):
         state["memory"] = memory
         out = torch.stack(outputs, dim=1)
 
-        z = (h @ t["in_z"].T).view(batch, length, v_heads, v_dim)
+        z = linear(h, t["in_z"]).view(batch, length, v_heads, v_dim)
         out = rmsnorm(out, t["out_norm"], p["eps"]) * F.silu(z)
-        return x + out.reshape(batch, length, v_heads * v_dim) @ t["out"].T
+        return x + linear(out.reshape(batch, length, v_heads * v_dim), t["out"])
 
 
 class MLP(Block):
@@ -365,15 +418,15 @@ class MoE(Block):
                 continue
             chosen = flat[token]
             if stacked:
-                gate, up = F.linear(chosen, t["gate_up"][expert]).chunk(2, dim=-1)
+                gate, up = linear(chosen, t["gate_up"][expert]).chunk(2, dim=-1)
                 down = t["down"][expert]
             else:
-                gate, up = F.linear(chosen, t[f"gate.{expert}"]), F.linear(chosen, t[f"up.{expert}"])
+                gate, up = linear(chosen, t[f"gate.{expert}"]), linear(chosen, t[f"up.{expert}"])
                 down = t[f"down.{expert}"]
-            y = F.linear(act(gate) * up, down) * weights[token, slot, None]
+            y = linear(act(gate) * up, down) * weights[token, slot, None]
             out.index_add_(0, token, y)
         if "shared_up" in t:
-            shared = F.linear(act(F.linear(flat, t["shared_gate"])) * F.linear(flat, t["shared_up"]), t["shared_down"])
+            shared = linear(act(linear(flat, t["shared_gate"])) * linear(flat, t["shared_up"]), t["shared_down"])
             out = out + torch.sigmoid(F.linear(flat, t["shared_router"])) * shared
         out = out.view_as(h)
         if "post_norm" in t:
@@ -438,10 +491,15 @@ def resolve_device(device: str) -> torch.device:
 class Model:
     """A model loaded from its manifest's directory, ready to run sessions."""
 
-    def __init__(self, directory: Path, dtype: torch.dtype = torch.float32, device: str = "cpu"):
+    def __init__(
+        self, directory: Path, dtype: torch.dtype = torch.float32, device: str = "cpu", quantize: str | None = None
+    ):
+        if quantize not in (None, "int8"):
+            raise ValueError(f"cannot quantize to {quantize!r}: shem has int8")
         self.directory = Path(directory)
         self.manifest = Manifest.load(self.directory)
         self.dtype = dtype
+        self.quantize = quantize
         self.device = resolve_device(device)
         device = str(self.device)
         if self.device.type == "cuda":
@@ -465,6 +523,12 @@ class Model:
                     with safe_open(str(self.directory / file), "pt", device=device) as handle:
                         for local, name in names:
                             loaded[local] = handle.get_tensor(name)
+            if quantize:
+                # Quantized as loaded, from the checkpoint's own precision
+                return {
+                    name: QWeight(tensor, dtype) if quantizable(spec.type, name) else tensor.to(dtype)
+                    for name, tensor in loaded.items()
+                }
             return {name: tensor.to(dtype) for name, tensor in loaded.items()}
 
         self.embed = tensors(m.embed)["weight"]
@@ -491,7 +555,8 @@ class Model:
     @property
     def precision(self) -> str:
         """The type the model computes in, as ModelPack names it, such as `float32`."""
-        return str(self.dtype).removeprefix("torch.")
+        name = str(self.dtype).removeprefix("torch.")
+        return f"{name}+{self.quantize}" if self.quantize else name
 
     @torch.no_grad()
     def forward(self, tokens: torch.Tensor, state: list, start: int) -> torch.Tensor:

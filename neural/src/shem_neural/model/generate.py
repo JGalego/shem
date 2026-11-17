@@ -364,6 +364,11 @@ def options(argv: list[str], model: str | None = None) -> argparse.Namespace:
         metavar="ORIGIN",
         help="with --serve, let pages of this origin call the API, or * for any; may be given again",
     )
+    parser.add_argument(
+        "--quantize",
+        choices=["int8"],
+        help="hold the projections' weights as int8, a quarter of float32's memory (embeddings stay as they are)",
+    )
     parser.add_argument("--tools", help="offer the programs in this directory of the image to the model as tools")
     parser.add_argument(
         "--serve",
@@ -516,7 +521,7 @@ def chat(
 
 def main() -> None:
     args = resolve(options(sys.argv[1:]))
-    model = Model(args.model, dtype=dtype(args.dtype), device=args.device)
+    model = Model(args.model, dtype=dtype(args.dtype), device=args.device, quantize=args.quantize)
     tokenizer = Tokenizer(args.model, model.manifest.tokenizer)
     if args.serve and not args.warm:
         from .serve import serve_forever

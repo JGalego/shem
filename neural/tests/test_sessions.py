@@ -263,3 +263,29 @@ def test_the_cache_grows_in_place_and_a_session_saves_only_what_it_holds(model):
     stepwise.feed([6])
     assert again.state[attention]["k"].shape[2] == 301
     assert not torch.equal(again.state[attention]["k"][:, :, -1], stepwise.state[attention]["k"][:, :, -1])
+
+
+def test_int8_weights_follow_the_model_closely_in_a_quarter_of_the_memory(model):
+    from shem_neural.model.blocks import QWeight
+
+    quantized = Model(SAVED / "model", quantize="int8")
+    assert quantized.precision == "float32+int8" and model.precision == "float32"
+    held = [t for block in quantized.blocks for t in block.t.values() if isinstance(t, QWeight)]
+    assert held, "projections are quantized"
+    assert all(w.q.dtype == torch.int8 for w in held)
+    a, b = cold(model, TOKENS), cold(quantized, TOKENS)
+    assert torch.nn.functional.cosine_similarity(a, b, dim=0) > 0.98
+    # The kernel and the dequantized matrix agree
+    w, h = held[0], torch.randn(3, held[0].q.shape[-1])
+    dequantized = torch.nn.functional.linear(h, w.q.float() * w.scale[:, None])
+    assert torch.allclose(w.apply(h), dequantized, atol=1e-4, rtol=1e-4)
+
+
+def test_a_session_saved_in_int8_is_read_again_by_a_model_that_is_not(model, tmp_path):
+    quantized = Model(SAVED / "model", quantize="int8")
+    session = Session(quantized)
+    session.feed(TOKENS)
+    session.save(tmp_path)
+    assert staleness(model, json.loads((tmp_path / "session.json").read_text())) == (
+        "in float32+int8, and this model runs in float32"
+    )

@@ -40,7 +40,7 @@ FORMAT = "shem.receipt/v1"
 #: type the model computes in: twice how far apart two devices' logits get.
 #: float32's is twice what imports are held to against transformers;
 #: bfloat16's is a few of its steps at a logit's size
-CLOSE = {"float32": 2e-3, "bfloat16": 0.5}
+CLOSE = {"float32": 2e-3, "bfloat16": 0.5, "float32+int8": 0.5, "bfloat16+int8": 0.5}
 
 #: What a replay finds, as the driver's exit status, and in a word
 SAME, DIFFERENT, UNDECIDED = 0, 1, 3
