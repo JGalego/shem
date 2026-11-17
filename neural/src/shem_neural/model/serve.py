@@ -42,6 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import receipt as receipts
 from .generate import ContextFull, Reply, Session
 from .sampling import Sampler
+from .tools import tool_calls
 
 #: Replies made in one pass over the model's weights, the rest waiting for room
 MAX_BATCH = 16
@@ -83,13 +84,17 @@ class Chat:
         self.batcher = Batcher(compute)
         self.primed = primed if primed is not None and primed.tokens else None
 
-    def prompt(self, messages: list[dict]) -> list[int]:
+    def prompt(self, messages: list[dict], tools: list[dict] | None = None) -> list[int]:
         """The tokens a reply to `messages` starts from, the image's system
-        prompt first unless the request gives its own. Raises `ContextFull`
-        if there is no room in the model's context window to reply."""
+        prompt first unless the request gives its own, and `tools` offered if
+        there are any. Raises `ContextFull` if there is no room in the
+        model's context window to reply."""
         if self.system and not (messages and messages[0]["role"] == "system"):
             messages = [{"role": "system", "content": self.system}] + messages
-        tokens = self.tokenizer.chat(messages)
+        return self.check(self.tokenizer.chat(messages, tools or None))
+
+    def check(self, tokens: list[int]) -> list[int]:
+        """`tokens`, if the model's window has room for a reply to them."""
         context = self.model.manifest.context
         if context is not None and len(tokens) >= context:
             raise ContextFull(f"the conversation is {len(tokens)} tokens, and the model's context window is {context}")
@@ -97,23 +102,31 @@ class Chat:
 
     def complete(
         self,
-        messages: list[dict],
+        messages: list[dict] | None,
         max_tokens: int | None = None,
         stops=(),
         out=None,
         draw: dict | None = None,
         receipt: bool = False,
+        tools: list[dict] | None = None,
+        logprobs: int | None = None,
+        prompt_tokens: list[int] | None = None,
     ) -> dict:
-        """Reply to `messages`, writing the text to `out` as it comes, drawing
-        tokens as `draw` says over the image's own settings. Returns the
-        reply, why it ended, and how many tokens each side took."""
-        prompt = self.prompt(messages)
+        """Reply to `messages`, or continue `prompt_tokens`, writing the text
+        to `out` as it comes, drawing tokens as `draw` says over the image's
+        own settings. Returns the reply, why it ended, how many tokens each
+        side took, the tool calls it makes if it was offered `tools`, the
+        log probabilities of its tokens if `logprobs` (how many of the likeliest
+        to give besides the chosen one), and with `receipt`, a receipt of the
+        reply, for `shem replay`."""
+        raw = prompt_tokens is not None
+        prompt = self.check(prompt_tokens) if raw else self.prompt(messages, tools)
         sampler = None
         if settings := {**self.draw, **(draw or {})}:
             if settings.get("temperature"):
                 sampler = Sampler(**settings)
         max_tokens = max_tokens or self.max_tokens
-        if self.system and not (messages and messages[0]["role"] == "system"):
+        if not raw and self.system and not (messages and messages[0]["role"] == "system"):
             messages = [{"role": "system", "content": self.system}] + messages
         job = Job()
         text = _Text(job.pieces.put)
@@ -122,8 +135,10 @@ class Chat:
             session.sampler = sampler
             if receipt:
                 session.choices = []
+            if logprobs is not None:
+                session.logprobs, session.top_logprobs = [], logprobs
             session.feed(prompt[len(session.tokens) :])
-        job.made = Reply(session, self.tokenizer, max_tokens, text, stops=[*self.stops, *stops])
+        job.made = Reply(session, self.tokenizer, max_tokens, text, hold=bool(tools), stops=[*self.stops, *stops])
         self.batcher.submit(job)
         try:
             # What the reply writes is passed on from this request's own thread: a slow client holds up no one else
@@ -140,10 +155,20 @@ class Chat:
         if receipt:
             request = {"max_tokens": max_tokens, "stop": [*self.stops, *stops]}
             made = {"receipt": receipts.record_messages(session, messages, text.value.strip(), request, self.subjects)}
+        if logprobs is not None:
+            made["logprobs"] = session.logprobs[: len(tokens)]
+        calls = tool_calls(job.made.text) if tools else []
+        # A text continuation is the model's own text, but for the line end the reply closes with
+        value = text.value.removesuffix("\n") if raw else text.value.strip()
         return {
             **made,
-            "text": text.value.strip(),
-            "finish": "length" if len(tokens) >= max_tokens or (room is not None and room < 1) else "stop",
+            "text": value,
+            "calls": calls,
+            "finish": "tool_calls"
+            if calls
+            else "length"
+            if len(tokens) >= max_tokens or (room is not None and room < 1)
+            else "stop",
             "prompt_tokens": len(prompt),
             "completion_tokens": len(tokens),
         }
@@ -261,15 +286,44 @@ class _Text:
 
 def message(raw: dict) -> dict:
     """A chat message as the template takes it: its role and its text, whose
-    parts, if it has them, are joined. Only text is understood."""
+    parts, if it has them, are joined, and an assistant's tool calls, whose
+    arguments, JSON in OpenAI's API, are the objects templates take. Only
+    text is understood."""
     role, content = raw["role"], raw.get("content") or ""
     if isinstance(content, list):
         if any(part.get("type") != "text" for part in content):
             raise ValueError("only text content is understood")
         content = "".join(part["text"] for part in content)
-    if role not in ("system", "user", "assistant", "developer") or not isinstance(content, str):
-        raise ValueError(f"a message must be a system, user or assistant's text, not {role!r}")
-    return {"role": "system" if role == "developer" else role, "content": content}
+    if role not in ("system", "user", "assistant", "developer", "tool") or not isinstance(content, str):
+        raise ValueError(f"a message must be a system, user, assistant or tool's text, not {role!r}")
+    made = {"role": "system" if role == "developer" else role, "content": content}
+    if role == "assistant" and raw.get("tool_calls"):
+        calls = []
+        for call in raw["tool_calls"]:
+            function = call["function"]
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments or "{}")
+            if not isinstance(arguments, dict):
+                raise ValueError("a tool call's arguments must be a JSON object")
+            calls.append({"type": "function", "function": {"name": function["name"], "arguments": arguments}})
+        made["tool_calls"] = calls
+    return made
+
+
+def tools_of(request: dict) -> list[dict]:
+    """The tools a request offers, if it does and does not forbid them: as a
+    chat template takes them, a list of `{"type": "function", "function": ...}`."""
+    tools = request.get("tools") or []
+    choice = request.get("tool_choice", "auto")
+    if choice not in ("auto", "none", None):
+        raise ValueError("tool_choice can be auto or none: shem does not force a call")
+    if choice == "none":
+        return []
+    for tool in tools:
+        if tool.get("type") != "function" or not isinstance(tool.get("function", {}).get("name"), str):
+            raise ValueError("tools must be functions, each with a name")
+    return tools
 
 
 def handler(chat: Chat):
@@ -337,80 +391,186 @@ def handler(chat: Chat):
             path = self.path.split("?")[0]
             if not self._allowed():
                 return self._unauthorized()
-            if path not in ("/v1/chat/completions", "/chat/completions"):
+            kind = {
+                "/v1/chat/completions": "chat",
+                "/chat/completions": "chat",
+                "/v1/completions": "text",
+                "/completions": "text",
+            }.get(path)
+            if kind is None:
                 self.close_connection = True  # a body it did not read would be taken for the next request
-                return self._error(404, f"nothing at {path}: the API is at /v1/chat/completions")
+                return self._error(404, f"nothing at {path}: the API is at /v1/chat/completions and /v1/completions")
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 length = -1
             if length < 0:
-                return self._error(400, "not a chat completion request: Content-Length is not a size")
+                return self._error(400, "not a request: Content-Length is not a size")
             if length > MAX_BODY:
                 self.close_connection = True
                 return self._error(413, f"the request is over the {MAX_BODY} bytes the API takes", "request_too_large")
             try:
                 request = json.loads(self.rfile.read(length))
-                messages = [message(m) for m in request["messages"]]
-                if not messages:
-                    raise ValueError("there are no messages to reply to")
-                max_tokens = request.get("max_completion_tokens") or request.get("max_tokens")
-                if max_tokens is not None and (not isinstance(max_tokens, int) or max_tokens < 1):
-                    raise ValueError("max_tokens must be a positive number")
-                stops = request.get("stop") or []
-                stops = [stops] if isinstance(stops, str) else list(stops)
-                if request.get("n", 1) != 1:
-                    raise ValueError("n must be 1: a reply is one draw from one seed")
-                receipt = request.get("shem_receipt") is True
-                draw = {}
-                for key, kind in (("temperature", float), ("top_p", float), ("top_k", int), ("seed", int)):
-                    if request.get(key) is not None:
-                        if isinstance(request[key], bool) or not isinstance(request[key], int | float):
-                            raise ValueError(f"{key} must be a number")
-                        draw[key] = kind(request[key])
-                if draw.get("temperature"):
-                    Sampler(**draw)  # its settings, checked before the headers of a stream go out
+                ask = self._ask(request, kind)
             except (ValueError, KeyError, TypeError, AttributeError) as error:
-                return self._error(400, f"not a chat completion request: {error}")
+                what = "chat completion" if kind == "chat" else "completion"
+                return self._error(400, f"not a {what} request: {error}")
             try:
-                chat.prompt(messages)
+                if kind == "chat":
+                    chat.prompt(ask["messages"], ask["tools"])
+                else:
+                    chat.check(ask["prompt_tokens"])
             except ContextFull as error:
                 return self._error(400, str(error), "context_length_exceeded")
             if not chat.waiting.acquire(blocking=False):
                 return self._error(429, f"{MAX_WAITING} requests are waiting for the model: try again", "busy", retry=5)
             try:
                 if request.get("stream"):
-                    self._stream(messages, max_tokens, stops, request.get("stream_options") or {}, draw, receipt)
+                    self._stream(kind, ask, request.get("stream_options") or {})
                     return
                 try:
-                    done = chat.complete(messages, max_tokens, stops, draw=draw, receipt=receipt)
+                    done = chat.complete(**ask["complete"])
                 except Exception as error:  # the template, say, refusing the conversation
                     return self._error(500, f"no reply: {error}")
-                self._json(200, self._completion(done))
+                self._json(200, self._completion(kind, done, ask["logprobs"]))
             finally:
                 chat.waiting.release()
+
+        def _ask(self, request: dict, kind: str) -> dict:
+            """What a request asks for, checked, as the arguments of
+            `Chat.complete` and the things the answer needs."""
+            if kind == "chat":
+                messages = [message(m) for m in request["messages"]]
+                if not messages:
+                    raise ValueError("there are no messages to reply to")
+                tools = tools_of(request)
+                given = {"messages": messages, "tools": tools or None}
+            else:
+                prompt = request["prompt"]
+                if isinstance(prompt, list) and len(prompt) == 1:
+                    prompt = prompt[0]
+                if not isinstance(prompt, str):
+                    raise ValueError("prompt must be a text: shem continues one text at a time")
+                tools = []
+                given = {"messages": None, "prompt_tokens": chat.tokenizer.encode(prompt)}
+            max_tokens = request.get("max_completion_tokens") or request.get("max_tokens")
+            if max_tokens is not None and (
+                isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1
+            ):
+                raise ValueError("max_tokens must be a positive number")
+            stops = request.get("stop") or []
+            stops = [stops] if isinstance(stops, str) else list(stops)
+            if request.get("n", 1) != 1:
+                raise ValueError("n must be 1: a reply is one draw from one seed")
+            receipt = request.get("shem_receipt") is True
+            if receipt and (kind != "chat" or tools):
+                raise ValueError(
+                    "shem_receipt is for chat completions without tools: they are what `shem replay` reads again"
+                )
+            draw = {}
+            for key, number in (("temperature", float), ("top_p", float), ("top_k", int), ("seed", int)):
+                if request.get(key) is not None:
+                    if isinstance(request[key], bool) or not isinstance(request[key], int | float):
+                        raise ValueError(f"{key} must be a number")
+                    draw[key] = number(request[key])
+            if draw.get("temperature"):
+                Sampler(**draw)  # its settings, checked before the headers of a stream go out
+            logprobs = None
+            if kind == "chat" and request.get("logprobs"):
+                logprobs = request.get("top_logprobs") or 0
+            elif kind == "text" and request.get("logprobs") is not None:
+                logprobs = request["logprobs"]
+            if logprobs is not None:
+                if isinstance(logprobs, bool) or not isinstance(logprobs, int) or not 0 <= logprobs <= 20:
+                    raise ValueError("top_logprobs, or logprobs of a completion, must be a number from 0 to 20")
+                if request.get("stream"):
+                    raise ValueError("logprobs are not sent in a stream yet: ask without stream")
+            if request.get("response_format") not in (None, {"type": "text"}):
+                raise ValueError("response_format: shem does not constrain replies to JSON, only text")
+            complete = {
+                **given,
+                "max_tokens": max_tokens,
+                "stops": stops,
+                "draw": draw,
+                "receipt": receipt,
+                "logprobs": logprobs,
+            }
+            return {**given, "tools": tools or None, "complete": complete, "logprobs": logprobs}
 
         def _model(self) -> dict:
             return {"id": chat.name, "object": "model", "created": 0, "owned_by": "shem"}
 
-        def _completion(self, done: dict) -> dict:
+        def _token(self, token: int) -> str:
+            return chat.tokenizer.decode([token])
+
+        def _logprobs(self, kind: str, entries: list, text: str) -> dict:
+            """The log probabilities of a reply's tokens in the shape of the
+            endpoint's: chosen token first, then the likeliest others."""
+            if kind == "chat":
+                content = []
+                for token, logprob, top in entries:
+                    word = self._token(token)
+                    content.append(
+                        {
+                            "token": word,
+                            "logprob": logprob,
+                            "bytes": list(word.encode()),
+                            "top_logprobs": [
+                                {"token": w, "logprob": lp, "bytes": list(w.encode())}
+                                for w, lp in ((self._token(t), lp) for t, lp in top)
+                            ],
+                        }
+                    )
+                return {"content": content, "refusal": None}
+            words = [self._token(token) for token, _, _ in entries]
+            offsets, at = [], 0
+            for word in words:
+                offsets.append(at)
+                at += len(word)
             return {
-                "id": f"chatcmpl-{uuid.uuid4().hex}",
-                "object": "chat.completion",
+                "tokens": words,
+                "token_logprobs": [logprob for _, logprob, _ in entries],
+                "top_logprobs": [{self._token(t): lp for t, lp in top} for _, _, top in entries],
+                "text_offset": offsets,
+            }
+
+        @staticmethod
+        def _tool_calls(calls: list) -> list[dict]:
+            return [
+                {
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }
+                for name, arguments in calls
+            ]
+
+        def _completion(self, kind: str, done: dict, logprobs) -> dict:
+            made = {
                 "created": int(time.time()),
                 "model": chat.name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": done["text"]},
-                        "finish_reason": done["finish"],
-                    }
-                ],
                 "usage": _usage(done),
                 **({"shem_receipt": done["receipt"]} if "receipt" in done else {}),
             }
+            shown = self._logprobs(kind, done["logprobs"], done["text"]) if logprobs is not None else None
+            if kind == "text":
+                return {
+                    "id": f"cmpl-{uuid.uuid4().hex}",
+                    "object": "text_completion",
+                    **made,
+                    "choices": [{"index": 0, "text": done["text"], "logprobs": shown, "finish_reason": done["finish"]}],
+                }
+            reply = {"role": "assistant", "content": done["text"] or (None if done["calls"] else "")}
+            if done["calls"]:
+                reply["tool_calls"] = self._tool_calls(done["calls"])
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                **made,
+                "choices": [{"index": 0, "message": reply, "logprobs": shown, "finish_reason": done["finish"]}],
+            }
 
-        def _stream(self, messages, max_tokens, stops, options, draw, receipt) -> None:
+        def _stream(self, kind: str, ask: dict, options: dict) -> None:
             """Server-sent events: a chunk for each piece of the reply as it
             comes, then one that says why it ended, then [DONE]."""
             self.send_response(200)
@@ -420,16 +580,23 @@ def handler(chat: Chat):
             self.end_headers()
             self.close_connection = True
             base = {
-                "id": f"chatcmpl-{uuid.uuid4().hex}",
-                "object": "chat.completion.chunk",
+                "id": f"{'chatcmpl' if kind == 'chat' else 'cmpl'}-{uuid.uuid4().hex}",
+                "object": "chat.completion.chunk" if kind == "chat" else "text_completion",
                 "created": int(time.time()),
                 "model": chat.name,
             }
 
             def send(
-                delta: dict, finish: str | None = None, usage: dict | None = None, receipt: dict | None = None
+                delta: dict | str,
+                finish: str | None = None,
+                usage: dict | None = None,
+                receipt: dict | None = None,
             ) -> None:
-                event = {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                if kind == "chat":
+                    choice = {"index": 0, "delta": delta, "finish_reason": finish}
+                else:
+                    choice = {"index": 0, "text": delta, "logprobs": None, "finish_reason": finish}
+                event = {**base, "choices": [choice]}
                 if usage is not None:
                     event["usage"] = usage
                 if receipt is not None:
@@ -437,10 +604,11 @@ def handler(chat: Chat):
                 self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
                 self.wfile.flush()
 
-            send({"role": "assistant", "content": ""})
+            if kind == "chat":
+                send({"role": "assistant", "content": ""})
             try:
                 done = chat.complete(
-                    messages, max_tokens, stops, out=lambda text: send({"content": text}), draw=draw, receipt=receipt
+                    **ask["complete"], out=lambda text: send({"content": text} if kind == "chat" else text)
                 )
             except (BrokenPipeError, ConnectionError):
                 return  # the client left
@@ -450,8 +618,11 @@ def handler(chat: Chat):
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 return
+            if done["calls"]:
+                calls = [{"index": i, **call} for i, call in enumerate(self._tool_calls(done["calls"]))]
+                send({"tool_calls": calls})
             usage = _usage(done) if options.get("include_usage") else None
-            send({}, done["finish"], usage, done.get("receipt"))
+            send({} if kind == "chat" else "", done["finish"], usage, done.get("receipt"))
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
 

@@ -395,12 +395,16 @@ docker run -d -p 8000:8000 --runtime io.containerd.shem.v1 --platform linux/risc
 | Endpoint | Answers with |
 |---|---|
 | `POST /v1/chat/completions` | A reply to the messages; with `"stream": true`, server-sent events as it comes |
+| `POST /v1/completions` | A continuation of a text, with no chat template: `prompt` is one text; `max_tokens`, `stop`, `stream` and `logprobs` apply |
 | `GET /v1/models` | The model, by the repository it came from |
 | `GET /health` | 200 once the model is loaded |
 
 - Replies are greedy, as the driver's are, unless the image or a request gives a `temperature`; then `top_p`, `top_k` and `seed` apply too, and the same seed draws the same reply. `n` must be 1. `max_tokens` and `stop` apply.
 - The image's system prompt comes first unless a request gives its own, and a conversation that starts with the image's [primed session](#sessions-as-layers) goes on from it rather than reading it again.
 - Requests are answered together: up to 16 replies share each pass over the model's weights, which decoding is bound by reading, so several clients cost far less than one after another (a prompt is read alone, in turn, and a reply that fails or whose client leaves does not stop the others). Up to 32 requests wait, after which the API answers `429` with `Retry-After`. Gated DeltaNet and Mamba blocks step their sessions one after another within a pass, so batching helps those models less. Messages are text; tools in requests, and images, are not understood yet.
+- `tools` in a chat request are offered to the model through its chat template, and a reply that calls them comes back as `tool_calls` with `finish_reason` `tool_calls` (in a stream, as a chunk of `tool_calls`); `tool` and `assistant` messages with `tool_calls` carry the conversation on. The caller runs the tools, as with OpenAI. `tool_choice` is `auto` or `none`: shem does not force a call.
+- `logprobs` (with `top_logprobs` in a chat request) gives the log probability of each token of the reply and of the likeliest others, from the model's own distribution, before any temperature; not in a stream yet.
+- `response_format` can be `text` only: shem does not constrain a reply to JSON, so asking for more is an error rather than ignored.
 - It listens on `127.0.0.1` unless given `--host`. Set `SHEM_API_KEY` in the environment, and every request but `/health` must send `Authorization: Bearer KEY`; under Docker, the model server's environment is the one that counts. A key is read from the environment, not an option, so that `ps` does not show it.
 - A page in a browser may call the API only from an origin that `--cors-origin ORIGIN` allows (or `*`).
 - A request body may be 8 MiB, and a client that stays silent for 60 seconds is dropped. A failure after a stream has begun is sent as an `error` event before `[DONE]`.

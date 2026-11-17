@@ -32,19 +32,35 @@ class Replies:
         self.asked = []
         self.api_key, self.cors, self.fail = api_key, list(cors), fail
         self.waiting = threading.BoundedSemaphore(serve.MAX_WAITING)
+        self.tokenizer = SimpleNamespace(
+            encode=lambda text: [ord(c) % 60 for c in text], decode=lambda ids: "".join(f"<{i}>" for i in ids)
+        )
+        self.calls = []
 
-    def prompt(self, messages):
+    def prompt(self, messages, tools=None):
         return [0] * 3
 
-    def complete(self, messages, max_tokens=None, stops=(), out=None, draw=None, receipt=False):
+    def check(self, tokens):
+        return tokens
+
+    def complete(self, messages, max_tokens=None, stops=(), out=None, draw=None, receipt=False, tools=None, **more):
         self.asked.append((messages, max_tokens, list(stops)))
-        self.drew = draw
+        self.drew, self.more, self.tools = draw, more, tools
         if self.fail:
             raise RuntimeError(self.fail)
         for piece in ("Hel", "lo"):
             if out is not None:
                 out(piece)
-        return {"text": "Hello", "finish": "stop", "prompt_tokens": 3, "completion_tokens": 2}
+        done = {
+            "text": "Hello",
+            "calls": self.calls if tools else [],
+            "finish": "tool_calls" if self.calls and tools else "stop",
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+        }
+        if more.get("logprobs") is not None:
+            done["logprobs"] = [(7, -0.5, [(7, -0.5), (8, -1.5)][: more["logprobs"]]), (9, -2.0, [])]
+        return done
 
 
 @pytest.fixture
@@ -90,7 +106,7 @@ def test_completions_answer_as_openai_does(api):
     reply = json.loads(data)
     assert reply["object"] == "chat.completion" and reply["model"] == "tiny/model"
     assert reply["choices"] == [
-        {"index": 0, "message": {"role": "assistant", "content": "Hello"}, "finish_reason": "stop"}
+        {"index": 0, "message": {"role": "assistant", "content": "Hello"}, "logprobs": None, "finish_reason": "stop"}
     ]
     assert reply["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
     # A developer's message is a system one, and parts of text are one text
@@ -130,7 +146,7 @@ def test_the_model_and_health_are_listed(api):
         {"messages": [{"role": "user", "content": "Hi"}], "n": 2},
         {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 0},
         {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]},
-        {"messages": [{"role": "tool", "content": "42"}]},
+        {"messages": [{"role": "tool", "content": 42}]},
     ],
 )
 def test_requests_it_cannot_answer_say_why(api, body):
@@ -142,7 +158,7 @@ def test_requests_it_cannot_answer_say_why(api, body):
 
 def test_other_paths_are_not_found(api):
     _, url = api
-    assert call(f"{url}/v1/completions", {"prompt": "Hi"})[0] == 404
+    assert call(f"{url}/v1/embeddings", {"input": "Hi"})[0] == 404
     assert call(f"{url}/")[0] == 404
 
 
@@ -168,6 +184,9 @@ class Characters:
 
     def chat(self, messages, tools=None):
         return self.prefix(messages) + [self.ROLES["assistant"]]
+
+    def encode(self, text):
+        return [4 + ord(c) % 60 for c in text]
 
     def prefix(self, messages):
         tokens = []
@@ -613,3 +632,100 @@ def test_the_api_returns_a_receipt_when_asked_to():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_text_completions_continue_a_text_without_a_chat_template(api):
+    replies, url = api
+    status, data = call(f"{url}/v1/completions", {"prompt": "Once", "max_tokens": 5, "stop": ["\n"]})
+    assert status == 200
+    reply = json.loads(data)
+    assert reply["object"] == "text_completion" and reply["choices"][0]["text"] == "Hello"
+    assert reply["choices"][0]["finish_reason"] == "stop" and reply["usage"]["total_tokens"] == 5
+    assert replies.more["prompt_tokens"] == [ord(c) % 60 for c in "Once"]
+    assert replies.asked[-1][0] is None, "no messages: the prompt is the text itself"
+    status, data = call(f"{url}/v1/completions", {"prompt": "Once", "stream": True})
+    events = [json.loads(e.removeprefix("data: ")) for e in data.decode().split("\n\n") if e and "[DONE]" not in e]
+    assert [e["choices"][0]["text"] for e in events] == ["Hel", "lo", ""] and events[0]["object"] == "text_completion"
+    assert call(f"{url}/v1/completions", {"prompt": [1, 2, 3]})[0] == 400
+    assert call(f"{url}/v1/completions", {})[0] == 400
+
+
+def test_log_probabilities_come_back_in_the_endpoints_shapes(api):
+    replies, url = api
+    status, data = call(f"{url}/v1/chat/completions", HI | {"logprobs": True, "top_logprobs": 2})
+    assert status == 200
+    content = json.loads(data)["choices"][0]["logprobs"]["content"]
+    assert content[0]["token"] == "<7>" and content[0]["logprob"] == -0.5
+    assert [t["logprob"] for t in content[0]["top_logprobs"]] == [-0.5, -1.5] and content[1]["top_logprobs"] == []
+    status, data = call(f"{url}/v1/completions", {"prompt": "Hi", "logprobs": 1})
+    shown = json.loads(data)["choices"][0]["logprobs"]
+    assert shown["tokens"] == ["<7>", "<9>"] and shown["token_logprobs"] == [-0.5, -2.0]
+    assert shown["text_offset"] == [0, 3] and shown["top_logprobs"][0] == {"<7>": -0.5}
+    assert json.loads(call(f"{url}/v1/chat/completions", HI)[1])["choices"][0]["logprobs"] is None
+    assert call(f"{url}/v1/chat/completions", HI | {"logprobs": True, "stream": True})[0] == 400
+    assert call(f"{url}/v1/chat/completions", HI | {"logprobs": True, "top_logprobs": 99})[0] == 400
+
+
+def test_tools_are_offered_and_their_calls_come_back(api):
+    replies, url = api
+    replies.calls = [("mul", {"a": 6, "b": 7})]
+    tool = {
+        "type": "function",
+        "function": {"name": "mul", "description": "Multiply", "parameters": {"type": "object"}},
+    }
+    status, data = call(f"{url}/v1/chat/completions", HI | {"tools": [tool]})
+    assert status == 200 and replies.tools == [tool]
+    choice = json.loads(data)["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    made = choice["message"]["tool_calls"][0]
+    assert made["type"] == "function" and made["function"] == {"name": "mul", "arguments": '{"a": 6, "b": 7}'}
+    status, data = call(f"{url}/v1/chat/completions", HI | {"tools": [tool], "stream": True})
+    events = [json.loads(e.removeprefix("data: ")) for e in data.decode().split("\n\n") if e and "[DONE]" not in e]
+    calls = next(e for e in events if "tool_calls" in e["choices"][0]["delta"])["choices"][0]["delta"]["tool_calls"]
+    assert calls[0]["index"] == 0 and calls[0]["function"]["name"] == "mul"
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    # Not offered, or forbidden, they are not called
+    assert json.loads(call(f"{url}/v1/chat/completions", HI)[1])["choices"][0]["finish_reason"] == "stop"
+    forbidden = HI | {"tools": [tool], "tool_choice": "none"}
+    assert json.loads(call(f"{url}/v1/chat/completions", forbidden)[1])["choices"][0]["finish_reason"] == "stop"
+    assert call(f"{url}/v1/chat/completions", HI | {"tools": [tool], "tool_choice": "required"})[0] == 400
+    assert call(f"{url}/v1/chat/completions", HI | {"tools": [{"type": "retrieval"}]})[0] == 400
+
+
+def test_a_conversation_with_tool_calls_and_replies_is_what_the_template_takes():
+    made = serve.message(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "mul", "arguments": '{"a": 6}'}}],
+        }
+    )
+    assert made == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"type": "function", "function": {"name": "mul", "arguments": {"a": 6}}}],
+    }
+    assert serve.message({"role": "tool", "tool_call_id": "c1", "content": "42"}) == {"role": "tool", "content": "42"}
+    with pytest.raises(ValueError):
+        serve.message({"role": "assistant", "tool_calls": [{"function": {"name": "m", "arguments": "[1]"}}]})
+
+
+def test_response_formats_it_cannot_keep_are_refused_not_ignored(api):
+    _, url = api
+    assert call(f"{url}/v1/chat/completions", HI | {"response_format": {"type": "text"}})[0] == 200
+    status, data = call(f"{url}/v1/chat/completions", HI | {"response_format": {"type": "json_object"}})
+    assert status == 400 and "response_format" in json.loads(data)["error"]["message"]
+
+
+def test_a_real_model_gives_log_probabilities_and_continues_raw_text():
+    chat = chat_of(max_tokens=5)
+    done = chat.complete([{"role": "user", "content": "Hi"}], logprobs=2)
+    assert len(done["logprobs"]) == done["completion_tokens"] == 5
+    for token, logprob, top in done["logprobs"]:
+        assert logprob <= 0 and len(top) == 2
+        assert top[0][0] == token and abs(top[0][1] - logprob) < 1e-6, "greedy chooses the likeliest"
+        assert top[0][1] >= top[1][1]
+    assert "logprobs" not in chat.complete([{"role": "user", "content": "Hi"}])
+    raw = chat.complete(None, prompt_tokens=Characters().encode("Once upon"), max_tokens=4)
+    assert raw["completion_tokens"] == 4 and raw["prompt_tokens"] == len("Once upon")
+    assert not raw["text"].startswith("\n") and raw["calls"] == []

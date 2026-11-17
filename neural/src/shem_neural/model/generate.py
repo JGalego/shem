@@ -63,8 +63,25 @@ class Session:
         self.choices: list[tuple[int, float]] | None = None
         #: How the next token is drawn, if not the likeliest
         self.sampler: Sampler | None = None
+        #: Each token chosen, its log probability and the likeliest others', when a list is put here
+        self.logprobs: list[tuple[int, float, list[tuple[int, float]]]] | None = None
+        self.top_logprobs = 0
 
     def choose(self) -> int:
+        token = self._choose()
+        if self.logprobs is not None:
+            logp = torch.log_softmax(self.logits.float(), dim=-1)
+            top = logp.topk(self.top_logprobs) if self.top_logprobs else None
+            self.logprobs.append(
+                (
+                    token,
+                    float(logp[token]),
+                    list(zip(top.indices.tolist(), top.values.tolist(), strict=True)) if top else [],
+                )
+            )
+        return token
+
+    def _choose(self) -> int:
         """The token the session continues with: the likeliest. A session
         that keeps its choices adds it, with its margin: how far its logit
         is ahead of the runner-up's."""
