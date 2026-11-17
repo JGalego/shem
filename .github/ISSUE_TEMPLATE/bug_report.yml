@@ -1,0 +1,46 @@
+name: Bug report
+description: Something shem does that it should not, or does not that it says it does
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: The command you ran, what it printed, and what you thought it would do.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The Shemfile or Dockerfile, the model or program, the commands. Smaller is better; a tiny model such as `trl-internal-testing/tiny-Qwen3ForCausalLM` is enough for most bugs.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `shem doctor`
+      description: It lists the versions and the setup of what shem found on your machine.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where it happens
+      multiple: true
+      options:
+        - shem run / build / push / pull
+        - A model image or the model server
+        - The OpenAI API (shem serve)
+        - A program or VM container
+        - The containerd shim, Docker or Kubernetes
+        - The neural vCPU
+        - A Space or the registry
+        - Docs or examples
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
+      description: Logs (`$SHEM_HOME/server.log` for the model server, `/run/shem/shim.log` for the shim), the checkpoint's name, the device.

@@ -1,0 +1,21 @@
+name: Feature request
+description: Something shem could do that it does not
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you want to do
+      description: The task, not the solution. What would you run, and what should happen?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How you think it could work
+      description: "A sketch is enough. For a change to the design, a new Shemfile instruction or a new device, this is the issue the maintainers ask for before a pull request."
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead today
+      description: "Another tool, a script, a workaround. Check the README's 'When to use shem' first: some things are on purpose not here."

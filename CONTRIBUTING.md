@@ -9,6 +9,19 @@ Thanks for helping. shem is experimental, so small, focused changes with tests a
 - Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 - Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
+## Where to start
+
+Small, self-contained changes that do not need the whole design in your head, each with a test to write alongside:
+
+- **A model family.** Add an importer for an architecture [the list](docs/models.md#imported-models) lacks: a tensor reader in `neural/src/shem_neural/model/importers.py`, a tiny random checkpoint in `neural/tests/test_importers.py`, and a row in the docs.
+- **A system call a guest needs.** Run a program, see `guest made unsupported system call N` on stderr, and add it ([how](#extend-shem)). `sendmsg`, `recvmsg` and `epoll` are not here yet.
+- **An example.** An interpreter or a tool built from source for RV32, as [`examples/lua`](examples/lua/Shemfile) is: SQLite, MicroPython, a small HTTP server using the container's [sockets](docs/architecture.md#isolation).
+- **A fuzz target.** What `shem registry` reads from the Hub, or the Python importers read from a checkpoint's `config.json`, as [`fuzz/`](fuzz/) does for Rust's parsers.
+- **A type error.** `neural/mypy-baseline.txt` lists the type errors that are known; fix one, run `scripts/mypy-ratchet --update`, and the list shrinks.
+- **Docs.** A guide for a task you did that took you longer than it should, or a correction where the docs and what shem does part.
+
+Say in an issue which you are taking, so that two of you do not.
+
 ## Build and test
 
 Use Rust 1.88+, [uv](https://docs.astral.sh/uv/), Go for the BuildKit frontend, and Docker for guest builds. The [toolchain image](toolchain/Dockerfile) cross-compiles RV32 programs with Zig and musl.
