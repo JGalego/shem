@@ -182,6 +182,10 @@ def throughput(neural, weights, device: str, sizes: list[int], seconds: float) -
         batch = None
         try:
             started = time.perf_counter()
+            if options["compile"]:
+                # Each size is compiled for its own shape, and each batch is a new object to guard on: the
+                # compiler's count of recompiles of the step is for one program, not for the whole sweep
+                torch._dynamo.reset()
             batch = Batch(weights, size, MEM, where, **options)
             for k in range(size):
                 batch.state.mem.set_bytes(k, 0, code)
