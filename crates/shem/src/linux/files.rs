@@ -576,7 +576,38 @@ impl Process {
                     // creates them for read-only opens.
                     options.create(true).write(true);
                 }
-                let file = options.open(&resolved.host)?;
+                // Opened beneath the root in one step where the kernel can, so that a
+                // link swapped in on the host since the path was resolved leads nowhere
+                let beneath = self.root.as_deref().and_then(|root| {
+                    // As the options above say it: Linux creates a file for a read-only
+                    // open too, which the host does only for one open for writing
+                    let write = access != O_RDONLY || creating;
+                    let mut how = match (access != O_WRONLY, write) {
+                        (true, true) => libc::O_RDWR,
+                        (true, false) => libc::O_RDONLY,
+                        _ => libc::O_WRONLY,
+                    };
+                    if creating {
+                        how |= libc::O_CREAT;
+                    }
+                    if flags & O_APPEND != 0 {
+                        how |= libc::O_APPEND;
+                    }
+                    if flags & O_TRUNC != 0 && access != O_RDONLY {
+                        how |= libc::O_TRUNC;
+                    }
+                    // openat2 refuses a mode unless it creates
+                    let mode = if creating {
+                        (mode & !self.umask) & 0o7777
+                    } else {
+                        0
+                    };
+                    root.open_beneath(&resolved.guest, how | libc::O_NOFOLLOW, mode)
+                });
+                let file = match beneath {
+                    Some(opened) => opened?,
+                    None => options.open(&resolved.host)?,
+                };
                 if !file.metadata()?.is_file() {
                     return Err(Errno::EPERM);
                 }

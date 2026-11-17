@@ -30,6 +30,9 @@ const NAME_MAX: usize = 255;
 
 pub struct RootFs {
     root: PathBuf,
+    /// The root, opened, for `open_beneath`
+    #[cfg(target_os = "linux")]
+    dir: std::fs::File,
     /// Guest inode numbers by host device and inode, handed out in the order
     /// files are first seen, so they do not depend on the host filesystem.
     inodes: Mutex<HashMap<(u64, u64), u64>>,
@@ -49,10 +52,82 @@ impl RootFs {
         if !root.is_dir() {
             return Err(ErrorKind::NotADirectory.into());
         }
+        #[cfg(target_os = "linux")]
+        let dir = std::fs::File::open(&root)?;
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            dir,
             root,
             inodes: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Open the file at the canonical guest path `guest` (as `resolve` made
+    /// it, with no links in it), in one step the kernel keeps under the root:
+    /// no component may be a symlink, and none may lead out, even if another
+    /// process on the host swaps one for a link between `resolve` and this.
+    /// `flags` and `mode` are those of `open(2)`. None where the kernel has
+    /// no `openat2` (Linux before 5.6, or another system), when the caller
+    /// opens the host path as it always did.
+    pub fn open_beneath(
+        &self,
+        guest: &[u8],
+        flags: i32,
+        mode: u32,
+    ) -> Option<std::io::Result<std::fs::File>> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static MISSING: AtomicBool = AtomicBool::new(false);
+            if MISSING.load(Ordering::Relaxed) {
+                return None;
+            }
+            #[repr(C)]
+            struct OpenHow {
+                flags: u64,
+                mode: u64,
+                resolve: u64,
+            }
+            const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+            const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+            const RESOLVE_BENEATH: u64 = 0x08;
+            let relative = guest.strip_prefix(b"/").unwrap_or(guest);
+            let relative = if relative.is_empty() { b"." } else { relative };
+            let path = std::ffi::CString::new(relative).ok()?;
+            let how = OpenHow {
+                flags: (flags | libc::O_CLOEXEC) as u64,
+                mode: u64::from(mode),
+                resolve: RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+            };
+            // SAFETY: the descriptor, the path and the struct are valid for the call
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    self.dir.as_raw_fd(),
+                    path.as_ptr(),
+                    &how,
+                    std::mem::size_of::<OpenHow>(),
+                )
+            };
+            if fd >= 0 {
+                // SAFETY: a new descriptor that nothing else owns
+                return Some(Ok(unsafe { std::fs::File::from_raw_fd(fd as i32) }));
+            }
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::ENOSYS) => {
+                    MISSING.store(true, Ordering::Relaxed);
+                    None
+                }
+                _ => Some(Err(err)),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (guest, flags, mode);
+            None
+        }
     }
 
     /// The guest inode number of the host file `ino` on the host device `dev`.

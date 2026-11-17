@@ -132,3 +132,55 @@ fn rejects_empty_and_overlong_paths() {
         Err(Errno::ENAMETOOLONG)
     );
 }
+
+#[cfg(target_os = "linux")]
+mod beneath {
+    use super::*;
+    use std::io::Read;
+
+    /// `open_beneath` for a read, as the O_RDONLY a guest's open becomes.
+    fn read(root: &Root, guest: &str) -> Option<std::io::Result<String>> {
+        root.fs
+            .open_beneath(guest.as_bytes(), libc::O_RDONLY | libc::O_NOFOLLOW, 0)
+            .map(|file| {
+                let mut text = String::new();
+                file?.read_to_string(&mut text)?;
+                Ok(text)
+            })
+    }
+
+    #[test]
+    fn a_file_is_opened_beneath_the_root_in_one_step() {
+        let root = root();
+        fs::create_dir(root.host.join("data")).unwrap();
+        fs::write(root.host.join("data/note"), "inside").unwrap();
+        let Some(opened) = read(&root, "/data/note") else {
+            return; // a kernel before openat2
+        };
+        assert_eq!(opened.unwrap(), "inside");
+    }
+
+    #[test]
+    fn a_link_swapped_in_after_the_path_was_resolved_leads_nowhere() {
+        let root = root();
+        let secret = tempfile::tempdir().unwrap();
+        fs::write(secret.path().join("note"), "the host's").unwrap();
+        fs::create_dir(root.host.join("data")).unwrap();
+        fs::write(root.host.join("data/note"), "inside").unwrap();
+        // The guest's open resolved /data/note, a file in a directory. Then another
+        // process on the host replaces the directory with a link to a place outside.
+        let resolved = root.fs.resolve(b"/", b"/data/note", true).unwrap();
+        fs::rename(root.host.join("data"), root.host.join("data.old")).unwrap();
+        symlink(secret.path(), root.host.join("data")).unwrap();
+        // Opening the host path, as an open does without openat2, would read the host's file
+        assert_eq!(fs::read_to_string(&resolved.host).unwrap(), "the host's");
+        let Some(opened) = read(&root, std::str::from_utf8(&resolved.guest).unwrap()) else {
+            return;
+        };
+        let err = opened.expect_err("a link in the way is refused, not followed");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        // Nor does a path that climbs out get anywhere
+        let climbs = read(&root, "/../../etc/hostname").unwrap();
+        assert!(climbs.is_err());
+    }
+}
