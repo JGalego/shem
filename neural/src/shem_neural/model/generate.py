@@ -543,6 +543,11 @@ def run(
     a receipt's, which the reply is checked against. Returns the driver's
     exit status: 0, unless a replay is not the receipt's."""
     checked = receipt.load(args.replay) if args.replay else None
+    if checked and checked.get("messages"):
+        # A conversation the API answered: replayed as it was asked
+        status, why = receipt.replay_messages(model, tokenizer, checked, out)
+        print(f"shem: {receipt.VERDICTS[status]}: {why}", file=err)
+        return status
     session = start(model, tokenizer, args, err)
     if session is None:
         return 0

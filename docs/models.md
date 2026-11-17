@@ -476,7 +476,7 @@ shem: verified: the model chose the receipt's 18 tokens again
 
 Decoding repeats exactly on one device, while two devices round sums differently. A choice holds on any device whose logits are within half its margin of the receipt's. shem calls a choice close under a margin of 0.002 in float32, twice the tolerance [imports are held to](#comparing-an-import-with-transformers) against transformers, and 0.5 in bfloat16. These are rules of thumb, not bounds measured between devices. A receipt's closest call is printed when it is written.
 
-A replay shows that this image gives this reply to this prompt. It does not show who ran it, or when: for that, sign the receipt, as with `cosign sign-blob`. To see what a change to the prompt does, run the changed prompt: nothing is sampled, so any difference in the reply comes from the change.
+A replay shows that this image gives this reply to this prompt. It does not show who ran it, or when: for that, sign the receipt. `shem sign receipt.json` hands it to [cosign](https://docs.sigstore.dev/cosign/) (keyless, by your identity, or with `--key`) and writes `receipt.json.sigstore.json` beside it; `shem verify receipt.json --certificate-identity ME --certificate-oidc-issuer ISSUER` checks it, and the signature's entry in Sigstore's transparency log says when. `SHEM_COSIGN` names another cosign. To see what a change to the prompt does, run the changed prompt: nothing is sampled, so any difference in the reply comes from the change.
 
 The [shem replay](https://huggingface.co/spaces/jgalego/shem-replay) Space checks a receipt in a browser: paste one, and it pulls the image, replays the prompt, and shows the verdict and each token marked by its margin. It then runs a changed prompt on the same image and shows how the reply differs, a word at a time. It takes receipts of images in public Hugging Face repos, up to 2.5 GB and 512 tokens, whose entrypoints run a model and nothing else: no tools and no server. Its steps are [`space/replay.py`](../space/replay.py), which runs from a terminal too:
 
@@ -486,7 +486,7 @@ uv run --project neural python space/replay.py receipt.json --prompt "Who am I?"
 
 ![The shem replay Space: a receipt is replayed and verified, with each token marked by how firmly it was chosen; a changed prompt shows which words of the reply change; and a receipt whose reply was edited comes back as a mismatch.](assets/shem-replay.gif)
 
-Receipts come from `shem run` only. Sessions under Docker and the API server write none yet. A receipt names its image by the reference the run was given, so once a repo is pushed to again, checking an older receipt takes the image it was made with, given to `shem replay RECEIPT IMAGE`.
+Receipts come from `shem run`, and from the API on request: a chat completion request with `"shem_receipt": true` gets a receipt of its reply in the response, and in a stream's last chunk. It holds the `messages` the model was given (the image's system prompt included), the `request` limits (`max_tokens`, `stop`) and the image `shem serve` named, and `shem replay` reads the conversation again and draws the reply as the API did; under Docker the server does not know its image's digest, so those receipts name none. Sessions under Docker write none yet. A receipt names its image by the reference the run was given, so once a repo is pushed to again, checking an older receipt takes the image it was made with, given to `shem replay RECEIPT IMAGE`.
 
 ## Running
 

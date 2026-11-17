@@ -36,7 +36,7 @@ class Replies:
     def prompt(self, messages):
         return [0] * 3
 
-    def complete(self, messages, max_tokens=None, stops=(), out=None, draw=None):
+    def complete(self, messages, max_tokens=None, stops=(), out=None, draw=None, receipt=False):
         self.asked.append((messages, max_tokens, list(stops)))
         self.drew = draw
         if self.fail:
@@ -573,3 +573,43 @@ def test_a_reply_that_fails_ends_its_request_with_the_error(monkeypatch):
     monkeypatch.setattr(serve.Session, "feed_batch", staticmethod(broken))
     with pytest.raises(RuntimeError, match="no memory"):
         chat.complete([{"role": "user", "content": "Hi"}])
+
+
+def test_a_reply_can_come_with_a_receipt_that_replays_it():
+    import io
+
+    from shem_neural.model import receipt
+
+    model = Model(TINY)
+    args = SimpleNamespace(max_tokens=6, stop=[], system="You are tiny.", subject=["image=tiny@sha256:ab"])
+    tokenizer = Characters()
+    chat = serve.Chat(model, tokenizer, args)
+    done = chat.complete([{"role": "user", "content": "Hi"}], draw={"temperature": 1.2, "seed": 3}, receipt=True)
+    written = done["receipt"]
+    assert written["image"] == "tiny@sha256:ab" and written["sampling"]["seed"] == 3
+    assert written["messages"][0] == {"role": "system", "content": "You are tiny."}
+    assert written["prompt"] == "Hi" and written["reply"] == done["text"]
+    assert len(written["tokens"]) == len(written["margins"]) == done["completion_tokens"]
+    status, why = receipt.replay_messages(model, tokenizer, written, io.StringIO())
+    assert status == receipt.SAME, why
+    forged = {**written, "tokens": [(t + 1) % 60 for t in written["tokens"]]}
+    assert receipt.replay_messages(model, tokenizer, forged)[0] in (receipt.DIFFERENT, receipt.UNDECIDED)
+    assert "receipt" not in chat.complete([{"role": "user", "content": "Hi"}])
+
+
+def test_the_api_returns_a_receipt_when_asked_to():
+    chat = chat_of()
+    server = serve.start(chat, serve.listen("127.0.0.1", 0))
+    host, port = server.server_address
+    try:
+        body = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 3, "shem_receipt": True}
+        status, data = call(f"http://{host}:{port}/v1/chat/completions", body)
+        assert status == 200 and json.loads(data)["shem_receipt"]["format"] == "shem.receipt/v1"
+        status, data = call(f"http://{host}:{port}/v1/chat/completions", body | {"stream": True})
+        events = [json.loads(e.removeprefix("data: ")) for e in data.decode().split("\n\n") if e and "[DONE]" not in e]
+        assert events[-1]["shem_receipt"]["reply"]
+        status, data = call(f"http://{host}:{port}/v1/chat/completions", {"messages": body["messages"]})
+        assert "shem_receipt" not in json.loads(data)
+    finally:
+        server.shutdown()
+        server.server_close()

@@ -103,6 +103,60 @@ def record(session, prompt: str, subjects: dict[str, str] | None = None) -> dict
     }
 
 
+def record_messages(
+    session, messages: list[dict], text: str, request: dict, subjects: dict[str, str] | None = None
+) -> dict:
+    """The receipt of a reply to a conversation, as the API makes one:
+    `messages` is what the model was given, `text` the reply, and `request`
+    the limits it was made under (`max_tokens`, `stop`), which a replay keeps.
+    The `prompt` is the last user message, for whoever reads it."""
+    choices = session.choices or []
+    drawn = session.sampler is not None and not session.sampler.greedy
+    user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+    return {
+        "format": FORMAT,
+        **(subjects or {}),
+        "prompt": user,
+        "messages": messages,
+        "reply": text,
+        "tokens": [token for token, _ in choices],
+        "margins": [round(margin, 6) for _, margin in choices],
+        "request": request,
+        **({"sampling": session.sampler.settings()} if drawn else {}),
+        "runtime": runtime(session.model),
+    }
+
+
+def replay_messages(model, tokenizer, checked: dict, out=None) -> tuple[int, str]:
+    """Reply to the conversation in the receipt `checked`, as the API did,
+    and compare: the verdict and why. The reply it makes is written to `out`."""
+    import io
+
+    from .generate import Reply, Session
+    from .sampling import Sampler
+
+    messages, request = checked["messages"], checked.get("request", {})
+    session = Session(model)
+    session.choices = []
+    if checked.get("sampling"):
+        session.sampler = Sampler(**checked["sampling"])
+    session.feed(tokenizer.chat(messages))
+    made = Reply(
+        session,
+        tokenizer,
+        request.get("max_tokens") or len(checked["tokens"]),
+        io.StringIO(),
+        stops=request.get("stop"),
+    )
+    while (token := made.next()) is not None:
+        session.feed([token])
+    text = made.out.getvalue().strip()
+    if out is not None:
+        print(text, file=out)
+    session.messages = [*messages, {"role": "assistant", "content": text}]
+    return check(checked, session)
+
+
 def save(receipt: dict, path: Path) -> None:
     """Write `receipt` to the file at `path`, a field to a line."""
     fields = [f" {json.dumps(key)}: {json.dumps(value, ensure_ascii=False)}" for key, value in receipt.items()]

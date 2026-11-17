@@ -34,6 +34,11 @@ enum Command {
     /// Check a receipt that `shem run --receipt` wrote: reply to its prompt
     /// on its image again, and see that the model chooses the same tokens
     Replay(ReplayArgs),
+    /// Sign a receipt with cosign, keyless unless given a key, writing
+    /// RECEIPT.sigstore.json beside it
+    Sign(SignArgs),
+    /// Check a receipt's signature with cosign, which says who signed it
+    Verify(VerifyArgs),
     /// Build an image from a Shemfile
     Build(BuildArgs),
     /// List the images in the local store
@@ -189,6 +194,25 @@ struct ReplayArgs {
     /// The image to replay it on rather than the one the receipt names; it
     /// must be the same one, by its digest
     image: Option<String>,
+}
+
+#[derive(Args)]
+struct SignArgs {
+    /// The receipt, as `shem run --receipt` wrote it
+    receipt: PathBuf,
+    /// Options for `cosign sign-blob`, such as `--key cosign.key`
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    cosign: Vec<String>,
+}
+
+#[derive(Args)]
+struct VerifyArgs {
+    /// The receipt, signed with `shem sign`
+    receipt: PathBuf,
+    /// Options for `cosign verify-blob`, which says who must have signed:
+    /// `--certificate-identity ME --certificate-oidc-issuer ISSUER`, or `--key cosign.pub`
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    cosign: Vec<String>,
 }
 
 #[derive(Args)]
@@ -418,6 +442,8 @@ fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Run(args) => run(args),
         Command::Replay(args) => replay(args),
+        Command::Sign(args) => cosign("sign-blob", &args.receipt, &args.cosign),
+        Command::Verify(args) => cosign("verify-blob", &args.receipt, &args.cosign),
         Command::Build(args) => build(args),
         Command::Images(args) => images(args),
         Command::Rmi(args) => rmi(args),
@@ -785,6 +811,44 @@ fn run_model(
     image::model::run_driver(&entrypoint, &options, input, &root, session, &log)
 }
 
+/// Run cosign on a receipt: `sign-blob` writes the signature's bundle beside
+/// it, `verify-blob` checks it. A receipt shows that an image gave a reply;
+/// the signature says who made the claim, and when.
+fn cosign(verb: &str, receipt: &Path, options: &[String]) -> anyhow::Result<u8> {
+    let bundle = {
+        let mut name = receipt.as_os_str().to_owned();
+        name.push(".sigstore.json");
+        PathBuf::from(name)
+    };
+    if !receipt.is_file() {
+        bail!("{}: no such receipt", receipt.display());
+    }
+    let mut command = std::process::Command::new(
+        std::env::var_os("SHEM_COSIGN").unwrap_or_else(|| "cosign".into()),
+    );
+    command.arg(verb).arg("--bundle").arg(&bundle);
+    if verb == "sign-blob" {
+        command.arg("--yes");
+    } else if !bundle.is_file() {
+        bail!(
+            "{}: no signature: sign the receipt with `shem sign` first",
+            bundle.display()
+        );
+    }
+    let status = command.args(options).arg(receipt).status().context(
+        "running cosign (https://docs.sigstore.dev/cosign/); install it or set SHEM_COSIGN",
+    )?;
+    if status.success() {
+        let done = if verb == "sign-blob" {
+            format!("signed: {}", bundle.display())
+        } else {
+            "the signature holds".to_string()
+        };
+        eprintln!("shem: {done}");
+    }
+    Ok(status.code().unwrap_or(1) as u8)
+}
+
 /// Check a receipt: find its image, which must have the digest it names,
 /// and have the driver reply to its prompt again and compare. The status is
 /// the driver's: 0 if the tokens are the receipt's, 1 if they are not, and
@@ -981,7 +1045,14 @@ fn serve(args: ServeArgs) -> anyhow::Result<u8> {
         true => format!("[{}]:{}", args.host, args.port),
         false => format!("{}:{}", args.host, args.port),
     };
-    image::model::serve(&image.config.entrypoint, &root, &address, &args.cors_origin)
+    let subject = format!("image={}", subject(&args.image, &digest));
+    image::model::serve(
+        &image.config.entrypoint,
+        &root,
+        &address,
+        &args.cors_origin,
+        &subject,
+    )
 }
 
 fn pull(args: PullArgs) -> anyhow::Result<u8> {

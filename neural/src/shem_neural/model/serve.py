@@ -5,6 +5,9 @@ clients and tools written for that API:
     GET  /v1/models             the model, by the repository it came from
     GET  /health                200 once the model is loaded
 
+A request with `"shem_receipt": true` gets a receipt of its reply, in the
+response (and a stream's last chunk), which `shem replay` checks.
+
 A request is refused unless it carries `Authorization: Bearer KEY` when the
 environment has `SHEM_API_KEY` (`/health` stays open, for probes); a page
 elsewhere may call the API only from an origin `--cors-origin` allows; a
@@ -36,6 +39,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import receipt as receipts
 from .generate import ContextFull, Reply, Session
 from .sampling import Sampler
 
@@ -67,6 +71,8 @@ class Chat:
             for key in ("temperature", "top_p", "top_k", "seed")
             if getattr(args, key, None) is not None
         }
+        #: What the host knows of this model that a receipt names it by: the image's reference and digest
+        self.subjects = dict(subject.split("=", 1) for subject in getattr(args, "subject", None) or [])
         #: The key requests must carry, from the environment, never the command line, where `ps` shows it
         self.api_key = os.environ.get("SHEM_API_KEY") or None
         #: Origins whose pages may call the API, or `*` for any
@@ -90,7 +96,13 @@ class Chat:
         return tokens
 
     def complete(
-        self, messages: list[dict], max_tokens: int | None = None, stops=(), out=None, draw: dict | None = None
+        self,
+        messages: list[dict],
+        max_tokens: int | None = None,
+        stops=(),
+        out=None,
+        draw: dict | None = None,
+        receipt: bool = False,
     ) -> dict:
         """Reply to `messages`, writing the text to `out` as it comes, drawing
         tokens as `draw` says over the image's own settings. Returns the
@@ -101,11 +113,15 @@ class Chat:
             if settings.get("temperature"):
                 sampler = Sampler(**settings)
         max_tokens = max_tokens or self.max_tokens
+        if self.system and not (messages and messages[0]["role"] == "system"):
+            messages = [{"role": "system", "content": self.system}] + messages
         job = Job()
         text = _Text(job.pieces.put)
         with self.prefill, self.compute():
             session = self._start(prompt)
             session.sampler = sampler
+            if receipt:
+                session.choices = []
             session.feed(prompt[len(session.tokens) :])
         job.made = Reply(session, self.tokenizer, max_tokens, text, stops=[*self.stops, *stops])
         self.batcher.submit(job)
@@ -120,7 +136,12 @@ class Chat:
         if job.error is not None:
             raise job.error
         tokens, room = job.made.tokens, session.room()
+        made = {}
+        if receipt:
+            request = {"max_tokens": max_tokens, "stop": [*self.stops, *stops]}
+            made = {"receipt": receipts.record_messages(session, messages, text.value.strip(), request, self.subjects)}
         return {
+            **made,
             "text": text.value.strip(),
             "finish": "length" if len(tokens) >= max_tokens or (room is not None and room < 1) else "stop",
             "prompt_tokens": len(prompt),
@@ -340,6 +361,7 @@ def handler(chat: Chat):
                 stops = [stops] if isinstance(stops, str) else list(stops)
                 if request.get("n", 1) != 1:
                     raise ValueError("n must be 1: a reply is one draw from one seed")
+                receipt = request.get("shem_receipt") is True
                 draw = {}
                 for key, kind in (("temperature", float), ("top_p", float), ("top_k", int), ("seed", int)):
                     if request.get(key) is not None:
@@ -358,10 +380,10 @@ def handler(chat: Chat):
                 return self._error(429, f"{MAX_WAITING} requests are waiting for the model: try again", "busy", retry=5)
             try:
                 if request.get("stream"):
-                    self._stream(messages, max_tokens, stops, request.get("stream_options") or {}, draw)
+                    self._stream(messages, max_tokens, stops, request.get("stream_options") or {}, draw, receipt)
                     return
                 try:
-                    done = chat.complete(messages, max_tokens, stops, draw=draw)
+                    done = chat.complete(messages, max_tokens, stops, draw=draw, receipt=receipt)
                 except Exception as error:  # the template, say, refusing the conversation
                     return self._error(500, f"no reply: {error}")
                 self._json(200, self._completion(done))
@@ -385,9 +407,10 @@ def handler(chat: Chat):
                     }
                 ],
                 "usage": _usage(done),
+                **({"shem_receipt": done["receipt"]} if "receipt" in done else {}),
             }
 
-        def _stream(self, messages, max_tokens, stops, options, draw) -> None:
+        def _stream(self, messages, max_tokens, stops, options, draw, receipt) -> None:
             """Server-sent events: a chunk for each piece of the reply as it
             comes, then one that says why it ended, then [DONE]."""
             self.send_response(200)
@@ -403,16 +426,22 @@ def handler(chat: Chat):
                 "model": chat.name,
             }
 
-            def send(delta: dict, finish: str | None = None, usage: dict | None = None) -> None:
+            def send(
+                delta: dict, finish: str | None = None, usage: dict | None = None, receipt: dict | None = None
+            ) -> None:
                 event = {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
                 if usage is not None:
                     event["usage"] = usage
+                if receipt is not None:
+                    event["shem_receipt"] = receipt
                 self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
                 self.wfile.flush()
 
             send({"role": "assistant", "content": ""})
             try:
-                done = chat.complete(messages, max_tokens, stops, out=lambda text: send({"content": text}), draw=draw)
+                done = chat.complete(
+                    messages, max_tokens, stops, out=lambda text: send({"content": text}), draw=draw, receipt=receipt
+                )
             except (BrokenPipeError, ConnectionError):
                 return  # the client left
             except Exception as error:  # after the headers, an error is an event, as OpenAI sends one
@@ -422,7 +451,7 @@ def handler(chat: Chat):
                 self.wfile.flush()
                 return
             usage = _usage(done) if options.get("include_usage") else None
-            send({}, done["finish"], usage)
+            send({}, done["finish"], usage, done.get("receipt"))
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
 
