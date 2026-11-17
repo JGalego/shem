@@ -184,11 +184,7 @@ impl Builder<'_> {
                     model: Some(format!("/{}", model::MODEL_DIR)),
                     ..Config::default()
                 };
-                model::import(
-                    &repo,
-                    revision.as_deref(),
-                    &self.root.join(model::MODEL_DIR),
-                )?;
+                self.import_model(&repo, revision.as_deref())?;
                 self.image.config.labels.extend(model::labels(&self.root)?);
                 for group in model::layer_groups(&self.root)? {
                     self.add_layer(&group, &[])?;
@@ -630,7 +626,60 @@ impl Builder<'_> {
     /// `WARM --until=prompt` in a model image: prime a session with the
     /// entrypoint's options, such as its system prompt, and freeze every
     /// block's state into the state layer.
+    /// Import `repo` at `revision` into the working copy. A model at a
+    /// pinned revision, a commit, is imported once: later builds link the
+    /// files the first one made. One at a branch could be another model by
+    /// now, so it is imported again, as are checkpoints in the build context.
+    fn import_model(&mut self, repo: &str, revision: Option<&str>) -> anyhow::Result<()> {
+        let into = self.root.join(model::MODEL_DIR);
+        let pinned =
+            revision.is_some_and(|r| r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit()));
+        let key = (Store::caching() && pinned && !Path::new(repo).exists()).then(|| {
+            cache_key(&[
+                env!("CARGO_PKG_VERSION"),
+                repo,
+                revision.unwrap_or_default(),
+            ])
+        });
+        if let Some(key) = &key
+            && Store::open()?.cached_import(key, &into)?
+        {
+            eprintln!(
+                "shem: using the model {repo}:{} imported before",
+                revision.unwrap_or_default()
+            );
+            return Ok(());
+        }
+        model::import(repo, revision, &into)?;
+        if let Some(key) = &key {
+            Store::open()?.cache_import(key, &into)?;
+        }
+        Ok(())
+    }
+
     fn warm_model(&mut self) -> anyhow::Result<()> {
+        // The session is the same for the same layers and the same driver
+        // options, so a build that has primed it before takes it from the cache
+        let key = Store::caching().then(|| {
+            let config = &self.image.config;
+            let mut parts: Vec<Vec<u8>> = vec![env!("CARGO_PKG_VERSION").into()];
+            for layer in &self.image.layers {
+                parts.push(layer.media_type.as_bytes().to_vec());
+                parts.push(layer.data.clone());
+            }
+            for list in [&config.entrypoint, &config.cmd, &config.env] {
+                parts.push(list.join("\0").into_bytes());
+            }
+            parts.push(config.workdir.clone().into_bytes());
+            cache_key_bytes(&parts)
+        });
+        if let Some(key) = &key
+            && let Some(state) = Store::open()?.cached_warm(key)
+        {
+            eprintln!("shem: using the session primed before");
+            self.set_state(state);
+            return Ok(());
+        }
         let out = tempfile::tempdir()?;
         model::warm(&self.image.config.entrypoint, &self.root, out.path())?;
         let mut files = Vec::new();
@@ -639,6 +688,9 @@ impl Builder<'_> {
         }
         let files: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (*n, d.as_slice())).collect();
         let state = layer::from_files(&files)?;
+        if let Some(key) = &key {
+            Store::open()?.cache_warm(key, &state)?;
+        }
         self.set_state(state);
         Ok(())
     }
@@ -696,6 +748,30 @@ impl Builder<'_> {
 }
 
 /// A guest path as a path relative to the root.
+/// A cache key: the digest of the parts, each told apart from the next by its length.
+fn cache_key(parts: &[&str]) -> String {
+    cache_key_bytes(
+        &parts
+            .iter()
+            .map(|p| p.as_bytes().to_vec())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn cache_key_bytes(parts: &[Vec<u8>]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part);
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn relative(guest: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(guest).trim_start_matches('/'))
 }
@@ -710,4 +786,17 @@ fn inside(base: &Path, path: &str) -> anyhow::Result<PathBuf> {
         bail!("COPY {path}: sources must stay inside the build context");
     }
     Ok(base.join(relative))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cache_key_tells_its_parts_apart() {
+        assert_eq!(cache_key(&["a", "b"]), cache_key(&["a", "b"]));
+        assert_ne!(cache_key(&["a", "b"]), cache_key(&["ab", ""]));
+        assert_ne!(cache_key(&["a", "b"]), cache_key(&["a", "c"]));
+        assert_eq!(cache_key(&["a"]).len(), 64);
+    }
 }

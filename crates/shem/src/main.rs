@@ -233,6 +233,10 @@ struct BuildArgs {
     /// Write the image as an OCI layout to this directory instead of the store
     #[arg(short, long, value_name = "DIR")]
     output: Option<PathBuf>,
+    /// Import models and prime sessions again, rather than take what an
+    /// earlier build kept (`shem prune --all` empties the cache)
+    #[arg(long)]
+    no_cache: bool,
     /// The build context: COPY sources are relative to it
     #[arg(default_value = ".")]
     context: PathBuf,
@@ -648,6 +652,10 @@ fn build(args: BuildArgs) -> anyhow::Result<u8> {
             .split_once('=')
             .context("expected --build-arg KEY=VALUE")?;
         build_args.insert(key.to_string(), value.to_string());
+    }
+    if args.no_cache {
+        // SAFETY: the build has not started any thread, and nothing else reads the environment meanwhile
+        unsafe { std::env::set_var("SHEM_NO_CACHE", "1") };
     }
     let options = BuildOptions {
         shemfile: args.file.unwrap_or_else(|| args.context.join("Shemfile")),

@@ -102,7 +102,7 @@ impl Store {
 
     /// Delete the copies the store keeps to run images that it no longer
     /// holds, or with `all` every copy, of images and of ModelPack artifacts
-    /// alike, to be made again when next run. Returns each path deleted and
+    /// alike, to be made again when next run, and the build cache. Returns each path deleted and
     /// the bytes that freed.
     pub fn prune(&self, all: bool) -> anyhow::Result<Vec<(PathBuf, u64)>> {
         let mut kept: HashSet<String> = HashSet::new();
@@ -127,6 +127,11 @@ impl Store {
                 doomed.push(unpacked);
             }
         }
+        if all {
+            // The build cache: models imported and sessions primed, made again by the next build
+            doomed.extend(entries(&self.cache("imports"))?);
+            doomed.extend(entries(&self.cache("warms"))?);
+        }
         let mut deleted = Vec::new();
         for path in doomed {
             let size = freed_by(&path)?;
@@ -134,6 +139,67 @@ impl Store {
             deleted.push((path, size));
         }
         Ok(deleted)
+    }
+
+    /// Whether the build cache is on, which `SHEM_NO_CACHE` or `shem build
+    /// --no-cache` turns off.
+    pub fn caching() -> bool {
+        std::env::var_os("SHEM_NO_CACHE").is_none_or(|value| value.is_empty())
+    }
+
+    /// Link the model a build cached under `key` into `to`, if it did.
+    pub fn cached_import(&self, key: &str, to: &Path) -> anyhow::Result<bool> {
+        let cached = self.cache("imports").join(key);
+        if !cached.join("shem.json").is_file() {
+            return Ok(false);
+        }
+        link_tree(&cached, to)?;
+        Ok(true)
+    }
+
+    /// Keep the model in `from` for builds that import the same checkpoint.
+    /// Its files are links, not copies, so the cache costs the weights once
+    /// until the build's own copies are gone.
+    pub fn cache_import(&self, key: &str, from: &Path) -> anyhow::Result<()> {
+        self.keep("imports", key, |staging| link_tree(from, staging))
+    }
+
+    /// The session a build cached under `key`.
+    pub fn cached_warm(&self, key: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.cache("warms").join(key).join("state.tar")).ok()
+    }
+
+    /// Keep the state layer a `WARM` made, for the build that would make it again.
+    pub fn cache_warm(&self, key: &str, state: &[u8]) -> anyhow::Result<()> {
+        self.keep("warms", key, |staging| {
+            std::fs::create_dir_all(staging)?;
+            std::fs::write(staging.join("state.tar"), state)?;
+            Ok(())
+        })
+    }
+
+    /// Make the entry `key` of the cache `name` with `fill`, in a staging
+    /// directory renamed into place, so that a build cut short leaves none.
+    fn keep(
+        &self,
+        name: &str,
+        key: &str,
+        fill: impl FnOnce(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let dir = self.cache(name);
+        let target = dir.join(key);
+        if target.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&dir)?;
+        let staging = tempfile::Builder::new().prefix(".").tempdir_in(&dir)?;
+        let inner = staging.path().join("entry");
+        fill(&inner)?;
+        // Another build may have made it meanwhile: either is the same
+        if std::fs::rename(&inner, &target).is_err() && !target.exists() {
+            bail!("keeping {} in the cache", target.display());
+        }
+        Ok(())
     }
 
     /// The directory beside the images where the store keeps `name`.
@@ -214,4 +280,38 @@ fn freed_by(path: &Path) -> anyhow::Result<u64> {
         .filter(|(_, links, seen)| seen >= links)
         .map(|(size, ..)| size)
         .sum())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_a_build_keeps_comes_back_and_prune_all_empties_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::at(home.path());
+        assert_eq!(store.cached_warm("k"), None);
+        store.cache_warm("k", b"state").unwrap();
+        store.cache_warm("k", b"other").unwrap(); // the first is kept
+        assert_eq!(store.cached_warm("k").as_deref(), Some(&b"state"[..]));
+
+        let model = tempfile::tempdir().unwrap();
+        std::fs::write(model.path().join("shem.json"), "{}").unwrap();
+        std::fs::write(model.path().join("w.safetensors"), "weights").unwrap();
+        let into = tempfile::tempdir().unwrap();
+        assert!(!store.cached_import("m", into.path()).unwrap());
+        store.cache_import("m", model.path()).unwrap();
+        assert!(store.cached_import("m", into.path()).unwrap());
+        assert_eq!(
+            std::fs::read(into.path().join("w.safetensors")).unwrap(),
+            b"weights"
+        );
+
+        assert!(
+            store.prune(false).unwrap().is_empty(),
+            "a build cache is not a stale copy"
+        );
+        assert_eq!(store.prune(true).unwrap().len(), 2);
+        assert_eq!(store.cached_warm("k"), None);
+    }
 }

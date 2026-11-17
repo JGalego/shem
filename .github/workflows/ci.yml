@@ -306,6 +306,13 @@ jobs:
           pkill -f '[s]hem_neural.server --keep-warm'
           SHEM_DAEMON=0 target/release/shem run tiny --max-tokens 4 Hello
           ! pgrep -f '[s]hem_neural.server --keep-warm'
+          # A model at a commit is imported once, and its primed session made once: the second build is the first's image
+          printf 'FROM hf.co/trl-internal-testing/tiny-Qwen3ForCausalLM:25bb9b8963688237e94750f6f3e48f1947d3c7a3\nENTRYPOINT ["shem:generate", "--max-tokens", "4", "--system", "You are tiny."]\nWARM --until=prompt\n' > $dir/Shemfile
+          target/release/shem build -t pinned $dir 2>$dir/first.log
+          target/release/shem build -t pinned $dir 2>$dir/second.log
+          grep -q 'imported before' $dir/second.log && grep -q 'primed before' $dir/second.log
+          test -n "$(tail -1 $dir/first.log)" && test "$(tail -1 $dir/first.log)" = "$(tail -1 $dir/second.log)"
+          target/release/shem build --no-cache -t pinned $dir 2>&1 | grep -q 'primed a session'
 
   models:
     name: Model images (against transformers)

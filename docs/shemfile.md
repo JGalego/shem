@@ -16,6 +16,7 @@ shem pull ghcr.io/your-user/hello:1.0         # pull into the store, and run it 
 docker save hello | shem load                 # or load an image docker build made
 shem rmi hello                                # remove it from the store
 shem prune                                    # delete unpacked copies of images no longer stored
+shem prune --all                              # and every copy, and the build cache
 ```
 
 `shem images --format` takes `json`, or a Go template as `docker images --format` does, such as `'{{.Repository}}:{{.Tag}} {{.Size}}'`, after `table ` for aligned columns with headers. Its fields are `.Repository`, `.Tag`, `.ID`, `.Digest`, `.Kind` (`program`, `vm` or `model`), `.Size` and `.Bytes`, and its functions Docker's `json`, `upper`, `lower`, `title`, `truncate`, `pad`, `join`, `split` and `len`. `shem images -q` prints the IDs alone, which `shem rmi` takes as well as names: an ID tagged more than once needs `-f` to remove every tag. `tag`, `inspect` and `history` take IDs too, or an OCI layout directory. `shem history` takes `--format` as well, with the fields `.ID`, `.Digest`, `.CreatedBy`, `.Comment`, `.Size` and `.Bytes`, and `shem inspect -f` a template over the JSON it prints, such as `'{{.Config.Entrypoint}}'`.
@@ -196,6 +197,10 @@ New layers use zstd-compressed tars. A booted Linux image is about 2 MB despite 
 Images in the local store live under `$SHEM_HOME/images/<name>/<tag>`, by default `~/.local/share/shem/images`. Program and VM runs unpack a fresh filesystem and remove it afterwards. Model images [cache their unpacked filesystem](models.md#running).
 
 Registry transfers use [ORAS](https://oras.land) and preserve manifest digests. Use `--plain-http` for a local registry without TLS.
+
+## The build cache
+
+A model imported at a pinned revision, a commit (`FROM hf.co/ORG/NAME:COMMIT`), is imported once: later builds link the files the first one made, and a `WARM --until=prompt` that primes the same session on the same layers and driver options takes it from the cache too, so rebuilding such an image takes a fraction of a second where the first build took the import and the prime. A model at a branch, as `FROM hf.co/ORG/NAME` is, could be another model by now, so it is imported again, as are checkpoints and GGUF files in the build context. The cache sits beside the image store, links its files rather than copying them, and `shem build --no-cache` or `SHEM_NO_CACHE=1` goes without it; `shem prune --all` empties it. Program and VM `WARM` steps and `COPY` are not cached yet, nor is the filesystem layered with overlayfs: program and VM runs still unpack every layer.
 
 ## Reproducibility
 
