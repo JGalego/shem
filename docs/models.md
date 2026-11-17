@@ -296,6 +296,8 @@ oras pull jgalego-shem-registry.hf.space/qwen/qwen3-0.6b
 
 ![The shem registry Space: opening Qwen/Qwen3-0.6B shows it as a ModelPack artifact, a shem image's page shows its system prompt, model and comparison with transformers, and the home page counts a docker pull as it happens.](assets/shem-registry.gif)
 
+`/metrics` has the registry's Prometheus metrics: pulls, the bytes it sent itself, those it had the Hub send and those it streamed, the repos and images it has, and the digests it has learnt. Those digests, the tars of weights' layers, never go stale (a tar is a function of the files' contents), so they are kept in a file, `registry-digests.json` in `--cache-dir` (`shem/` in your cache by default), and a registry that restarts does not read every large file through again; a Space keeps them where it has persistent storage.
+
 Outside `/v2/`, the registry serves pages for people. `/` has a search box, counts of the repos served, the pulls, and the bytes sent from the Hub, from the Hub as tars and from the registry, and the repos pulled since it started, last pulled first. `/ORG/NAME?tag=TAG` shows an image as a model page: badges for its comparison with transformers (from the repo's `comparison.json`), size, precision, licence and primed session; its system prompt, the model from its `shem.json`, its entrypoint and its layers; and beside them, the commands to use it with shem, oras or Docker, its digest, its source checkpoint and its tags. Open pages stay current: they ask `/live` whether what they show has changed, every 3 seconds for the home page and every 15 for a repo's, which asks the Hub for the revision's commit, and show the new version without reloading.
 
 ### Checkpoints as images of their files
@@ -415,6 +417,7 @@ docker run -d -p 8000:8000 --runtime io.containerd.shem.v1 --platform linux/risc
 | `POST /v1/embeddings` | A unit vector for each text of `input`: the model's final hidden state at the last token (`"shem_pooling": "mean"` averages them all), floats or `base64`. It is a language model's, so it is as good an embedding as that model is, and best from one trained for it |
 | `GET /v1/models` | The model, by the repository it came from |
 | `GET /health` | 200 once the model is loaded |
+| `GET /metrics` | Prometheus metrics: requests by path and status, their latency, tokens read and made, requests waiting, and replies per pass over the weights; a key is asked for, as for the rest, when there is one |
 
 - Replies are greedy, as the driver's are, unless the image or a request gives a `temperature`; then `top_p`, `top_k` and `seed` apply too, and the same seed draws the same reply. `n` must be 1. `max_tokens` and `stop` apply.
 - The image's system prompt comes first unless a request gives its own, and a conversation that starts with the image's [primed session](#sessions-as-layers) goes on from it rather than reading it again.

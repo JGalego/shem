@@ -422,6 +422,11 @@ struct RegistryArgs {
     /// sends as it reads them from Hugging Face: any amount by default
     #[arg(long, value_name = "SIZE")]
     files_limit: Option<String>,
+    /// Where the digests of layers of weights are kept, so that a restart
+    /// need not read every large file through again: `shem/` in the user's
+    /// cache by default
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -480,6 +485,7 @@ fn main() -> ExitCode {
             args.port,
             args.public,
             args.files_limit.as_deref(),
+            args.cache_dir.as_deref(),
         ),
         Command::Boot(args) => boot(args),
         Command::Doctor => doctor(),

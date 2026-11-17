@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from shem_neural.metrics import Metrics
 from shem_neural.model import serve
 from shem_neural.model.blocks import Model
 from shem_neural.model.generate import ContextFull, Session
@@ -32,6 +33,7 @@ class Replies:
         self.asked = []
         self.api_key, self.cors, self.fail = api_key, list(cors), fail
         self.waiting = threading.BoundedSemaphore(serve.MAX_WAITING)
+        self.metrics = Metrics()
         self.tokenizer = SimpleNamespace(
             encode=lambda text: [ord(c) % 60 for c in text], decode=lambda ids: "".join(f"<{i}>" for i in ids)
         )
@@ -780,3 +782,37 @@ def test_the_hidden_states_are_what_the_head_reads():
     logits = model.forward(tokens, model.init_state(), 0)
     assert hidden.shape == (1, 4, model.manifest.hidden_size)
     assert torch.allclose(hidden @ model.head_weight.T, logits, atol=1e-5)
+
+
+def test_the_api_serves_prometheus_metrics_of_what_it_has_done():
+    chat = chat_of(max_tokens=4)
+    server = serve.start(chat, serve.listen("127.0.0.1", 0))
+    host, port = server.server_address
+    url = f"http://{host}:{port}"
+    try:
+        assert call(f"{url}/v1/chat/completions", HI)[0] == 200
+        assert call(f"{url}/v1/chat/completions", {"messages": []})[0] == 400
+        assert call(f"{url}/not/a/path")[0] == 404
+        status, data = call(f"{url}/metrics")
+        assert status == 200 and call.headers["Content-Type"].startswith("text/plain")
+        text = data.decode()
+        assert "# TYPE shem_requests_total counter" in text
+        assert 'shem_requests_total{path="/v1/chat/completions",status="200"} 1' in text
+        assert 'shem_requests_total{path="/v1/chat/completions",status="400"} 1' in text
+        assert 'shem_requests_total{path="other",status="404"} 1' in text, "unknown paths are one label, not a flood"
+        assert 'shem_tokens_total{kind="completion"} 4' in text
+        assert 'shem_request_seconds_count{path="/v1/chat/completions"} 2' in text
+        assert 'shem_batch_size_bucket{le="1"}' in text and "shem_requests_waiting 0" in text
+        assert 'shem_model_info{model="' in text
+    finally:
+        server.shutdown()
+        server.server_close()
+    # A key is asked for, as for the rest, when there is one
+    secured = Replies(api_key="s3cret")
+    server, url = serving(secured)
+    try:
+        assert call(f"{url}/metrics")[0] == 401
+        assert call(f"{url}/metrics", headers={"Authorization": "Bearer s3cret"})[0] == 200
+    finally:
+        server.shutdown()
+        server.server_close()

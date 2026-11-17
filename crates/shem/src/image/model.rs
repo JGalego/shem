@@ -285,6 +285,7 @@ pub fn serve_registry(
     port: u16,
     public: bool,
     files_limit: Option<&str>,
+    cache_dir: Option<&Path>,
 ) -> anyhow::Result<u8> {
     let mut command = python("shem_neural.registry");
     command.args(["--host", host, "--port", &port.to_string()]);
@@ -293,6 +294,9 @@ pub fn serve_registry(
     }
     if let Some(limit) = files_limit {
         command.args(["--files-limit", limit]);
+    }
+    if let Some(dir) = cache_dir {
+        command.arg("--cache-dir").arg(dir);
     }
     let status = command
         .status()

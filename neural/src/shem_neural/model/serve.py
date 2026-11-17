@@ -4,6 +4,7 @@ clients and tools written for that API:
     POST /v1/chat/completions   a reply to the messages, streamed with "stream": true
     GET  /v1/models             the model, by the repository it came from
     GET  /health                200 once the model is loaded
+    GET  /metrics               Prometheus metrics: requests, latency, tokens, waiting, batch size
 
 A request with `"shem_receipt": true` gets a receipt of its reply, in the
 response (and a stream's last chunk), which `shem replay` checks.
@@ -43,6 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import torch
 
+from .. import metrics as telemetry
 from . import receipt as receipts
 from .generate import ContextFull, Reply, Session
 from .sampling import Sampler
@@ -50,6 +52,18 @@ from .tools import tool_calls
 
 #: Replies made in one pass over the model's weights, the rest waiting for room
 MAX_BATCH = 16
+#: The paths the API answers, which its metrics tell apart from the rest
+KNOWN_PATHS = {
+    "/health",
+    "/metrics",
+    "/v1/models",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/chat/completions",
+    "/completions",
+    "/embeddings",
+}
 #: The largest request body taken, in bytes: a long conversation is a few hundred kilobytes
 MAX_BODY = 8 << 20
 #: Requests that may be waiting for or having their turn on the model; the next is told to retry
@@ -83,9 +97,21 @@ class Chat:
         #: Origins whose pages may call the API, or `*` for any
         self.cors = list(getattr(args, "cors_origin", None) or [])
         self.waiting = threading.BoundedSemaphore(MAX_WAITING)
+        self.metrics = telemetry.Metrics()
+        for name, kind, text in (
+            ("shem_requests_total", "counter", "Requests answered, by path and status"),
+            ("shem_request_seconds", "histogram", "Seconds from a request to its answer"),
+            ("shem_tokens_total", "counter", "Tokens read (prompt) and made (completion)"),
+            ("shem_requests_waiting", "gauge", "Requests waiting for or having their turn on the model"),
+            ("shem_batch_size", "histogram", "Replies read in one pass over the model's weights"),
+            ("shem_model_info", "gauge", "The model served"),
+        ):
+            self.metrics.describe(name, kind, text)
+        self.metrics.set("shem_model_info", 1, model=self.name, precision=model.precision)
         #: Prefill, which reads a prompt in one pass, takes turns; replies are made together
         self.prefill = threading.Lock()
         self.batcher = Batcher(compute)
+        self.batcher.metrics = self.metrics
         self.primed = primed if primed is not None and primed.tokens else None
 
     def prompt(self, messages: list[dict], tools: list[dict] | None = None) -> list[int]:
@@ -164,6 +190,8 @@ class Chat:
         calls = tool_calls(job.made.text) if tools else []
         # A text continuation is the model's own text, but for the line end the reply closes with
         value = text.value.removesuffix("\n") if raw else text.value.strip()
+        self.metrics.inc("shem_tokens_total", len(prompt), kind="prompt")
+        self.metrics.inc("shem_tokens_total", len(tokens), kind="completion")
         return {
             **made,
             "text": value,
@@ -229,6 +257,8 @@ class Batcher:
     def __init__(self, compute=contextlib.nullcontext, size: int | None = None):
         self.compute, self.size = compute, size or MAX_BATCH
         self.waiting: queue.Queue = queue.Queue()
+        #: Where the size of each pass is observed, when someone wants it
+        self.metrics: telemetry.Metrics | None = None
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
 
@@ -250,10 +280,10 @@ class Batcher:
                         active.append(self.waiting.get_nowait())
                     except queue.Empty:
                         break
-                active = self._step(active)
+                active = self._step(active, self.metrics)
 
     @staticmethod
-    def _step(active: list[Job]) -> list[Job]:
+    def _step(active: list[Job], metrics: "telemetry.Metrics | None" = None) -> list[Job]:
         """Choose each reply's next token, then read them all in one pass.
         Replies that end, fail or are given up on leave."""
         going, tokens = [], []
@@ -271,6 +301,8 @@ class Batcher:
                 going.append(job)
                 tokens.append(token)
         if going:
+            if metrics is not None:
+                metrics.observe("shem_batch_size", len(going), buckets=(1, 2, 4, 8, 16, 32))
             try:
                 Session.feed_batch([job.made.session for job in going], tokens)
             except Exception as error:  # a pass that fails may have read for some and not others: all end
@@ -355,6 +387,21 @@ def handler(chat: Chat):
         def log_message(self, format, *args):
             pass
 
+        def log_request(self, code="-", size="-"):
+            """Every answer is counted, by the path it was for and its status."""
+            path = self.path.split("?")[0]
+            known = path in KNOWN_PATHS
+            chat.metrics.inc("shem_requests_total", path=path if known else "other", status=code)
+
+        def handle_one_request(self):
+            started = time.perf_counter()
+            super().handle_one_request()
+            if getattr(self, "path", None):
+                path = self.path.split("?")[0]
+                chat.metrics.observe(
+                    "shem_request_seconds", time.perf_counter() - started, path=path if path in KNOWN_PATHS else "other"
+                )
+
         def _allowed(self) -> bool:
             """Whether the request carries the key, if there is one."""
             if not chat.api_key:
@@ -394,6 +441,15 @@ def handler(chat: Chat):
                 return self._unauthorized()
             if path == "/health":
                 self._json(200, {"status": "ok"})
+            elif path == "/metrics":
+                waiting = MAX_WAITING - chat.waiting._value  # the semaphore's own count
+                chat.metrics.set("shem_requests_waiting", waiting)
+                data = chat.metrics.render().encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
             elif path in ("/v1/models", "/models"):
                 self._json(200, {"object": "list", "data": [self._model()]})
             elif path.startswith(("/v1/models/", "/models/")):

@@ -28,6 +28,10 @@ and never this host's. It answers the distribution spec's token flow:
 `docker login` with a Hugging Face token as the password, or none, to pull
 public repos anonymously. Its home page lists only repos that aren't private.
 
+`/metrics` has Prometheus metrics: pulls, bytes sent and where from, what it
+has made. The digests of layers of weights it learns are kept in a file
+(`--cache-dir`), as they never go stale.
+
 Outside `/v2/`, the registry serves pages for people: what it is and how
 to pull from it at `/`, and each repo's image at `/ORG/NAME`. `/live` tells
 an open page whether what it shows has changed, so it can show it again.
@@ -38,6 +42,7 @@ import base64
 import copy
 import hashlib
 import json
+import os
 import re
 import socket
 import sys
@@ -61,6 +66,7 @@ from huggingface_hub.errors import (
 )
 
 from shem_neural import checkpoints, files
+from shem_neural import metrics as telemetry
 from shem_neural import registry_pages as pages
 from shem_neural.checkpoints import Artifact, File
 from shem_neural.hub import revision
@@ -115,11 +121,41 @@ class Stream:
         return self.size
 
 
+class Digests(dict):
+    """The digests of layers of weights, by the files they hold, kept in a
+    file as they are learnt. A layer's tar is a function of the files'
+    contents, which the Hub names by their sha256, so a digest never goes stale
+    and a registry that restarts need not read every large file through again.
+    Without a `path` it is a plain dict."""
+
+    def __init__(self, path: Path | None = None):
+        super().__init__()
+        self.path = path
+        self.lock = threading.Lock()
+        if path is not None:
+            try:
+                for key, digest in json.loads(path.read_text()):
+                    if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+                        super().__setitem__(tuple(tuple(pair) for pair in key), digest)
+            except (OSError, ValueError, TypeError):
+                pass  # none yet, or one that is not ours: they are learnt again
+
+    def __setitem__(self, key, digest) -> None:
+        super().__setitem__(key, digest)
+        if self.path is None:
+            return
+        with self.lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            staging = self.path.with_name(f".{self.path.name}.{os.getpid()}")
+            staging.write_text(json.dumps([[list(map(list, k)), v] for k, v in self.items()]))
+            os.replace(staging, self.path)
+
+
 class Hub:
     """Layouts in Hugging Face repos, read with this host's token, or the one
     `using` gives it."""
 
-    def __init__(self, api: HfApi | None = None):
+    def __init__(self, api: HfApi | None = None, digests: Path | None = None):
         self.api = api or HfApi()
         #: When the Hub's answers, by token and question, stop being trusted:
         #: whether a token is one, a repo readable with it, or a repo private
@@ -133,7 +169,7 @@ class Hub:
         self.images: dict[tuple[str, str, str], files.Image] = {}
         #: The digests of layers of weights, by the files they hold, which
         #: outlast a commit that changes other files
-        self.tars: dict[tuple, str] = {}
+        self.tars: dict[tuple, str] = Digests(digests)
         #: Held to make an image, one at a time: it reads its weights through
         self.making = threading.Lock()
 
@@ -483,6 +519,8 @@ class Registry:
         html = {"Content-Type": "text/html; charset=utf-8"}
         if path == "/":
             return HTTPStatus.OK, html, pages.home(host, self.served, self.stats, self.version())
+        if path == "/metrics":
+            return HTTPStatus.OK, {"Content-Type": "text/plain; version=0.0.4; charset=utf-8"}, self.metrics(hub)
         if path == "/live":
             repo, tag = (query.get("repo") or [""])[0], (query.get("tag") or ["latest"])[0]
             if repo and not (PAGE.match(f"/{repo}") and TAG.fullmatch(tag)):
@@ -506,6 +544,33 @@ class Registry:
             self.served[match["name"]] = summary
             return HTTPStatus.OK, html, body
         raise Unknown("NAME_INVALID", f"no such page {path}")
+
+    def metrics(self, hub) -> bytes:
+        """What a scraper reads: the pulls and the bytes sent, by how they went,
+        and what the registry has made and learnt."""
+        out = telemetry.Metrics()
+        for name, kind, text, value in (
+            ("shem_registry_pulls_total", "counter", "Pulls of images and artifacts", self.stats["pulls"]),
+            (
+                "shem_registry_redirected_bytes_total",
+                "counter",
+                "Bytes of blobs the Hub was asked to send",
+                self.stats["redirected"],
+            ),
+            ("shem_registry_sent_bytes_total", "counter", "Bytes this registry sent itself", self.stats["sent"]),
+            (
+                "shem_registry_streamed_bytes_total",
+                "counter",
+                "Bytes read from the Hub to send as layers of files",
+                self.stats["streamed"],
+            ),
+            ("shem_registry_repos", "gauge", "Repos served since it started", len(self.served)),
+            ("shem_registry_images", "gauge", "Images of checkpoints' files made", len(hub.images)),
+            ("shem_registry_layer_digests", "gauge", "Digests of layers of weights learnt", len(hub.tars)),
+        ):
+            out.describe(name, kind, text)
+            out.set(name, value)
+        return out.render().encode()
 
     def version(self) -> str:
         """What the home page shows, as a digest that changes with it."""
@@ -694,11 +759,22 @@ def handler(registry: Registry) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-def serve(address: tuple[str, int], hub=None, public: bool = False, limit: int | None = None) -> ThreadingHTTPServer:
+def serve(
+    address: tuple[str, int], hub=None, public: bool = False, limit: int | None = None, digests: Path | None = None
+) -> ThreadingHTTPServer:
     """A registry over `hub` (Hugging Face's, by default) at `address`, not
     yet serving: a public one, if `public`, reading with clients' tokens,
-    which makes images of the files of checkpoints with weights up to `limit`."""
-    return ThreadingHTTPServer(address, handler(Registry(hub or Hub(), public, limit)))
+    which makes images of the files of checkpoints with weights up to `limit`,
+    and keeps the digests it learns in the file `digests`."""
+    return ThreadingHTTPServer(address, handler(Registry(hub or Hub(digests=digests), public, limit)))
+
+
+def default_digests() -> Path | None:
+    """Where a registry keeps what it learns of weights' tars, unless told: in the user's cache."""
+    cache = os.environ.get("XDG_CACHE_HOME")
+    home = os.environ.get("HOME")
+    base = Path(cache) if cache else Path(home) / ".cache" if home else None
+    return base / "shem" / "registry-digests.json" if base else None
 
 
 def main() -> None:
@@ -715,8 +791,16 @@ def main() -> None:
         help="the most weights a checkpoint may have, such as 16G, to be served as an image of its files, "
         "which sends them through this registry (default: any)",
     )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        metavar="DIR",
+        help="where the digests of layers of weights are kept (default: shem/ in the user's cache), "
+        "so that a restart need not read every large file through again",
+    )
     args = parser.parse_args()
-    server = serve((args.host, args.port), public=args.public, limit=args.files_limit)
+    digests = args.cache_dir / "registry-digests.json" if args.cache_dir else default_digests()
+    server = serve((args.host, args.port), public=args.public, limit=args.files_limit, digests=digests)
     whose = "each client's token" if args.public else "this host's token"
     print(
         f"shem registry: serving Hugging Face repos at {args.host}:{args.port}, read-only, with {whose}",
