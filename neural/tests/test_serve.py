@@ -158,7 +158,7 @@ def test_requests_it_cannot_answer_say_why(api, body):
 
 def test_other_paths_are_not_found(api):
     _, url = api
-    assert call(f"{url}/v1/embeddings", {"input": "Hi"})[0] == 404
+    assert call(f"{url}/v1/images", {"prompt": "Hi"})[0] == 404
     assert call(f"{url}/")[0] == 404
 
 
@@ -729,3 +729,54 @@ def test_a_real_model_gives_log_probabilities_and_continues_raw_text():
     raw = chat.complete(None, prompt_tokens=Characters().encode("Once upon"), max_tokens=4)
     assert raw["completion_tokens"] == 4 and raw["prompt_tokens"] == len("Once upon")
     assert not raw["text"].startswith("\n") and raw["calls"] == []
+
+
+def test_embeddings_are_unit_vectors_of_what_the_model_made_of_a_text():
+    import base64
+    import struct
+
+    model = Model(TINY)
+    args = SimpleNamespace(max_tokens=4, stop=[], system=None)
+    chat = serve.Chat(model, Characters(), args)
+    server = serve.start(chat, serve.listen("127.0.0.1", 0))
+    host, port = server.server_address
+    url = f"http://{host}:{port}/v1/embeddings"
+    try:
+        status, data = call(url, {"input": ["Hi there", "Another text"]})
+        assert status == 200
+        reply = json.loads(data)
+        assert reply["object"] == "list" and [d["index"] for d in reply["data"]] == [0, 1]
+        one, two = (d["embedding"] for d in reply["data"])
+        assert len(one) == model.manifest.hidden_size
+        assert abs(sum(x * x for x in one) - 1) < 1e-4 and one != two
+        assert reply["usage"]["prompt_tokens"] == len("Hi there") + len("Another text")
+        # Deterministic, a text alone is what it is among others, and mean pooling is another vector
+        alone = json.loads(call(url, {"input": "Hi there"})[1])["data"][0]["embedding"]
+        assert alone == one
+        mean = json.loads(call(url, {"input": "Hi there", "shem_pooling": "mean"})[1])["data"][0]["embedding"]
+        assert mean != one and abs(sum(x * x for x in mean) - 1) < 1e-4
+        # The same numbers, packed as base64 floats
+        packed = json.loads(call(url, {"input": "Hi there", "encoding_format": "base64"})[1])["data"][0]["embedding"]
+        floats = struct.unpack(f"<{len(one)}f", base64.b64decode(packed))
+        assert all(abs(a - b) < 1e-6 for a, b in zip(floats, one, strict=True))
+        # And what it cannot do is said
+        for bad in (
+            {"input": []},
+            {"input": [1, 2]},
+            {"input": "x", "dimensions": 8},
+            {"input": "x", "shem_pooling": "max"},
+        ):
+            assert call(url, bad)[0] == 400
+        assert call(url, {"input": ""})[0] == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_hidden_states_are_what_the_head_reads():
+    model = Model(TINY)
+    tokens = torch.tensor([[3, 17, 42, 8]])
+    hidden = model.hidden(tokens, model.init_state(), 0)
+    logits = model.forward(tokens, model.init_state(), 0)
+    assert hidden.shape == (1, 4, model.manifest.hidden_size)
+    assert torch.allclose(hidden @ model.head_weight.T, logits, atol=1e-5)

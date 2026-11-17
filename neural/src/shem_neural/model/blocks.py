@@ -739,16 +739,25 @@ class Model:
         return softcap(logits, p.get("softcap"))
 
     @torch.no_grad()
-    def forward(self, tokens: torch.Tensor, state: list, start: int) -> torch.Tensor:
-        """Next-token logits (batch, tokens, vocabulary) for `tokens`, which
-        continue a session at position `start` whose blocks' state is `state`."""
+    def hidden(self, tokens: torch.Tensor, state: list, start: int) -> torch.Tensor:
+        """What the model has made of `tokens` (batch, tokens, hidden), after
+        its last block and its final norm: what the head reads, and what an
+        embedding is taken from. They continue a session at position `start`
+        whose blocks' state is `state`."""
         x = self.embed[tokens.to(self.device)]
         if self.embed_scale:
             x = x * self.embed_scale
         for block, block_state in zip(self.blocks, state, strict=True):
             x = block.forward(x, block_state, start)
         p = self.head_params
-        logits = rmsnorm(x, self.head_norm, p["eps"], p.get("norm_offset", 0.0)) @ self.head_weight.T
+        return rmsnorm(x, self.head_norm, p["eps"], p.get("norm_offset", 0.0))
+
+    @torch.no_grad()
+    def forward(self, tokens: torch.Tensor, state: list, start: int) -> torch.Tensor:
+        """Next-token logits (batch, tokens, vocabulary) for `tokens`, which
+        continue a session at position `start` whose blocks' state is `state`."""
+        p = self.head_params
+        logits = self.hidden(tokens, state, start) @ self.head_weight.T
         if p.get("logit_divisor"):
             logits = logits / p["logit_divisor"]
         return softcap(logits, p.get("softcap"))

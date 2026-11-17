@@ -170,7 +170,7 @@ Larger float32 comparisons use a [Hugging Face Job](https://huggingface.co/docs/
 | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) | 48 attention, 48 mixtures of 128 experts, 8 per token | The same, against transformers' Qwen3-MoE |
 | [mistralai/Mixtral-8x7B-Instruct-v0.1](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1) | 32 attention, 32 mixtures of 8 experts, 2 per token | In bfloat16, as below: its 47 billion parameters take 188 GB in float32 |
 
-Qwen3.5 and Gemma 3 4B imports are text-only: vision encoders are omitted, as is Qwen3.5's multi-token prediction layer.
+Qwen3.5 and Gemma 3 4B imports are text-only: vision encoders are omitted, as is Qwen3.5's multi-token prediction layer, and the API takes no images. A vision tower is a block type that does not exist yet (the importers would read its tensors, a `vision` block would turn pixels into the embeddings a prompt holds); that is not started.
 
 Download-based tests in [`test_model.py`](../neural/tests/test_model.py) require `SHEM_MODEL_TESTS=1`. Add the larger-model flags as needed:
 
@@ -412,6 +412,7 @@ docker run -d -p 8000:8000 --runtime io.containerd.shem.v1 --platform linux/risc
 |---|---|
 | `POST /v1/chat/completions` | A reply to the messages; with `"stream": true`, server-sent events as it comes |
 | `POST /v1/completions` | A continuation of a text, with no chat template: `prompt` is one text; `max_tokens`, `stop`, `stream` and `logprobs` apply |
+| `POST /v1/embeddings` | A unit vector for each text of `input`: the model's final hidden state at the last token (`"shem_pooling": "mean"` averages them all), floats or `base64`. It is a language model's, so it is as good an embedding as that model is, and best from one trained for it |
 | `GET /v1/models` | The model, by the repository it came from |
 | `GET /health` | 200 once the model is loaded |
 

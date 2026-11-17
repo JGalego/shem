@@ -26,6 +26,7 @@ reading those tokens again.
 serves in the container's network, where `docker run -p` publishes it.
 """
 
+import base64
 import contextlib
 import copy
 import hmac
@@ -33,11 +34,14 @@ import json
 import os
 import queue
 import socket
+import struct
 import sys
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import torch
 
 from . import receipt as receipts
 from .generate import ContextFull, Reply, Session
@@ -172,6 +176,20 @@ class Chat:
             "prompt_tokens": len(prompt),
             "completion_tokens": len(tokens),
         }
+
+    def embed(self, text: str, pooling: str = "last") -> tuple[list[float], int]:
+        """An embedding of `text`: what the model has made of it, taken from its
+        last token or averaged over them all, and scaled to length 1. The
+        model is a language model's, so the vector is as good as that model is
+        at representing a text in one place, which one trained for the purpose is. Returns it,
+        and how many tokens the text was."""
+        tokens = self.check(self.tokenizer.encode(text))
+        if not tokens:
+            raise ValueError("there is no text to embed")
+        with self.prefill, self.compute():
+            hidden = self.model.hidden(torch.tensor([tokens]), self.model.init_state(), 0)[0].float()
+        vector = hidden.mean(dim=0) if pooling == "mean" else hidden[-1]
+        return (vector / vector.norm().clamp(min=1e-12)).tolist(), len(tokens)
 
     def _start(self, prompt: list[int]) -> Session:
         """A session for `prompt`: a copy of the primed one if the prompt goes
@@ -396,10 +414,14 @@ def handler(chat: Chat):
                 "/chat/completions": "chat",
                 "/v1/completions": "text",
                 "/completions": "text",
+                "/v1/embeddings": "embeddings",
+                "/embeddings": "embeddings",
             }.get(path)
             if kind is None:
                 self.close_connection = True  # a body it did not read would be taken for the next request
-                return self._error(404, f"nothing at {path}: the API is at /v1/chat/completions and /v1/completions")
+                return self._error(
+                    404, f"nothing at {path}: the API is at /v1/chat/completions, /v1/completions and /v1/embeddings"
+                )
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
@@ -409,6 +431,8 @@ def handler(chat: Chat):
             if length > MAX_BODY:
                 self.close_connection = True
                 return self._error(413, f"the request is over the {MAX_BODY} bytes the API takes", "request_too_large")
+            if kind == "embeddings":
+                return self._embeddings(length)
             try:
                 request = json.loads(self.rfile.read(length))
                 ask = self._ask(request, kind)
@@ -435,6 +459,52 @@ def handler(chat: Chat):
                 self._json(200, self._completion(kind, done, ask["logprobs"]))
             finally:
                 chat.waiting.release()
+
+        def _embeddings(self, length: int) -> None:
+            """`/v1/embeddings`: a vector for each text, as OpenAI's API gives them."""
+            try:
+                request = json.loads(self.rfile.read(length))
+                texts = request["input"]
+                texts = [texts] if isinstance(texts, str) else texts
+                if not texts or not all(isinstance(text, str) for text in texts):
+                    raise ValueError("input must be a text, or a list of texts: shem does not take token lists")
+                pooling = request.get("shem_pooling", "last")
+                if pooling not in ("last", "mean"):
+                    raise ValueError("shem_pooling must be last or mean")
+                form = request.get("encoding_format", "float")
+                if form not in ("float", "base64"):
+                    raise ValueError("encoding_format must be float or base64")
+                if request.get("dimensions") is not None:
+                    raise ValueError("dimensions: shem gives the model's own size")
+            except (ValueError, KeyError, TypeError, AttributeError) as error:
+                return self._error(400, f"not an embeddings request: {error}")
+            if not chat.waiting.acquire(blocking=False):
+                return self._error(429, f"{MAX_WAITING} requests are waiting for the model: try again", "busy", retry=5)
+            try:
+                data, used = [], 0
+                for index, text in enumerate(texts):
+                    vector, count = chat.embed(text, pooling)
+                    used += count
+                    if form == "base64":
+                        vector = base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode()
+                    data.append({"object": "embedding", "index": index, "embedding": vector})
+            except ContextFull as error:
+                return self._error(400, str(error), "context_length_exceeded")
+            except ValueError as error:
+                return self._error(400, f"not an embeddings request: {error}")
+            except Exception as error:
+                return self._error(500, f"no embedding: {error}")
+            finally:
+                chat.waiting.release()
+            self._json(
+                200,
+                {
+                    "object": "list",
+                    "data": data,
+                    "model": chat.name,
+                    "usage": {"prompt_tokens": used, "total_tokens": used},
+                },
+            )
 
         def _ask(self, request: dict, kind: str) -> dict:
             """What a request asks for, checked, as the arguments of
