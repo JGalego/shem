@@ -6,10 +6,12 @@
 //!
 //! [runtime spec]: https://github.com/opencontainers/runtime-spec/blob/main/config.md
 
+use std::collections::VecDeque;
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -111,8 +113,32 @@ impl Bundle {
 /// What the shim asks of a running program, which it does between slices,
 /// or while it waits for input: stop with a signal, or pause, as `docker
 /// pause` and `docker commit` ask, until it is resumed.
+/// A program `docker exec` adds to a running container: where its streams
+/// are, and where to say how it ended.
+#[derive(Debug)]
+pub struct ExecRequest {
+    pub args: Vec<String>,
+    pub env: Vec<String>,
+    pub cwd: String,
+    pub stdin: String,
+    pub stdout: String,
+    pub stderr: String,
+    /// Told the exit status, or 137 if the container ends first
+    pub done: Sender<u8>,
+}
+
 #[derive(Debug, Default)]
 pub struct Control {
+    /// Programs waiting to join the container, taken between slices.
+    spawns: Mutex<VecDeque<ExecRequest>>,
+    /// Set once the container has ended: nothing can join it then.
+    ended: AtomicBool,
+    /// Instructions the container has retired, and processes it has, as of the last slice: its statistics.
+    pub steps: AtomicU64,
+    pub processes: AtomicU32,
+    /// How many programs `docker exec` added are running. Init's read of
+    /// its input does not wait while there are, as it holds up the container.
+    joined: AtomicU32,
     /// The signal to stop with, or 0.
     pub kill: AtomicU32,
     pause: Mutex<Pausing>,
@@ -141,7 +167,36 @@ impl Control {
     /// Whether a read of input should stop waiting: the program is to stop,
     /// or a key typed at its terminal sends it a signal.
     fn wakes(&self) -> bool {
-        self.interrupted() || TERMINAL_SIGNAL.load(Ordering::SeqCst) != 0
+        self.interrupted()
+            || TERMINAL_SIGNAL.load(Ordering::SeqCst) != 0
+            || self.joined.load(Ordering::SeqCst) > 0
+            || !self.spawns.lock().unwrap().is_empty()
+    }
+
+    /// Ask for a program to join the running container. False if the
+    /// container has ended, which nothing can join: the request is dropped,
+    /// and whoever waits on its `done` hears nothing.
+    pub fn exec(&self, request: ExecRequest) -> bool {
+        let mut spawns = self.spawns.lock().unwrap();
+        if self.ended.load(Ordering::SeqCst) {
+            return false;
+        }
+        spawns.push_back(request);
+        true
+    }
+
+    fn take_execs(&self) -> Vec<ExecRequest> {
+        self.spawns.lock().unwrap().drain(..).collect()
+    }
+
+    /// The container has ended: the programs that were to join it, and had
+    /// not, end with the status of a kill.
+    fn end(&self) {
+        let mut spawns = self.spawns.lock().unwrap();
+        self.ended.store(true, Ordering::SeqCst);
+        for request in spawns.drain(..) {
+            let _ = request.done.send(137);
+        }
     }
 
     /// Stop the program with `signal`, paused or not.
@@ -303,7 +358,26 @@ fn run_on<V: Vcpu + Clone>(
     control: &Control,
     terminal: Option<i32>,
     slice: u64,
-    vcpu: impl FnOnce(u32) -> anyhow::Result<V>,
+    vcpu: impl Fn(u32) -> anyhow::Result<V>,
+) -> anyhow::Result<u8> {
+    let mut running = Vec::new();
+    let result = run_container(bundle, stdio, control, terminal, slice, &vcpu, &mut running);
+    // Whatever joined the container goes with it, and nothing can join now
+    control.end();
+    for (_, done) in running {
+        let _ = done.send(137);
+    }
+    result
+}
+
+fn run_container<V: Vcpu + Clone>(
+    bundle: &Bundle,
+    stdio: Stdio,
+    control: &Control,
+    terminal: Option<i32>,
+    slice: u64,
+    vcpu: &impl Fn(u32) -> anyhow::Result<V>,
+    running: &mut Vec<(u32, Sender<u8>)>,
 ) -> anyhow::Result<u8> {
     let mut container = if let Some(frozen) = warm_state(&bundle.root)? {
         let vcpu = vcpu(frozen.machine.mem.len() as u32)?;
@@ -331,9 +405,19 @@ fn run_on<V: Vcpu + Clone>(
             Err(RunError::StepLimit(_)) => {}
             // Every process waits, one of them on input that stopped waiting
             // so the program could stop; if it need not now, it waits again
-            Err(RunError::Deadlock) if control.woke.swap(false, Ordering::SeqCst) => {}
+            Err(RunError::Deadlock) if control.woke.swap(false, Ordering::SeqCst) => {
+                // Not a busy wait while the programs `docker exec` added take their time
+                if !running.is_empty() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            // Or the ones `docker exec` added are still to run or to end
+            Err(RunError::Deadlock) if !running.is_empty() => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             Err(err) => return Err(err.into()),
         }
+        join_programs(&mut container, bundle, control, vcpu, running);
         if control.interrupted() {
             match control.kill.load(Ordering::SeqCst) {
                 0 => pause(&container, bundle, control)?,
@@ -341,6 +425,100 @@ fn run_on<V: Vcpu + Clone>(
             }
         }
     }
+}
+
+/// Start the programs `docker exec` asked for, and say how those that have
+/// ended did. The statistics `docker stats` shows are taken here too.
+fn join_programs<V: Vcpu + Clone>(
+    container: &mut Container<V>,
+    bundle: &Bundle,
+    control: &Control,
+    vcpu: &impl Fn(u32) -> anyhow::Result<V>,
+    running: &mut Vec<(u32, Sender<u8>)>,
+) {
+    for request in control.take_execs() {
+        match join(container, bundle, &request, vcpu) {
+            Ok(pid) => running.push((pid, request.done)),
+            Err(err) => {
+                log::warn!("exec {:?}: {err:#}", request.args);
+                if let Ok(mut stderr) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&request.stderr)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(stderr, "shem: {err:#}");
+                }
+                let _ = request.done.send(126);
+            }
+        }
+    }
+    running.retain(|(pid, done)| match container.exit_of(*pid) {
+        Some(status) => {
+            let _ = done.send(status);
+            false
+        }
+        None => true,
+    });
+    control.joined.store(running.len() as u32, Ordering::SeqCst);
+    control.steps.store(container.steps, Ordering::SeqCst);
+    control
+        .processes
+        .store(container.processes() as u32, Ordering::SeqCst);
+}
+
+/// The streams of a program `docker exec` added, from the FIFOs containerd made.
+/// Its input is read without waiting, so that a program with none yet parks
+/// where the container's own loop can go on; a program that has no streams
+/// gets empty ones.
+fn exec_stdio(request: &ExecRequest) -> std::io::Result<Stdio> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let input: Box<dyn Read + Send> = if request.stdin.is_empty() {
+        Box::new(std::io::empty())
+    } else {
+        Box::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&request.stdin)?,
+        )
+    };
+    let output = |path: &str| -> std::io::Result<Box<dyn std::io::Write + Send>> {
+        if path.is_empty() {
+            return Ok(Box::new(std::io::sink()));
+        }
+        Ok(Box::new(
+            std::fs::OpenOptions::new().write(true).open(path)?,
+        ))
+    };
+    Ok(Stdio {
+        stdin: input,
+        stdout: output(&request.stdout)?,
+        stderr: output(&request.stderr)?,
+    })
+}
+
+fn join<V: Vcpu + Clone>(
+    container: &mut Container<V>,
+    bundle: &Bundle,
+    request: &ExecRequest,
+    vcpu: &impl Fn(u32) -> anyhow::Result<V>,
+) -> anyhow::Result<u32> {
+    let name = request.args.first().context("no program to run")?;
+    let rootfs = RootFs::new(&bundle.root).context("the bundle's root filesystem")?;
+    let cwd = if request.cwd.is_empty() {
+        &bundle.cwd
+    } else {
+        &request.cwd
+    };
+    let env = if request.env.is_empty() {
+        &bundle.env
+    } else {
+        &request.env
+    };
+    let program = find_program(&rootfs, cwd, env, name)?;
+    let elf = std::fs::read(program)?;
+    let stdio = exec_stdio(request)?;
+    Ok(container.spawn(vcpu(bundle.memory)?, &elf, &request.args, env, cwd, stdio)?)
 }
 
 /// Pause the program until it is resumed, frozen into `/.shem` in its root

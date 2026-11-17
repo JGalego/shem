@@ -7,7 +7,7 @@
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use thiserror::Error;
@@ -51,6 +51,8 @@ pub enum StartError {
     Elf(#[from] ElfError),
     #[error("arguments and environment do not fit on the stack: {0}")]
     Stack(#[from] MemoryFault),
+    #[error("the process's root filesystem or working directory is not there")]
+    NoRoot,
 }
 
 /// A signal the host's terminal sent, such as SIGINT for Ctrl-C, for the
@@ -217,6 +219,8 @@ pub struct Container<V> {
     pub trace: bool,
     pause: Option<Pause>,
     paused: bool,
+    /// The host directory that is `/`, for the processes spawned in it
+    root: Option<PathBuf>,
 }
 
 impl<V: Vcpu + Clone> Container<V> {
@@ -264,6 +268,7 @@ impl<V: Vcpu + Clone> Container<V> {
             trace: false,
             pause: None,
             paused: false,
+            root: None,
         }
     }
 
@@ -292,7 +297,57 @@ impl<V: Vcpu + Clone> Container<V> {
 
     /// Give the guest a filesystem: the host directory `root` becomes `/`.
     pub fn set_root(&mut self, root: &Path) -> std::io::Result<()> {
-        self.tasks[&INIT].process.borrow_mut().set_root(root)
+        self.tasks[&INIT].process.borrow_mut().set_root(root)?;
+        self.root = Some(root.to_path_buf());
+        Ok(())
+    }
+
+    /// Start another program in the container, as `docker exec` does: it has
+    /// its own memory, on `vcpu`, and standard streams, `cwd` for its working
+    /// directory, and the container's filesystem and network, and no parent
+    /// to wait for it: `exit_of` says when it has ended. Returns its pid.
+    pub fn spawn(
+        &mut self,
+        vcpu: V,
+        elf: &[u8],
+        argv: &[String],
+        envp: &[String],
+        cwd: &str,
+        stdio: Stdio,
+    ) -> Result<u32, StartError> {
+        let pid = self.next_pid;
+        let mut process = Process::new(pid, stdio, 0, 0);
+        if let Some(root) = &self.root {
+            process.set_root(root).map_err(|_| StartError::NoRoot)?;
+        }
+        if cwd != "/" && !cwd.is_empty() {
+            process.set_cwd(cwd).map_err(|_| StartError::NoRoot)?;
+        }
+        let mut task = Task::new(pid, process, vcpu, Emulator::default());
+        let exe = argv.first().map_or(&b""[..], |arg| arg.as_bytes());
+        load(&mut task, elf, exe, argv, envp)?;
+        self.next_pid += 1;
+        self.tasks.insert(pid, task);
+        Ok(pid)
+    }
+
+    /// How a process `spawn` started ended, if it has: its exit status, with
+    /// the process gone from the container once told.
+    pub fn exit_of(&mut self, pid: u32) -> Option<u8> {
+        let task = self.tasks.get(&pid)?;
+        if task.process().ppid != 0 {
+            return None; // not one of spawn's: its parent waits for it
+        }
+        let State::Zombie(termination) = task.state else {
+            return None;
+        };
+        self.tasks.remove(&pid);
+        Some(termination.status())
+    }
+
+    /// How many processes the container has, zombies included.
+    pub fn processes(&self) -> usize {
+        self.tasks.len()
     }
 
     /// The first process, which lives as long as the container.

@@ -169,6 +169,12 @@ docker-test: toolchain
         exit 1
     }
     seen "total 3" || failed "the program did not read its input"
+    echo "--- docker exec runs another program in the running container, and docker stats counts it"
+    printf '7\n' | timeout 60 docker exec -i shem-tally /tally > $dir/exec.txt 2>&1 || failed "docker exec failed: $(cat $dir/exec.txt)"
+    grep -q "total 7" $dir/exec.txt || failed "the program docker exec added did not run: $(cat $dir/exec.txt)"
+    processes=$(timeout 30 docker stats --no-stream --format '{{{{.PIDs}}' shem-tally 2>&1) || failed "docker stats failed: $processes"
+    [ "$processes" -ge 1 ] 2>/dev/null || failed "docker stats showed no processes: $processes"
+    grep -q "total 3" $dir/tally.txt || failed "init was disturbed"
     # The commit pauses the program as it waits for more, then it goes on
     timeout 60 docker commit shem-tally shem-tally:committed >/dev/null || failed "docker commit failed"
     printf '10\n' >&3

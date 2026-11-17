@@ -33,7 +33,7 @@ use containerd_shim::{
 use log::{info, warn};
 use shem::linux::Stdio;
 
-use crate::bundle::{self, Bundle, Control, Wakeable};
+use crate::bundle::{self, Bundle, Control, ExecRequest, Wakeable};
 use crate::console::{Console, Resizer};
 use crate::holder::Holder;
 
@@ -71,6 +71,9 @@ struct Task {
 /// turn of its live session.
 struct ExecProcess {
     args: Vec<String>,
+    env: Vec<String>,
+    cwd: String,
+    stdin: String,
     stdout: String,
     stderr: String,
     status: api::Status,
@@ -144,21 +147,25 @@ impl Service {
     /// Start an exec process: one turn of a model container's live session,
     /// streamed to the exec's stdout. It ends when the reply does.
     fn start_exec(&self, exec_id: String) -> TtrpcResult<api::StartResponse> {
-        let (container_id, bundle_dir, task_pid, args, stdout, stderr) =
-            self.with_task(|task| {
-                let exec = (task.execs.get_mut(&exec_id))
-                    .ok_or_else(|| error(format!("no exec {exec_id}")))?;
-                exec.status = api::Status::RUNNING;
-                let streams = (exec.args.clone(), exec.stdout.clone(), exec.stderr.clone());
-                Ok::<_, ttrpc::Error>((
-                    task.id.clone(),
-                    task.bundle.clone(),
-                    task.pid,
-                    streams.0,
-                    streams.1,
-                    streams.2,
-                ))
-            })??;
+        let (container_id, bundle_dir, task_pid, control, exec) = self.with_task(|task| {
+            let exec = (task.execs.get_mut(&exec_id))
+                .ok_or_else(|| error(format!("no exec {exec_id}")))?;
+            exec.status = api::Status::RUNNING;
+            let copy = (
+                exec.args.clone(),
+                exec.env.clone(),
+                exec.cwd.clone(),
+                [exec.stdin.clone(), exec.stdout.clone(), exec.stderr.clone()],
+            );
+            Ok::<_, ttrpc::Error>((
+                task.id.clone(),
+                task.bundle.clone(),
+                task.pid,
+                task.control.clone(),
+                copy,
+            ))
+        })??;
+        let (args, env, cwd, [stdin, stdout, stderr]) = exec;
         self.publish(TaskExecStarted {
             container_id: container_id.clone(),
             exec_id: exec_id.clone(),
@@ -173,17 +180,43 @@ impl Service {
                     _ => Box::new(std::io::sink()),
                 }
             };
-            let mut out = open(&stdout);
-            let status = match Bundle::load(&bundle_dir)
-                .and_then(|bundle| crate::session::exec(&bundle, &args, &mut out))
-            {
-                Ok(()) => 0,
-                Err(err) => {
-                    let _ = writeln!(open(&stderr), "shem: {err:#}");
-                    1
+            let bundle = Bundle::load(&bundle_dir);
+            let program = bundle
+                .as_ref()
+                .is_ok_and(|b| !b.sandbox && !b.args[0].starts_with("shem:"));
+            let status = if program {
+                // A program joins the running container, which starts it between its slices
+                let (done, ended) = std::sync::mpsc::channel();
+                let request = ExecRequest {
+                    args,
+                    env,
+                    cwd,
+                    stdin,
+                    stdout,
+                    stderr: stderr.clone(),
+                    done,
+                };
+                if control.exec(request) {
+                    u32::from(ended.recv().unwrap_or(137))
+                } else {
+                    let _ = writeln!(open(&stderr), "shem: the container has ended");
+                    137
                 }
+            } else {
+                // A model container's live session: one turn, streamed to the exec's stdout
+                let mut out = open(&stdout);
+                let status = match bundle
+                    .and_then(|bundle| crate::session::exec(&bundle, &args, &mut out))
+                {
+                    Ok(()) => 0,
+                    Err(err) => {
+                        let _ = writeln!(open(&stderr), "shem: {err:#}");
+                        1
+                    }
+                };
+                drop(out);
+                status
             };
-            drop(out);
             let at = Timestamp::now();
             let (lock, exited) = &*service.task;
             if let Some(task) = lock.lock().unwrap().as_mut()
@@ -605,6 +638,54 @@ impl shim::Task for Service {
         })
     }
 
+    /// What `docker stats` and `kubectl top` show: the processes the container
+    /// has, the CPU time its instructions took on the virtual clock (one
+    /// nanosecond each), and the guest memory it was given, whose pages are the
+    /// vCPU's. Reported as cgroup v2 metrics, which is what containerd's clients decode.
+    fn stats(
+        &self,
+        _ctx: &TtrpcContext,
+        req: api::StatsRequest,
+    ) -> TtrpcResult<api::StatsResponse> {
+        trace("stats");
+        use containerd_shim::protos::cgroups_v2::metrics::{
+            CPUStat, MemoryStat, Metrics, PidsStat,
+        };
+        use containerd_shim::protos::protobuf::{Message, well_known_types::any::Any};
+        if !req.id.is_empty() && req.id != self.with_task(|task| task.id.clone())? {
+            return Err(error(format!("no container {}", req.id)));
+        }
+        let (control, bundle_dir) =
+            self.with_task(|task| (task.control.clone(), task.bundle.clone()))?;
+        let memory = Bundle::load(&bundle_dir).map_or(0, |bundle| u64::from(bundle.memory));
+        let steps = control.steps.load(std::sync::atomic::Ordering::SeqCst);
+        let metrics = Metrics {
+            pids: MessageField::some(PidsStat {
+                current: u64::from(control.processes.load(std::sync::atomic::Ordering::SeqCst)),
+                ..Default::default()
+            }),
+            cpu: MessageField::some(CPUStat {
+                usage_usec: steps / 1000,
+                user_usec: steps / 1000,
+                ..Default::default()
+            }),
+            memory: MessageField::some(MemoryStat {
+                usage: memory,
+                usage_limit: memory,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(api::StatsResponse {
+            stats: MessageField::some(Any {
+                type_url: "type.googleapis.com/io.containerd.cgroups.v2.Metrics".into(),
+                value: metrics.write_to_bytes().map_err(error)?,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
     fn pids(&self, _ctx: &TtrpcContext, _req: api::PidsRequest) -> TtrpcResult<api::PidsResponse> {
         trace("pids");
         let task_pid = self.with_task(|task| task.pid).unwrap_or_else(|_| pid());
@@ -646,6 +727,11 @@ impl shim::Task for Service {
                 req.exec_id.clone(),
                 ExecProcess {
                     args,
+                    env: (spec["env"].as_array().into_iter().flatten())
+                        .filter_map(|e| e.as_str().map(String::from))
+                        .collect(),
+                    cwd: spec["cwd"].as_str().unwrap_or_default().to_string(),
+                    stdin: req.stdin.clone(),
                     stdout: req.stdout.clone(),
                     stderr: req.stderr.clone(),
                     status: api::Status::CREATED,

@@ -93,9 +93,14 @@ containerd calls the shim's task service over ttrpc:
 
 Implementation: [`bundle.rs`](../crates/containerd-shim-shem/src/bundle.rs) loads bundles; [`service.rs`](../crates/containerd-shim-shem/src/service.rs) handles the protocol. Run `just docker-test` or `just containerd-test` for integration tests.
 
+## Exec and statistics
+
+`docker exec CONTAINER PROGRAM` starts another program in a running program container, with its own memory and streams, in the container's filesystem and network (its sockets included: a program and a client `exec` adds can talk), and ends with the program's status. `-i` gives it stdin; `-t` is not supported for an exec. The program joins at the next slice, about a hundredth of a second on the reference vCPU. A container whose init is blocked for good on something only a client would give it (an `accept` waiting for an `exec`'d client) is reported as deadlocked before the client can start, so start servers beside their clients, from one init.
+
+`docker stats` and `kubectl top` read the container's statistics, which the shim reports as cgroup v2 metrics: the processes it has, the CPU time its instructions took on the virtual clock (one nanosecond each), and its guest memory.
+
 ## Not yet
 
-- Program containers: `docker exec`.
-- Checkpoints and resource statistics.
+- Checkpoints, and `docker exec -t`.
 
-Model containers already support `exec`, `commit` and terminal input; see [sessions under Docker](models.md#sessions-under-docker).
+Model containers support `exec`, `commit` and terminal input too; see [sessions under Docker](models.md#sessions-under-docker).

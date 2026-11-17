@@ -366,3 +366,67 @@ fn signal_handlers_run_and_return_through_sigreturn() {
     );
     assert_eq!(out.result, Ok(42));
 }
+
+#[test]
+fn a_process_spawned_into_a_running_container_runs_beside_init_and_reports_how_it_ended() {
+    use shem::linux::Stdio;
+
+    // Init counts down for a while, so that the container is running when a program joins it
+    let init = elf(
+        &program![
+            li(T0, 100_000),
+            addi(T0, T0, -1),
+            bne(T0, ZERO, -4),
+            addi(A0, ZERO, 0),
+            exit_a0(),
+        ],
+        &[],
+    );
+    let (mut container, _init_out) = start(&init, &["init"], &[], MEM).unwrap();
+    assert_eq!(container.run(Some(100)), Err(RunError::StepLimit(100)));
+    let slice = 70_000;
+
+    let msg = b"from exec\n";
+    let joined = elf(
+        &program![
+            addi(A0, ZERO, 1),
+            li(A1, DATA),
+            addi(A2, ZERO, msg.len() as i32),
+            addi(A7, ZERO, SYS_WRITE),
+            ECALL,
+            lw(A0, SP, 0), // argc, as its status
+            exit_a0(),
+        ],
+        msg,
+    );
+    let out = SharedBuf::default();
+    let stdio = Stdio {
+        stdin: Box::new(std::io::empty()),
+        stdout: Box::new(out.clone()),
+        stderr: Box::new(std::io::sink()),
+    };
+    let argv = ["exec".to_string(), "a".to_string()];
+    let pid = container
+        .spawn(ReferenceVcpu::new(MEM), &joined, &argv, &[], "/", stdio)
+        .unwrap();
+    assert!(pid > 1);
+    assert_eq!(container.exit_of(pid), None, "it has not run yet");
+    // The container goes on; the joined program finishes first, and init after
+    let mut status = None;
+    for _ in 0..1000 {
+        match container.run(Some(container.steps + slice)) {
+            Ok(code) => {
+                assert_eq!(code, 0, "init's own status");
+                break;
+            }
+            Err(RunError::StepLimit(_)) => {}
+            Err(other) => panic!("{other:?}"),
+        }
+        status = status.or(container.exit_of(pid));
+    }
+    status = status.or(container.exit_of(pid));
+    assert_eq!(status, Some(2), "argc of the joined program");
+    assert_eq!(out.contents(), msg);
+    assert_eq!(container.exit_of(pid), None, "told once, and gone");
+    assert_eq!(container.processes(), 1);
+}

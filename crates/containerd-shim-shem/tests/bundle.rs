@@ -359,3 +359,48 @@ fn model_containers_hold_live_sessions() {
     control.kill(15);
     assert_eq!(main.join().unwrap(), 128 + 15);
 }
+
+#[test]
+fn a_program_docker_exec_adds_runs_in_the_container_and_says_how_it_ended() {
+    use containerd_shim_shem::bundle::ExecRequest;
+
+    let dir = bundle_with(echo());
+    let (control, mut stdin, out, run) = start_echo(dir.path());
+    std::thread::sleep(Duration::from_millis(200)); // init is well into its read
+
+    // The exec's streams are files here, where containerd's are FIFOs
+    let streams = tempfile::tempdir().unwrap();
+    let said = streams.path().join("stdout");
+    std::fs::write(&said, "").unwrap();
+    let (done, ended) = std::sync::mpsc::channel();
+    assert!(control.exec(ExecRequest {
+        args: vec!["/bin/hello".into(), "joined".into()],
+        env: Vec::new(),
+        cwd: String::new(),
+        stdin: String::new(),
+        stdout: said.to_string_lossy().into_owned(),
+        stderr: String::new(),
+        done,
+    }));
+    // It ran beside init, and ended with the status its program gave
+    assert_eq!(ended.recv_timeout(Duration::from_secs(30)), Ok(0));
+    assert!(std::fs::read(&said).unwrap().starts_with(b"ready\n"));
+    assert!(control.processes.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+
+    // Init was not disturbed: it still echoes what it is given, and ends
+    stdin.write_all(b"typed\n").unwrap();
+    assert_eq!(run.join().unwrap(), 0);
+    assert!(out.0.lock().unwrap().ends_with(b"typed\n"));
+    // Nothing can join a container that has ended, and a request waiting is ended with it
+    let (done, ended) = std::sync::mpsc::channel();
+    assert!(!control.exec(ExecRequest {
+        args: vec!["/bin/hello".into()],
+        env: Vec::new(),
+        cwd: String::new(),
+        stdin: String::new(),
+        stdout: String::new(),
+        stderr: String::new(),
+        done,
+    }));
+    assert!(ended.recv_timeout(Duration::from_secs(1)).is_err());
+}
