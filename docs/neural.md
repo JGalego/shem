@@ -160,15 +160,15 @@ It compares 1,024 random-program guests against the CPU executor for 512 steps i
 
 Instructions per second, with torch 2.15 and CUDA 13.2 (the CPU row is the paged executor on one core, from [Speed](#speed), as measured for an earlier release):
 
-| Guests | CPU | L4, best mode | A100, eager | A100, compiled + graph | A100, eager + graph |
+| Guests | CPU | L4, best mode (before → with byte registers) | A100, eager | A100, compiled + graph | A100, eager + graph |
 |---|---|---|---|---|---|
-| 1 | 881 | 4,818 | 192 | **12,859** | 2,086 |
-| 64 | 27,985 | 278,995 | 12,187 | **577,138** | 121,028 |
-| 1,024 | | 891,211 | 189,646 | **2,821,098** | 1,399,234 |
-| 4,096 | | 998,556 | 760,787 | 3,549,051 | **3,664,716** |
-| 16,384 | | 945,402 | 3,026,696 | 3,986,316 | **6,556,971** |
-| 32,768 | | 968,596 | 6,118,754 | 3,166,873 | **7,434,596** |
+| 1 | 881 | 4,818 → **6,655** | 192 | **12,859** | 2,086 |
+| 64 | 27,985 | 278,995 → **390,706** | 12,187 | **577,138** | 121,028 |
+| 1,024 | | 891,211 → **1,351,532** | 189,646 | **2,821,098** | 1,399,234 |
+| 4,096 | | 998,556 → **2,727,032** | 760,787 | 3,549,051 | **3,664,716** |
+| 16,384 | | 945,402 → **3,648,414** | 3,026,696 | 3,986,316 | **6,556,971** |
+| 32,768 | | 968,596 → **3,320,424** | 6,118,754 | 3,166,873 | **7,434,596** |
 
 - Small batches are launch-bound; compilation and graphs reduce launches.
-- Large batches are float64-bound. The A100 reaches 7.4 million instructions/s; the L4 levels off near one million.
-- Register bits are stored as bytes between instructions, 1 KiB per guest where float64 took 8, and are float64 again while an instruction computes with them. The arithmetic values stay float64, which the multiplier and divider need to stay exact. The GPU numbers above were measured before this change.
+- Large batches are memory-bound by what the state holds. The A100 reaches 7.4 million instructions/s (before byte registers); the L4 levelled off near one million, and now reaches 3.6 million.
+- Register bits are stored as bytes between instructions, 1 KiB per guest where float64 took 8, and are float64 again while an instruction computes with them. The arithmetic values stay float64, which the multiplier and divider need to stay exact. On the L4 this took the best mode at 16,384 guests from 945,402 to 3,648,414 instructions/s (the A100 columns were measured before it), with every mode still identical to the CPU's result, as the job checks.
