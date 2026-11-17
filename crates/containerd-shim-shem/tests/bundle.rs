@@ -508,6 +508,8 @@ fn tty_check() -> Vec<u8> {
     elf(&code, &[0; 64])
 }
 
+// Terminals are the shim's on Linux, where containerd is
+#[cfg(target_os = "linux")]
 #[test]
 fn docker_exec_t_gives_the_program_a_terminal_of_its_own_and_its_keys_signal_it() {
     let (dir, control, run) = waiting_container();
