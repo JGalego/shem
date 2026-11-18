@@ -56,6 +56,52 @@ pub mod fs {
         }
     }
 
+    /// What names the file at `path` on its host, when its metadata does not:
+    /// its volume and its index there, which only Windows keeps apart from
+    /// the metadata std gives. None where `MetadataExt` has them.
+    pub fn identity_of_path(path: &std::path::Path) -> Option<(u64, u64)> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            // Opened for nothing but its information, which a directory allows too
+            let file = std::fs::OpenOptions::new()
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .ok()?;
+            identity_of_file(&file)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    /// As `identity_of_path`, for a file that is open.
+    pub fn identity_of_file(file: &std::fs::File) -> Option<(u64, u64)> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+            // SAFETY: the handle is open for the call, and the struct is one it fills in
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            let done = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+            (done != 0).then_some((
+                u64::from(info.dwVolumeSerialNumber),
+                u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow),
+            ))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = file;
+            None
+        }
+    }
+
     /// The permission bits of `meta`.
     pub fn mode_of(meta: &std::fs::Metadata) -> u32 {
         MetadataExt::mode(meta) & 0o7777

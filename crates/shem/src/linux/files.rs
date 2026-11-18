@@ -385,9 +385,18 @@ impl Description {
 
     fn stat(&self, root: Option<&RootFs>) -> Result<Stat, Errno> {
         match &self.kind {
-            Kind::File(file) => Ok(guest_stat(root, &file.metadata()?)),
+            Kind::File(file) => Ok(guest_stat(
+                root,
+                &file.metadata()?,
+                crate::sys::fs::identity_of_file(file),
+            )),
             Kind::Dir(dir @ Dir { host: Some(_), .. }) => {
-                Ok(guest_stat(root, &std::fs::metadata(dir.host_now(root)?)?))
+                let host = dir.host_now(root)?;
+                Ok(guest_stat(
+                    root,
+                    &std::fs::metadata(&host)?,
+                    crate::sys::fs::identity_of_path(&host),
+                ))
             }
             Kind::Dir(dir) => Ok(proc::stat(&dir.guest, &Node::Dir(Vec::new()))),
             Kind::Proc { path, .. } => Ok(proc::stat(path, &Node::File(Vec::new()))),
@@ -1499,12 +1508,16 @@ pub(super) fn normalize(base: &[u8], path: &[u8]) -> Vec<u8> {
 
 fn list_dir(root: Option<&RootFs>, resolved: Resolved) -> Result<Dir, Errno> {
     let meta = std::fs::metadata(&resolved.host)?;
-    let ino = |meta: &std::fs::Metadata| guest_ino(root, meta.dev(), meta.ino());
-    let own = ino(&meta);
+    let ino = |meta: &std::fs::Metadata, path: &std::path::Path| {
+        let (dev, ino) = crate::sys::fs::identity_of_path(path).unwrap_or((meta.dev(), meta.ino()));
+        guest_ino(root, dev, ino)
+    };
+    let own = ino(&meta, &resolved.host);
     let parent = if resolved.guest == b"/" {
         own
     } else {
-        ino(&std::fs::metadata(resolved.host.parent().unwrap())?)
+        let above = resolved.host.parent().unwrap();
+        ino(&std::fs::metadata(above)?, above)
     };
     let mut entries = vec![
         Dirent {
@@ -1593,11 +1606,22 @@ fn stat_host(root: Option<&RootFs>, resolved: &Resolved, follow: bool) -> Result
     } else {
         std::fs::symlink_metadata(&resolved.host)?
     };
-    Ok(guest_stat(root, &meta))
+    Ok(guest_stat(
+        root,
+        &meta,
+        crate::sys::fs::identity_of_path(&resolved.host),
+    ))
 }
 
-fn guest_stat(root: Option<&RootFs>, meta: &std::fs::Metadata) -> Stat {
-    Stat::from_metadata(meta, guest_ino(root, meta.dev(), meta.ino()))
+/// The guest's view of a host file's metadata. `identity` is the file's
+/// device and inode where the metadata has none (Windows').
+fn guest_stat(
+    root: Option<&RootFs>,
+    meta: &std::fs::Metadata,
+    identity: Option<(u64, u64)>,
+) -> Stat {
+    let (dev, ino) = identity.unwrap_or((meta.dev(), meta.ino()));
+    Stat::from_metadata(meta, guest_ino(root, dev, ino))
 }
 
 /// The guest's inode number for a host file: the root filesystem's, which
