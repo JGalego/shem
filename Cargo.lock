@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "containerd-shim-shem"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "containerd-shim",
@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "shem"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",

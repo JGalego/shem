@@ -100,7 +100,7 @@ A check on pull requests fails when a commit lacks it. To fix a missing sign-off
 
 ## Release
 
-The [release workflow](.github/workflows/release.yml) publishes crates, the Python package, Linux and macOS binaries, GHCR images, [CPU weights](https://huggingface.co/jgalego/shem-rv32im), release notes, SBOMs and build provenance.
+The [release workflow](.github/workflows/release.yml) publishes crates, the Python package, Linux, macOS and Windows binaries, GHCR images, [CPU weights](https://huggingface.co/jgalego/shem-rv32im), release notes, SBOMs and build provenance.
 
 Set the same version in [Cargo.toml](Cargo.toml) and [neural/pyproject.toml](neural/pyproject.toml), then generate the changelog and tag the release. Replace `0.2.0` with the new version:
 
