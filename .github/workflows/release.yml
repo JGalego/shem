@@ -3,7 +3,7 @@ name: Release
 # Pushing a tag vX.Y.Z publishes that version everywhere:
 #   - the shem and containerd-shim-shem crates on crates.io
 #   - the shem-neural package on PyPI
-#   - shem and containerd-shim-shem-v1 binaries, with build provenance, on the GitHub release
+#   - shem (Linux, macOS and Windows) and containerd-shim-shem-v1 (Linux) binaries, with build provenance, on the GitHub release
 #   - the guest toolchain, the shem-neural runtime and the docker build frontend images on GHCR, for amd64 and arm64
 #   - the examples as shem images on GHCR: programs, a warm shell, a booted Linux, and models
 #   - the compiled CPU's weights, with a model card, on the Hugging Face Hub
@@ -61,7 +61,13 @@ jobs:
           - { os: macos-latest, target: aarch64-apple-darwin, packages: -p shem }
           # Built on Apple Silicon for Intel Macs, which GitHub's runners no longer offer
           - { os: macos-latest, target: x86_64-apple-darwin, packages: -p shem }
+          # Without the containerd shim, which is Linux's
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, packages: -p shem }
     runs-on: ${{ matrix.os }}
+    # One shell for the packaging on every system: Windows' default is PowerShell
+    defaults:
+      run:
+        shell: bash
     permissions:
       contents: read
       id-token: write
@@ -77,18 +83,20 @@ jobs:
         run: |
           name="shem-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
           out="target/${{ matrix.target }}/release"
+          exe=""
+          if [ "$RUNNER_OS" = Windows ]; then exe=".exe"; fi
           mkdir "$name"
-          cp "$out/shem" LICENSE README.md "$name/"
+          cp "$out/shem$exe" LICENSE README.md "$name/"
           if [ -f "$out/containerd-shim-shem-v1" ]; then cp "$out/containerd-shim-shem-v1" "$name/"; fi
           # Completions for the shells, and the manual pages, made by the binary they describe,
           # which a build for another architecture than the runner's may not be able to run
-          if "$out/shem" --version >/dev/null 2>&1; then
+          if "$out/shem$exe" --version >/dev/null 2>&1; then
             mkdir -p "$name/completions"
-            for shell in bash zsh fish; do "$out/shem" completions "$shell" > "$name/completions/shem.$shell"; done
-            "$out/shem" man "$name/man"
+            for shell in bash zsh fish; do "$out/shem$exe" completions "$shell" > "$name/completions/shem.$shell"; done
+            "$out/shem$exe" man "$name/man"
           fi
           tar czf "$name.tar.gz" "$name"
-          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          if command -v shasum >/dev/null; then shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"; else sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"; fi
       - uses: actions/attest-build-provenance@v4
         if: github.ref_type == 'tag'
         with:

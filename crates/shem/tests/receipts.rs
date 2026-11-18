@@ -1,3 +1,4 @@
+#![cfg_attr(not(unix), allow(dead_code))]
 //! `shem sign` and `shem verify`, which hand a receipt to cosign. A script
 //! stands in for cosign: it records its arguments, writes the bundle that
 //! `sign-blob` is asked for, and fails when told to.
@@ -29,6 +30,7 @@ fn shem(dir: &Path, args: &[&str], fail: bool) -> Output {
     command.output().unwrap()
 }
 
+#[cfg(unix)] // the stand-in for cosign is a shell script
 #[test]
 fn a_receipt_is_signed_and_its_signature_checked_through_cosign() {
     let dir = tempfile::tempdir().unwrap();
@@ -73,6 +75,7 @@ fn a_receipt_is_signed_and_its_signature_checked_through_cosign() {
     );
 }
 
+#[cfg(unix)] // the stand-in for cosign is a shell script
 #[test]
 fn a_signature_cosign_refuses_is_a_failure() {
     let dir = tempfile::tempdir().unwrap();

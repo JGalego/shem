@@ -81,6 +81,86 @@ pub fn make_removable(scratch: &Path) {
     let _ = scratch;
 }
 
+/// Make the namespaces an overlay can be mounted in, and be in them. Where
+/// this fails part of the way (a kernel that lets a process make a user
+/// namespace and then refuses it the right to map its ids, as Ubuntu 24.04
+/// does by default), the process is left in one it cannot use: `enter`
+/// tries it in a process of its own first.
+#[cfg(target_os = "linux")]
+fn attempt() -> Result<(), Why> {
+    // SAFETY: geteuid and getegid read the process's ids
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    // SAFETY: unshare takes flags only; it fails where there are other threads
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
+        return Err(format!(
+            "cannot make namespaces: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // The user stays who they are, so the files the run makes are theirs
+    let write = |file: &str, text: String| {
+        std::fs::write(format!("/proc/self/{file}"), text)
+            .map_err(|error| format!("cannot write {file}: {error}"))
+    };
+    write("setgroups", "deny".into())?;
+    write("gid_map", format!("{gid} {gid} 1"))?;
+    write("uid_map", format!("{uid} {uid} 1"))?;
+    // What is mounted here is not shared with the host's namespace
+    // SAFETY: remounting "/" with flags only, and no data
+    unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        );
+    }
+    Ok(())
+}
+
+/// Run `attempt` in a process of its own, which ends with it, and say what
+/// it found: the caller's namespaces stay as they are.
+#[cfg(target_os = "linux")]
+fn in_child(attempt: impl FnOnce() -> Result<(), Why>) -> Result<(), Why> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    // SAFETY: an array of two descriptors for pipe to fill in
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: fork; the child makes the attempt, says what happened and ends
+    // without returning to the caller's code
+    match unsafe { libc::fork() } {
+        -1 => Err(std::io::Error::last_os_error().to_string()),
+        0 => {
+            let said = match attempt() {
+                Ok(()) => String::new(),
+                Err(why) => why,
+            };
+            // SAFETY: the write end of the pipe, a buffer and its length, then exit
+            unsafe {
+                libc::write(fds[1], said.as_ptr().cast(), said.len());
+                libc::_exit(0)
+            }
+        }
+        _ => {
+            // SAFETY: the read end of the pipe, which nothing else owns; the
+            // write end is closed here so that reading ends with the child's
+            let mut reader = unsafe {
+                libc::close(fds[1]);
+                std::fs::File::from_raw_fd(fds[0])
+            };
+            let mut said = String::new();
+            let _ = reader.read_to_string(&mut said);
+            // SAFETY: reaping the child
+            unsafe { libc::wait(std::ptr::null_mut()) };
+            if said.is_empty() { Ok(()) } else { Err(said) }
+        }
+    }
+}
+
 /// Enter the namespaces an overlay can be mounted in, once for the process.
 /// Fails, and leaves the process as it was, where it cannot be done.
 #[cfg(target_os = "linux")]
@@ -92,35 +172,9 @@ pub fn enter() -> Result<(), Why> {
             if disabled() {
                 return Err("SHEM_NO_OVERLAY is set".into());
             }
-            // SAFETY: geteuid and getegid read the process's ids
-            let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-            // SAFETY: unshare takes flags only; it fails where there are other threads
-            if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
-                return Err(format!(
-                    "cannot make namespaces: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            // The user stays who they are, so the files the run makes are theirs
-            let write = |file: &str, text: String| {
-                std::fs::write(format!("/proc/self/{file}"), text)
-                    .map_err(|error| format!("cannot write {file}: {error}"))
-            };
-            write("setgroups", "deny".into())?;
-            write("gid_map", format!("{gid} {gid} 1"))?;
-            write("uid_map", format!("{uid} {uid} 1"))?;
-            // What is mounted here is not shared with the host's namespace
-            // SAFETY: remounting "/" with flags only, and no data
-            unsafe {
-                libc::mount(
-                    std::ptr::null(),
-                    c"/".as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_REC | libc::MS_PRIVATE,
-                    std::ptr::null(),
-                );
-            }
-            Ok(())
+            // Where a child can, this process can
+            in_child(attempt)?;
+            attempt()
         })
         .clone()
 }
@@ -198,46 +252,11 @@ pub fn mount(_lower: &Path, _scratch_in: &Path) -> Result<Mounted, Why> {
 /// directories go, on the filesystem a run's would.
 #[cfg(target_os = "linux")]
 pub fn probe(scratch_in: &Path) -> Result<(), Why> {
-    use std::io::Read;
-    use std::os::fd::FromRawFd;
     if disabled() {
         return Err("SHEM_NO_OVERLAY is set".into());
     }
     let lower = tempfile::tempdir_in(scratch_in).map_err(|error| error.to_string())?;
-    let mut fds = [0; 2];
-    // SAFETY: an array of two descriptors for pipe to fill in
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    // SAFETY: fork; the child makes the attempt, says what happened and ends
-    // without returning to the caller's code
-    match unsafe { libc::fork() } {
-        -1 => Err(std::io::Error::last_os_error().to_string()),
-        0 => {
-            let said = match enter().and_then(|()| mount(lower.path(), scratch_in).map(drop)) {
-                Ok(()) => String::new(),
-                Err(why) => why,
-            };
-            // SAFETY: the write end of the pipe, a buffer and its length, then exit
-            unsafe {
-                libc::write(fds[1], said.as_ptr().cast(), said.len());
-                libc::_exit(0)
-            }
-        }
-        _ => {
-            // SAFETY: the read end of the pipe, which nothing else owns; the
-            // write end is closed here so that reading ends with the child's
-            let mut reader = unsafe {
-                libc::close(fds[1]);
-                std::fs::File::from_raw_fd(fds[0])
-            };
-            let mut said = String::new();
-            let _ = reader.read_to_string(&mut said);
-            // SAFETY: reaping the child
-            unsafe { libc::wait(std::ptr::null_mut()) };
-            if said.is_empty() { Ok(()) } else { Err(said) }
-        }
-    }
+    in_child(|| attempt().and_then(|()| mount(lower.path(), scratch_in).map(drop)))
 }
 
 #[cfg(not(target_os = "linux"))]
