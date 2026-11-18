@@ -62,7 +62,84 @@ impl Store {
         }
         std::fs::create_dir_all(dir.parent().context("no parent")?)?;
         std::fs::rename(staged, dir).with_context(|| format!("storing {}", dir.display()))?;
+        self.share_blobs(dir);
+        self.sweep()?;
         Ok(())
+    }
+
+    /// Where the large files of images' unpacked copies are kept once, each
+    /// linked into every copy that holds it.
+    pub(super) fn shared_files(&self) -> PathBuf {
+        self.cache("files")
+    }
+
+    /// Where the store keeps the blobs of the layouts in it once, each
+    /// linked into every layout that holds it.
+    fn shared_blobs(&self) -> PathBuf {
+        self.cache("blobs")
+    }
+
+    /// Make the blobs of the layout in `dir` links to the store's one file
+    /// for each, adding those it has none of: two images with the same
+    /// layer, as two models have the same weights, keep it on the disk once.
+    /// Best effort: a blob that cannot be linked stays a file of its own.
+    pub(super) fn share_blobs(&self, dir: &Path) {
+        let pool = self.shared_blobs();
+        let Ok(listing) = std::fs::read_dir(dir.join("blobs/sha256")) else {
+            return;
+        };
+        if std::fs::create_dir_all(&pool).is_err() {
+            return;
+        }
+        for blob in listing.flatten() {
+            let (path, kept) = (blob.path(), pool.join(blob.file_name()));
+            let (Ok(own), Ok(there)) = (path.metadata(), kept.metadata()) else {
+                // The store has none: this one is where it will be
+                let _ = std::fs::hard_link(&path, &kept);
+                continue;
+            };
+            // Named for its content, so the same file if it is as long; a link is already shared
+            if own.ino() == there.ino() || own.len() != there.len() {
+                continue;
+            }
+            let staged =
+                path.with_file_name(format!(".shared-{}", blob.file_name().to_string_lossy()));
+            if std::fs::hard_link(&kept, &staged).is_ok()
+                && std::fs::rename(&staged, &path).is_err()
+            {
+                let _ = std::fs::remove_file(&staged);
+            }
+        }
+    }
+
+    /// Delete what the shared files and blobs hold that no image or copy
+    /// links to any longer, which is every file whose only link is its own
+    /// place in the pool. Returns each path deleted and the bytes freed.
+    pub(super) fn sweep(&self) -> anyhow::Result<Vec<(PathBuf, u64)>> {
+        let mut deleted = Vec::new();
+        for pool in [self.shared_blobs(), self.shared_files()] {
+            let Ok(listing) = std::fs::read_dir(&pool) else {
+                continue;
+            };
+            for entry in listing.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                let name = entry.file_name();
+                // A name with a dot first is a file being made, which is its only link until it is placed
+                let unfinished = name.to_string_lossy().starts_with('.');
+                let stale = meta
+                    .modified()
+                    .ok()
+                    .and_then(|at| at.elapsed().ok())
+                    .is_some_and(|age| age > std::time::Duration::from_secs(24 * 60 * 60));
+                if meta.nlink() == 1
+                    && (!unfinished || stale)
+                    && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    deleted.push((entry.path(), meta.len()));
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     /// The references `name` stands for: an image's reference, as
@@ -154,6 +231,7 @@ impl Store {
         if unpacked.exists() {
             self.discard(&unpacked)?;
         }
+        self.sweep()?;
         Ok(Some(digest))
     }
 
@@ -207,6 +285,8 @@ impl Store {
             self.discard(&path)?;
             deleted.push((path, size));
         }
+        // What no image or copy of one links to now
+        deleted.extend(self.sweep()?);
         Ok(deleted)
     }
 

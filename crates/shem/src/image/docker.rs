@@ -218,7 +218,9 @@ impl Store {
             }
             std::fs::create_dir_all(path.parent().context("no parent")?)?;
             std::fs::rename(&layout, &path)?;
+            self.share_blobs(&path);
         }
+        self.sweep()?;
         // The staging directory became the last image
         let _ = staging.keep();
         Ok(names)

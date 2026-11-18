@@ -446,6 +446,16 @@ impl Image {
         Ok(())
     }
 
+    /// Unpack the filesystem layers into `root` as `unpack_rootfs` does, with
+    /// the large files kept in `pool` for the other images that hold them
+    /// (see [`layer::unpack_sharing`]).
+    pub fn unpack_rootfs_sharing(&self, root: &Path, pool: &Path) -> anyhow::Result<()> {
+        for layer in self.layers.iter().filter(|l| l.media_type == ROOTFS_TYPE) {
+            layer::unpack_sharing(&layer.data, root, Some(pool))?;
+        }
+        Ok(())
+    }
+
     /// Write the image as an OCI image layout in `dir`, tagged `tag`. Returns
     /// the manifest's digest.
     pub fn write_layout(&self, dir: &Path, tag: &str) -> anyhow::Result<String> {
@@ -945,7 +955,8 @@ impl Store {
         if !dir.is_dir() {
             std::fs::create_dir_all(&cache)?;
             let staging = tempfile::tempdir_in(&cache)?;
-            image.unpack_rootfs(staging.path())?;
+            // Files of the size of weights are linked to those of the other copies that hold them
+            image.unpack_rootfs_sharing(staging.path(), &self.shared_files())?;
             // A model's primed session, where `shem save` puts it for Docker too
             if let (Some(_), Some(files)) = (&image.config.model, image.state_files()?) {
                 let dir = staging.path().join(model::SESSION_DIR);

@@ -127,6 +127,18 @@ pub fn diff(
 
 /// Apply a layer on top of the tree at `root`.
 pub fn unpack(layer: &[u8], root: &Path) -> anyhow::Result<()> {
+    unpack_sharing(layer, root, None)
+}
+
+/// The size from which a file is kept once for all the trees that hold it.
+pub const SHARED_FROM: u64 = 1 << 20;
+
+/// Apply a layer on top of the tree at `root`, as `unpack` does, with the
+/// files of `SHARED_FROM` bytes and more, if there is a `pool` to keep them
+/// in, hard links to files there that other trees link to as well: the same
+/// weights in two images are on the disk once. A pooled file is read-only,
+/// since a write to it would change every tree it is in.
+pub fn unpack_sharing(layer: &[u8], root: &Path, pool: Option<&Path>) -> anyhow::Result<()> {
     std::fs::create_dir_all(root)?;
     let mut archive = tar::Archive::new(layer);
     archive.set_preserve_permissions(true);
@@ -157,12 +169,90 @@ pub fn unpack(layer: &[u8], root: &Path) -> anyhow::Result<()> {
                 std::fs::remove_file(&target)?;
             }
         }
+        if let Some(pool) = pool
+            && entry.header().entry_type() == tar::EntryType::Regular
+            && entry.size() >= SHARED_FROM
+        {
+            let start = entry.raw_file_position() as usize;
+            let mode = entry.header().mode().unwrap_or(0o644) & 0o7555;
+            let data = layer.get(start..start + entry.size() as usize);
+            if let (Some(data), Some(parent)) = (data, plain_parent(root, &path))
+                && share(
+                    data,
+                    mode,
+                    pool,
+                    &parent.join(path.file_name().unwrap_or_default()),
+                )
+                .is_ok()
+            {
+                continue;
+            }
+        }
         // unpack_in refuses paths that would land outside `root`.
         if !entry.unpack_in(root)? {
             bail!("layer entry {} escapes the root", path.display());
         }
     }
     Ok(())
+}
+
+/// The directory the layer entry `path` is in under `root`, made if it is
+/// not, when every part of it is a plain directory: None if the path climbs
+/// with `..` or goes through a link, which the tar crate makes sure of
+/// where this does not.
+fn plain_parent(root: &Path, path: &Path) -> Option<PathBuf> {
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => names.push(part),
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    names.pop()?;
+    let mut dir = root.to_path_buf();
+    for name in names {
+        dir.push(name);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return None,
+            Err(_) => std::fs::create_dir(&dir).ok()?,
+        }
+    }
+    Some(dir)
+}
+
+/// Put `data` at `target` as a hard link to its file in `pool`, which is
+/// named for the content and the mode, and made if no tree has put it
+/// there yet. The file is made read-only: it is shared.
+fn share(data: &[u8], mode: u32, pool: &Path, target: &Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let kept = pool.join(format!("{}-{mode:o}", hex(&Sha256::digest(data))));
+    let linked = |from: &Path| std::fs::hard_link(from, target);
+    if target.symlink_metadata().is_ok() {
+        std::fs::remove_file(target)?;
+    }
+    if linked(&kept).is_ok() {
+        return Ok(());
+    }
+    // Made under another name first: a name in the pool is only ever a whole file
+    std::fs::create_dir_all(pool)?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".staged-")
+        .tempfile_in(pool)?;
+    staged.write_all(data)?;
+    staged
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(mode & !0o222))?;
+    linked(staged.path())?;
+    // Another unpack may have made it first, which is the same file
+    let _ = std::fs::hard_link(staged.path(), &kept);
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Where the layer entry `path` is under `root`, which already exists: None
