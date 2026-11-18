@@ -8,13 +8,10 @@
 //! off, and a run that needs the driver's own process (a receipt, a
 //! conversation, a terminal's prompt) never uses it.
 
+use crate::sys::net::UnixStream;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -36,7 +33,8 @@ const START_WAIT: Duration = Duration::from_secs(900);
 
 /// Whether the server is on, which `SHEM_DAEMON=0` (or `off`, `no`, `false`) turns off.
 pub fn enabled() -> bool {
-    on(std::env::var("SHEM_DAEMON").ok().as_deref())
+    // The server is reached over a Unix socket, which a run on Windows does not have
+    cfg!(unix) && on(std::env::var("SHEM_DAEMON").ok().as_deref())
 }
 
 fn on(setting: Option<&str>) -> bool {
@@ -57,18 +55,7 @@ fn connect(log: &Path) -> Option<UnixStream> {
     if let Some(dir) = lock.parent() {
         std::fs::create_dir_all(dir).ok()?;
     }
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .mode(0o600)
-        .open(lock)
-        .ok()?;
-    // SAFETY: the descriptor is open for the call
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return None;
-    }
+    let _lock = crate::sys::lock_file(&lock).ok()?;
     if let Ok(stream) = neural::connect_stream(&socket) {
         return Some(stream);
     }
@@ -76,20 +63,20 @@ fn connect(log: &Path) -> Option<UnixStream> {
         "shem: starting the model server, which keeps models loaded for {} minutes (SHEM_DAEMON=0 runs without it)",
         KEEP_WARM.parse::<u32>().unwrap_or(0) / 60
     );
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(log)
-        .ok()?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+    let log = options.open(log).ok()?;
     let mut server = image::model::python("shem_neural.server");
     server
         .args(["--keep-warm", KEEP_WARM, "--idle-exit", IDLE_EXIT])
         .stdin(Stdio::null())
         .stdout(log.try_clone().ok()?)
-        .stderr(log)
-        // Its own group: a Ctrl-C at this terminal is not for it
-        .process_group(0);
+        .stderr(log);
+    // Its own group: a Ctrl-C at this terminal is not for it
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut server, 0);
     let mut child = server.spawn().ok()?;
     let started = Instant::now();
     loop {
@@ -171,7 +158,7 @@ fn reply(stream: &mut UnixStream, request: &serde_json::Value) -> anyhow::Result
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

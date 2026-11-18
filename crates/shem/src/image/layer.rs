@@ -4,9 +4,9 @@
 //! files always make the same bytes. Deletions are OCI whiteouts: an empty
 //! `.wh.NAME` entry next to the deleted `NAME`.
 
+use crate::sys::fs::MetadataExt;
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -227,7 +227,6 @@ fn plain_parent(root: &Path, path: &Path) -> Option<PathBuf> {
 /// there yet. The file is made read-only: it is shared.
 fn share(data: &[u8], mode: u32, pool: &Path, target: &Path) -> anyhow::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     let kept = pool.join(format!("{}-{mode:o}", hex(&Sha256::digest(data))));
     let linked = |from: &Path| std::fs::hard_link(from, target);
     if target.symlink_metadata().is_ok() {
@@ -242,9 +241,7 @@ fn share(data: &[u8], mode: u32, pool: &Path, target: &Path) -> anyhow::Result<(
         .prefix(".staged-")
         .tempfile_in(pool)?;
     staged.write_all(data)?;
-    staged
-        .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(mode & !0o222))?;
+    crate::sys::fs::set_mode(staged.path(), mode & !0o222)?;
     linked(staged.path())?;
     // Another unpack may have made it first, which is the same file
     let _ = std::fs::hard_link(staged.path(), &kept);

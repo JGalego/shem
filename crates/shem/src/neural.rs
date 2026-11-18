@@ -6,8 +6,8 @@
 //! The `Vcpu` trait has no room for transport errors, so a broken connection to
 //! the server panics with the reason.
 
+use crate::sys::net::UnixStream;
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -36,18 +36,26 @@ const MEMORY_FAULT: u8 = 2;
 /// directory, or else under `/tmp` by their ID. Not a fixed path in a
 /// directory everyone can write to, where another user could listen first.
 pub fn default_socket() -> PathBuf {
-    // SAFETY: geteuid has no arguments and cannot fail
-    let uid = unsafe { libc::geteuid() };
-    if uid == 0 {
-        return PathBuf::from("/run/shem/neural.sock");
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no arguments and cannot fail
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 {
+            return PathBuf::from("/run/shem/neural.sock");
+        }
+        match std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
+            Some(dir) => PathBuf::from(dir).join("shem/neural.sock"),
+            None => PathBuf::from(format!("/tmp/shem-neural-{uid}.sock")),
+        }
     }
-    match std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
-        Some(dir) => PathBuf::from(dir).join("shem/neural.sock"),
-        None => PathBuf::from(format!("/tmp/shem-neural-{uid}.sock")),
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("shem-neural.sock")
     }
 }
 
 /// The user ID of the process at the other end of `stream`.
+#[cfg(unix)]
 fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     use std::os::fd::AsRawFd;
     #[cfg(target_os = "linux")]
@@ -90,17 +98,20 @@ fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
 /// made is refused.
 pub fn connect_stream(socket: &Path) -> io::Result<UnixStream> {
     let stream = UnixStream::connect(socket)?;
-    let peer = peer_uid(&stream)?;
-    // SAFETY: geteuid has no arguments and cannot fail
-    let me = unsafe { libc::geteuid() };
-    if peer != me && peer != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{} is listened at by user {peer}, not by this user or root: refusing to send it a guest or a prompt",
-                socket.display()
-            ),
-        ));
+    #[cfg(unix)]
+    {
+        let peer = peer_uid(&stream)?;
+        // SAFETY: geteuid has no arguments and cannot fail
+        let me = unsafe { libc::geteuid() };
+        if peer != me && peer != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is listened at by user {peer}, not by this user or root: refusing to send it a guest or a prompt",
+                    socket.display()
+                ),
+            ));
+        }
     }
     Ok(stream)
 }

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! What images that hold the same layer, or the same large file, keep on the
 //! disk once: the blobs of their layouts, and the files of their unpacked copies.
 

@@ -451,7 +451,8 @@ impl Image {
     /// (see [`layer::unpack_sharing`]).
     pub fn unpack_rootfs_sharing(&self, root: &Path, pool: &Path) -> anyhow::Result<()> {
         for layer in self.layers.iter().filter(|l| l.media_type == ROOTFS_TYPE) {
-            layer::unpack_sharing(&layer.data, root, Some(pool))?;
+            // Windows' metadata has no link count to tell a pooled file nothing holds from one it does
+            layer::unpack_sharing(&layer.data, root, cfg!(unix).then_some(pool))?;
         }
         Ok(())
     }
@@ -902,6 +903,10 @@ impl Store {
             Some(dir) => PathBuf::from(dir),
             None => match std::env::var_os("XDG_DATA_HOME") {
                 Some(dir) => PathBuf::from(dir).join("shem"),
+                None if cfg!(windows) => PathBuf::from(
+                    std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?,
+                )
+                .join("shem"),
                 None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
                     .join(".local/share/shem"),
             },

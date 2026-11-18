@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
@@ -194,13 +196,7 @@ mod beneath {
         fs::rename(root.host.join("data"), root.host.join("data.old")).unwrap();
         symlink(outside.path(), root.host.join("data")).unwrap();
         let guest = std::str::from_utf8(&resolved.guest).unwrap();
-        let made = root.fs.at_parent(guest.as_bytes(), |dir, name| {
-            // SAFETY: the descriptor is open and the name a C string, for the call
-            match unsafe { libc::mkdirat(dir, name.as_ptr(), 0o755 as libc::mode_t) } {
-                0 => Ok(()),
-                _ => Err(std::io::Error::last_os_error()),
-            }
-        });
+        let made = root.fs.mkdir_beneath(guest.as_bytes(), 0o755);
         let Some(made) = made else { return };
         // The link is refused, as a link (ELOOP) or as no directory (ENOTDIR, which O_DIRECTORY says of one)
         let refused = made.unwrap_err().raw_os_error();
@@ -210,12 +206,7 @@ mod beneath {
         );
         assert!(!outside.path().join("kept").is_dir() && outside.path().join("kept").is_file());
         // A parent that is a plain directory works as before
-        let ok = root.fs.at_parent(b"/bin/new", |dir, name| {
-            match unsafe { libc::mkdirat(dir, name.as_ptr(), 0o755 as libc::mode_t) } {
-                0 => Ok(()),
-                _ => Err(std::io::Error::last_os_error()),
-            }
-        });
+        let ok = root.fs.mkdir_beneath(b"/bin/new", 0o755);
         assert!(ok.unwrap().is_ok() && root.host.join("bin/new").is_dir());
     }
 
@@ -228,20 +219,17 @@ mod beneath {
         let Some(stat) = root.fs.stat_beneath(b"/data/note") else {
             return; // a kernel before openat2
         };
-        assert_eq!(stat.unwrap().st_size, 6);
+        assert_eq!(stat.unwrap().size, 6);
         // A link is itself, not its target
         let link = root.fs.stat_beneath(b"/data/link").unwrap().unwrap();
-        assert_eq!(link.st_mode & 0o170000, 0o120000);
+        assert_eq!(link.mode & 0o170000, 0o120000);
         assert_eq!(
             root.fs.readlink_beneath(b"/data/link").unwrap().unwrap(),
             b"note"
         );
-        let now = [libc::timespec {
-            tv_sec: 1_000_000,
-            tv_nsec: 0,
-        }; 2];
+        let now = Some(1_000_000_000_000_000);
         root.fs
-            .set_times_beneath(b"/data/note", &now)
+            .set_times_beneath(b"/data/note", now, now)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -249,7 +237,8 @@ mod beneath {
                 .stat_beneath(b"/data/note")
                 .unwrap()
                 .unwrap()
-                .st_mtime,
+                .mtime
+                .0,
             1_000_000
         );
         let mut names: Vec<_> = root
@@ -272,7 +261,7 @@ mod beneath {
         assert!(root.fs.readlink_beneath(b"/data/link").unwrap().is_err());
         assert!(
             root.fs
-                .set_times_beneath(b"/data/note", &now)
+                .set_times_beneath(b"/data/note", now, now)
                 .unwrap()
                 .is_err()
         );

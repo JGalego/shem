@@ -1,10 +1,10 @@
 //! File descriptors, and the system calls that work on files and paths.
 
+use crate::sys::ffi::OsStrExt;
+use crate::sys::fs::{DirBuilderExt, DirEntryExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, DirEntryExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -569,8 +569,9 @@ impl Process {
                     .write(access != O_RDONLY)
                     .append(flags & O_APPEND != 0)
                     .truncate(flags & O_TRUNC != 0 && access != O_RDONLY)
-                    .mode((mode & !self.umask) & 0o7777)
-                    .custom_flags(libc::O_NOFOLLOW);
+                    .mode((mode & !self.umask) & 0o7777);
+                #[cfg(unix)]
+                options.custom_flags(libc::O_NOFOLLOW);
                 if creating {
                     // The host only creates files opened for writing; Linux also
                     // creates them for read-only opens.
@@ -578,6 +579,7 @@ impl Process {
                 }
                 // Opened beneath the root in one step where the kernel can, so that a
                 // link swapped in on the host since the path was resolved leads nowhere
+                #[cfg(unix)]
                 let beneath = self.root.as_deref().and_then(|root| {
                     // As the options above say it: Linux creates a file for a read-only
                     // open too, which the host does only for one open for writing
@@ -604,6 +606,8 @@ impl Process {
                     };
                     root.open_beneath(&resolved.guest, how | libc::O_NOFOLLOW, mode)
                 });
+                #[cfg(not(unix))]
+                let beneath: Option<std::io::Result<std::fs::File>> = None;
                 let file = match beneath {
                     Some(opened) => opened?,
                     None => options.open(&resolved.host)?,
@@ -987,15 +991,10 @@ impl Process {
     ) -> Result<u32, Errno> {
         let resolved = self.resolve_at(vcpu, dirfd, path, false)?;
         let mode = (mode & !self.umask) & 0o7777;
-        let beneath = self.root.as_deref().and_then(|root| {
-            root.at_parent(&resolved.guest, |dir, name| {
-                // SAFETY: `dir` is open and `name` is a C string, for the call
-                match unsafe { libc::mkdirat(dir, name.as_ptr(), mode as libc::mode_t) } {
-                    0 => Ok(()),
-                    _ => Err(std::io::Error::last_os_error()),
-                }
-            })
-        });
+        let beneath = self
+            .root
+            .as_deref()
+            .and_then(|root| root.mkdir_beneath(&resolved.guest, mode));
         match beneath {
             Some(done) => done?,
             None => std::fs::DirBuilder::new()
@@ -1017,21 +1016,10 @@ impl Process {
         if resolved.guest == b"/" {
             return Err(Errno::EBUSY);
         }
-        let how = if flags & AT_REMOVEDIR != 0 {
-            libc::AT_REMOVEDIR
-        } else {
-            0
-        };
-        let beneath = self.root.as_deref().and_then(|root| {
-            root.at_parent(&resolved.guest, |dir, name| {
-                // SAFETY: `dir` is open and `name` is a C string, for the call; the kernel
-                // answers EISDIR and ENOTDIR as Linux does for the wrong kind
-                match unsafe { libc::unlinkat(dir, name.as_ptr(), how) } {
-                    0 => Ok(()),
-                    _ => Err(std::io::Error::last_os_error()),
-                }
-            })
-        });
+        let beneath = self
+            .root
+            .as_deref()
+            .and_then(|root| root.unlink_beneath(&resolved.guest, flags & AT_REMOVEDIR != 0));
         match beneath {
             Some(done) => done?,
             None => {
@@ -1066,21 +1054,13 @@ impl Process {
         }
         let resolved = self.resolve_at(vcpu, dirfd, path, false)?;
         // The target is stored verbatim; the resolver interprets it inside the root.
-        let beneath = self.root.as_deref().and_then(|root| {
-            let link = std::ffi::CString::new(target.clone()).ok()?;
-            root.at_parent(&resolved.guest, |dir, name| {
-                // SAFETY: `dir` is open, and `link` and `name` are C strings, for the call
-                match unsafe { libc::symlinkat(link.as_ptr(), dir, name.as_ptr()) } {
-                    0 => Ok(()),
-                    _ => Err(std::io::Error::last_os_error()),
-                }
-            })
-        });
+        let beneath = self
+            .root
+            .as_deref()
+            .and_then(|root| root.symlink_beneath(&resolved.guest, &target));
         match beneath {
             Some(done) => done?,
-            None => {
-                std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &resolved.host)?
-            }
+            None => crate::sys::fs::symlink(std::ffi::OsStr::from_bytes(&target), &resolved.host)?,
         }
         self.created(&resolved);
         Ok(0)
@@ -1107,9 +1087,6 @@ impl Process {
                 .and_then(|root| root.readlink_beneath(&resolved.guest))
             {
                 Some(Ok(target)) => target,
-                Some(Err(err)) if err.raw_os_error() == Some(libc::EINVAL) => {
-                    return Err(Errno::EINVAL);
-                }
                 Some(Err(err)) => return Err(err.into()),
                 None => {
                     if !std::fs::symlink_metadata(&resolved.host)?.is_symlink() {
@@ -1139,40 +1116,12 @@ impl Process {
         }
         let from = self.resolve_at(vcpu, old_dirfd, old_path, false)?;
         let to = self.resolve_at(vcpu, new_dirfd, new_path, false)?;
-        #[cfg(target_os = "linux")]
-        let beneath = self.root.as_deref().and_then(|root| {
-            root.at_parent(&from.guest, |from_dir, from_name| {
-                root.at_parent(&to.guest, |to_dir, to_name| {
-                    // SAFETY: both descriptors are open and both names are C strings, for the call
-                    let done = unsafe {
-                        libc::syscall(
-                            libc::SYS_renameat2,
-                            from_dir,
-                            from_name.as_ptr(),
-                            to_dir,
-                            to_name.as_ptr(),
-                            flags,
-                        )
-                    };
-                    if done == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                })
-                .unwrap_or_else(|| Err(std::io::Error::from_raw_os_error(libc::ENOSYS)))
-            })
-        });
-        #[cfg(not(target_os = "linux"))]
-        let beneath: Option<std::io::Result<()>> = None;
+        // The kernel with openat2 has renameat2 too; one without either renames by path
+        let beneath = self
+            .root
+            .as_deref()
+            .and_then(|root| root.rename_beneath(&from.guest, &to.guest, flags));
         match beneath {
-            // The kernel with openat2 has renameat2 too; one without either renames by path
-            Some(Err(err)) if err.raw_os_error() == Some(libc::ENOSYS) => {
-                if flags & RENAME_NOREPLACE != 0 && std::fs::symlink_metadata(&to.host).is_ok() {
-                    return Err(Errno::EEXIST);
-                }
-                std::fs::rename(&from.host, &to.host)?;
-            }
             Some(done) => done?,
             None => {
                 if flags & RENAME_NOREPLACE != 0 && std::fs::symlink_metadata(&to.host).is_ok() {
@@ -1306,8 +1255,7 @@ impl Process {
             let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
             let resolved = self.resolve_at(vcpu, dirfd, path, follow)?;
             if let Some(root) = self.root()
-                && let Some(done) =
-                    root.set_times_beneath(&resolved.guest, &timespecs(stamps[0], stamps[1]))
+                && let Some(done) = root.set_times_beneath(&resolved.guest, stamps[0], stamps[1])
             {
                 done?;
                 return Ok(0);
@@ -1612,7 +1560,7 @@ fn list_dir(root: Option<&RootFs>, resolved: Resolved) -> Result<Dir, Errno> {
 }
 
 fn dirent_type(kind: std::fs::FileType) -> u8 {
-    use std::os::unix::fs::FileTypeExt;
+    use crate::sys::fs::FileTypeExt;
     if kind.is_dir() {
         DT_DIR
     } else if kind.is_file() {
@@ -1632,18 +1580,13 @@ fn dirent_type(kind: std::fs::FileType) -> u8 {
     }
 }
 
-#[allow(clippy::unnecessary_cast)] // the platform's field types differ
 fn stat_host(root: Option<&RootFs>, resolved: &Resolved, follow: bool) -> Result<Stat, Errno> {
     // The resolver has followed any link there is to follow, so what is left
     // is read as itself, through its parent opened beneath the root
     if let Some(root) = root
         && let Some(stat) = root.stat_beneath(&resolved.guest)
     {
-        let stat = stat?;
-        return Ok(Stat::from_stat(
-            &stat,
-            root.inode(stat.st_dev as u64, stat.st_ino as u64),
-        ));
+        return Ok(stat?);
     }
     let meta = if follow {
         std::fs::metadata(&resolved.host)?
@@ -1671,31 +1614,16 @@ fn stamp(path: &std::path::Path, access: Option<u64>, modify: Option<u64>) {
     let _ = set_times(path, access, modify);
 }
 
-/// An access and a modification time, in virtual nanoseconds, as `utimensat`
-/// takes them: `None` leaves the time as it is.
-fn timespecs(access: Option<u64>, modify: Option<u64>) -> [libc::timespec; 2] {
-    let timespec = |ns: Option<u64>| match ns {
-        Some(ns) => libc::timespec {
-            tv_sec: (ns / NS_PER_SEC) as libc::time_t,
-            tv_nsec: (ns % NS_PER_SEC) as libc::c_long,
-        },
-        None => libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
-    };
-    [timespec(access), timespec(modify)]
-}
-
 /// Set the times of the file at the host `path`, or of the symlink there,
 /// which is not followed.
+#[cfg(unix)]
 fn set_times(
     path: &std::path::Path,
     access: Option<u64>,
     modify: Option<u64>,
 ) -> Result<(), Errno> {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
-    let times = timespecs(access, modify);
+    let times = super::rootfs::timespecs(access, modify);
     // SAFETY: a NUL-terminated path and two timespecs, as utimensat expects.
     let status = unsafe {
         libc::utimensat(
@@ -1709,6 +1637,31 @@ fn set_times(
         0 => Ok(()),
         _ => Err(std::io::Error::last_os_error().into()),
     }
+}
+
+/// Set the times of the file or directory at the host `path`: a link's
+/// target's, since Windows opens a link as what it leads to.
+#[cfg(windows)]
+fn set_times(
+    path: &std::path::Path,
+    access: Option<u64>,
+    modify: Option<u64>,
+) -> Result<(), Errno> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let at = |ns: u64| SystemTime::UNIX_EPOCH + Duration::from_nanos(ns);
+    let mut times = std::fs::FileTimes::new();
+    if let Some(ns) = access {
+        times = times.set_accessed(at(ns));
+    }
+    if let Some(ns) = modify {
+        times = times.set_modified(at(ns));
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    Ok(file.set_times(times)?)
 }
 
 const STATFS_SIZE: usize = 88;

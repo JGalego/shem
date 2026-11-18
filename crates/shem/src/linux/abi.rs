@@ -1,8 +1,8 @@
 //! The Linux ABI as an RV32 guest sees it: asm-generic system call numbers with
 //! 64-bit time, errno values, flags, and the layouts of structs the host writes.
 
+use crate::sys::fs::MetadataExt;
 use std::fs::Metadata;
-use std::os::unix::fs::MetadataExt;
 
 use crate::mm::MapError;
 use crate::vcpu::MemoryFault;
@@ -332,6 +332,7 @@ impl Stat {
 
     /// As `from_metadata`, from what `fstatat` filled in. The casts are the
     /// platform's field types, which differ.
+    #[cfg(unix)]
     #[allow(clippy::unnecessary_cast)]
     pub fn from_stat(st: &libc::stat, ino: u64) -> Self {
         let size = st.st_size as u64;

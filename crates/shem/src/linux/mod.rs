@@ -626,6 +626,7 @@ impl Linux {
         let Some(host) = self.terminal_of(p).filter(|_| p.is_stdio_stream(fd)) else {
             return Err(Errno::ENOTTY);
         };
+        #[cfg(unix)]
         let pass = |request: u32, buf: &mut [u8]| -> Result<(), Errno> {
             // SAFETY: the buffer is at least as large as the request's struct
             let done = unsafe { libc::ioctl(host, request as _, buf.as_mut_ptr()) };
@@ -634,6 +635,12 @@ impl Linux {
             } else {
                 Ok(())
             }
+        };
+        // The terminal's settings are not the guest's to change on a host that has none like Unix's
+        #[cfg(not(unix))]
+        let pass = |_: u32, _: &mut [u8]| -> Result<(), Errno> {
+            let _ = host;
+            Err(Errno::ENOTTY)
         };
         match request {
             TCGETS | TIOCGWINSZ => {
@@ -733,13 +740,22 @@ impl Linux {
         {
             // Wait on the host terminal itself, as a read of it would
             let millis = wait_ns.map_or(-1, |ns| (ns / 1_000_000).min(i32::MAX as u64) as i32);
-            let mut watch = libc::pollfd {
-                fd: host,
-                events: libc::POLLIN,
-                revents: 0,
+            #[cfg(unix)]
+            let host_ready = {
+                let mut watch = libc::pollfd {
+                    fd: host,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one pollfd, on the stack
+                let polled = unsafe { libc::poll(&mut watch, 1, millis) };
+                polled > 0
             };
-            // SAFETY: one pollfd, on the stack
-            let host_ready = unsafe { libc::poll(&mut watch, 1, millis) } > 0;
+            #[cfg(not(unix))]
+            let host_ready = {
+                let _ = (host, millis);
+                false
+            };
             ready = poll(p, &mut entries, host_ready).0;
         }
         if ready == 0 {
@@ -1069,7 +1085,7 @@ impl Process {
     /// those overlapping `range` (address, length), or all of them. Only the
     /// part of a mapping that lies within its file is written, as on Linux.
     pub fn sync_shared(&mut self, vcpu: &dyn Vcpu, range: Option<(u32, u32)>) {
-        use std::os::unix::fs::FileExt;
+        use crate::sys::fs::FileExt;
         for map in &self.shared {
             let (from, to) = match range {
                 Some((addr, len)) => (

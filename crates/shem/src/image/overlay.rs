@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 
 /// Whether the user turned overlays off.
+#[cfg(target_os = "linux")]
 fn disabled() -> bool {
     std::env::var_os("SHEM_NO_OVERLAY").is_some_and(|value| !value.is_empty() && value != "0")
 }

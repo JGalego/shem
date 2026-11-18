@@ -214,7 +214,7 @@ fn busybox_root() -> tempfile::TempDir {
             let kind = entry.file_type().unwrap();
             if kind.is_symlink() {
                 let link = std::fs::read_link(entry.path()).unwrap();
-                std::os::unix::fs::symlink(link, &target).unwrap();
+                shem::sys::fs::symlink(link, &target).unwrap();
             } else if kind.is_dir() {
                 copy(&entry.path(), &target);
             } else {

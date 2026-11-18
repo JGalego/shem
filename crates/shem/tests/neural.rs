@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! The neural vCPU against the reference vCPU.
 //!
 //! These tests start the neural server from `neural/` (Python and PyTorch, run

@@ -7,7 +7,6 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -115,7 +114,7 @@ fn installed_as(home: &Path, name: &str) -> (String, std::path::PathBuf) {
     for (name, data) in &files {
         let path = context.path().join(name);
         fs::write(&path, data).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        shem::sys::fs::set_mode(&path, 0o755).unwrap();
     }
     fs::write(
         context.path().join("Shemfile"),
@@ -270,7 +269,7 @@ fn directory() -> (tempfile::TempDir, std::path::PathBuf) {
     }
     let program = dir.path().join("prog");
     fs::write(&program, guest()).unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    shem::sys::fs::set_mode(&program, 0o755).unwrap();
     (dir, root)
 }
 

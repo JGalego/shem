@@ -273,10 +273,9 @@ fn qemu() -> Option<PathBuf> {
 
 /// What the program writes when QEMU runs it.
 fn on_qemu(qemu: &std::path::Path, program: &[u8], dir: &std::path::Path) -> Vec<u8> {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("program");
     std::fs::write(&path, program).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    shem::sys::fs::set_mode(&path, 0o755).unwrap();
     let out = Command::new(qemu).arg(&path).output().unwrap();
     assert!(
         out.status.success(),

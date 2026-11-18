@@ -1,8 +1,8 @@
 //! Removing what the store holds: images by reference or ID, and the copies
 //! it keeps to run them, which it can make again.
 
+use crate::sys::fs::MetadataExt;
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -30,21 +30,10 @@ impl Store {
     /// under a build do not leave half an image or take one away. Reading
     /// takes no lock: a layout is moved into place whole.
     pub fn lock(&self) -> anyhow::Result<StoreLock> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
         let path = self.cache("store.lock");
         std::fs::create_dir_all(path.parent().context("no store directory")?)?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        // SAFETY: the descriptor is open for the call
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("locking the store");
-        }
+        let file = crate::sys::lock_file(&path)
+            .with_context(|| format!("locking the store at {}", path.display()))?;
         Ok(StoreLock(file))
     }
 
@@ -84,6 +73,10 @@ impl Store {
     /// layer, as two models have the same weights, keep it on the disk once.
     /// Best effort: a blob that cannot be linked stays a file of its own.
     pub(super) fn share_blobs(&self, dir: &Path) {
+        // Needs the link counts of Unix's metadata, which Windows' has not
+        if !cfg!(unix) {
+            return;
+        }
         let pool = self.shared_blobs();
         let Ok(listing) = std::fs::read_dir(dir.join("blobs/sha256")) else {
             return;
@@ -117,6 +110,9 @@ impl Store {
     /// place in the pool. Returns each path deleted and the bytes freed.
     pub(super) fn sweep(&self) -> anyhow::Result<Vec<(PathBuf, u64)>> {
         let mut deleted = Vec::new();
+        if !cfg!(unix) {
+            return Ok(deleted);
+        }
         for pool in [self.shared_blobs(), self.shared_files()] {
             let Ok(listing) = std::fs::read_dir(&pool) else {
                 continue;

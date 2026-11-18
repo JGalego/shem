@@ -683,10 +683,29 @@ fn launch<V: Vcpu + Clone>(
 /// The host terminal, while a container uses it: its settings, restored when
 /// the container is done, since the guest may change them (a shell turns off
 /// echo and line buffering to edit lines itself).
+#[cfg(unix)]
 struct Terminal {
     saved: libc::termios,
 }
 
+/// Windows' console is left as it is: a guest reads lines from it, and
+/// Ctrl-C ends shem.
+#[cfg(not(unix))]
+struct Terminal;
+
+#[cfg(not(unix))]
+impl Terminal {
+    fn attach(_: &mut shem::linux::Linux) -> Option<Self> {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for Terminal {
+    fn drop(&mut self) {}
+}
+
+#[cfg(unix)]
 impl Terminal {
     /// Give the container the host's terminal if stdin is one, and send the
     /// signals typed at it (Ctrl-C, Ctrl-\, Ctrl-Z) to the guest instead of
@@ -715,6 +734,7 @@ impl Terminal {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Terminal {
     fn drop(&mut self) {
         // SAFETY: restoring the settings tcgetattr returned

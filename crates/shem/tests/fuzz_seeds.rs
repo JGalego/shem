@@ -6,7 +6,6 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use common::*;
@@ -94,7 +93,7 @@ fn write_fuzz_seeds() {
     let context = tempfile::tempdir().unwrap();
     let path = context.path().join("echo");
     fs::write(&path, &program).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    shem::sys::fs::set_mode(&path, 0o755).unwrap();
     let shemfile = "FROM scratch\nCOPY echo /bin/echo\nENTRYPOINT [\"/bin/echo\"]\nWARM --until=syscall:read\n";
     fs::write(context.path().join("Shemfile"), shemfile).unwrap();
     let warm = image::build(&BuildOptions {

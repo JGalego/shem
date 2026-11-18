@@ -1,7 +1,6 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use common::*;
@@ -22,7 +21,7 @@ fn context(shemfile: &str, files: &[(&str, Vec<u8>)]) -> tempfile::TempDir {
         let path = dir.path().join(name);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, data).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        shem::sys::fs::set_mode(&path, 0o755).unwrap();
     }
     dir
 }
@@ -584,7 +583,7 @@ fn tags_store_an_image_under_another_reference_sharing_its_blobs() {
     let original = fs::read_to_string(one.join("index.json")).unwrap();
     assert!(original.contains(r#"ref.name":"latest""#), "{original}");
     let blob = |dir: &Path| {
-        use std::os::unix::fs::MetadataExt;
+        use shem::sys::fs::MetadataExt;
         let hex = &a["sha256:".len()..];
         fs::metadata(dir.join("blobs/sha256").join(hex))
             .unwrap()

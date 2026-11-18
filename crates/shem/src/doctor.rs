@@ -59,13 +59,30 @@ impl Check {
 
 /// The executable `name` in the directories of `path`, as a shell would find it.
 pub fn find_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
+    // Windows finds a program by the extensions it runs
+    let extensions: Vec<String> = if cfg!(windows) {
+        let known = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        std::iter::once(String::new())
+            .chain(
+                known
+                    .split(';')
+                    .filter(|ext| !ext.is_empty())
+                    .map(str::to_lowercase),
+            )
+            .collect()
+    } else {
+        vec![String::new()]
+    };
     std::env::split_paths(path)
-        .map(|dir| dir.join(name))
+        .flat_map(|dir| {
+            extensions
+                .iter()
+                .map(move |ext| dir.join(format!("{name}{ext}")))
+        })
         .find(|candidate| {
             candidate
                 .metadata()
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                .is_ok_and(|meta| meta.is_file() && crate::sys::fs::mode_of(&meta) & 0o111 != 0)
         })
 }
 
@@ -128,7 +145,8 @@ fn tool(name: &str, version: &[&str], why: &str, hint: &str, path: &OsStr) -> Ch
 pub fn run() -> Vec<Check> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let env = |name: &str| std::env::var_os(name);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
     let mut checks = vec![Check::ok(
         "shem",
         format!(
@@ -303,8 +321,10 @@ pub fn report(checks: &[Check]) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     #[test]
     fn a_program_is_found_on_the_path_only_if_it_runs() {
         let dir = tempfile::tempdir().unwrap();
@@ -365,6 +385,7 @@ mod tests {
         assert!(!healthy && text.starts_with("FAIL"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_tool_that_answers_is_reported_with_its_version() {
         let dir = tempfile::tempdir().unwrap();

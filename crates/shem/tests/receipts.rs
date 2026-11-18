@@ -1,8 +1,6 @@
 //! `shem sign` and `shem verify`, which hand a receipt to cosign. A script
 //! stands in for cosign: it records its arguments, writes the bundle that
 //! `sign-blob` is asked for, and fails when told to.
-
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -18,7 +16,7 @@ exit 0
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    shem::sys::fs::set_mode(&script, 0o755).unwrap();
     script
 }
 

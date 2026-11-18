@@ -510,7 +510,7 @@ impl Builder<'_> {
         }
         let meta = std::fs::symlink_metadata(source)?;
         if meta.is_symlink() {
-            std::os::unix::fs::symlink(std::fs::read_link(source)?, &host)?;
+            crate::sys::fs::symlink(std::fs::read_link(source)?, &host)?;
         } else {
             std::fs::copy(source, &host)?;
         }

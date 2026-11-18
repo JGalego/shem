@@ -18,14 +18,14 @@
 //! rather than follow a link. Elsewhere, and before Linux 5.6, they act on
 //! the host path as checked.
 
+use crate::sys::ffi::OsStrExt;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::io::ErrorKind;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use super::abi::Errno;
+use super::abi::{Errno, Stat};
 
 /// Linux's limit on symlinks followed in one resolution.
 const MAX_SYMLINKS: usize = 40;
@@ -179,6 +179,14 @@ impl RootFs {
                     continue;
                 }
                 _ if name.len() > NAME_MAX => return Err(Errno::ENAMETOOLONG),
+                // Windows takes these as more than a name: a separator, a drive, a stream
+                #[cfg(windows)]
+                _ if name.iter().any(|b| {
+                    matches!(b, b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|')
+                }) =>
+                {
+                    return Err(Errno::EINVAL);
+                }
                 _ => {}
             }
             let last = pending.is_empty();
@@ -227,7 +235,8 @@ impl RootFs {
     /// root as `open_beneath` opens a file: a `mkdirat` or `unlinkat` on it
     /// cannot be sent through a link a host process swapped in since the
     /// path was resolved. None where `open_beneath` has no `openat2`.
-    pub fn at_parent<T>(
+    #[cfg(unix)]
+    fn at_parent<T>(
         &self,
         guest: &[u8],
         change: impl FnOnce(std::os::fd::RawFd, &std::ffi::CStr) -> std::io::Result<T>,
@@ -253,60 +262,196 @@ impl RootFs {
     /// The metadata of the canonical guest path `guest`, itself and not what a
     /// link there leads to, read through its parent opened beneath the root.
     /// None as `at_parent` is.
-    pub fn stat_beneath(&self, guest: &[u8]) -> Option<std::io::Result<libc::stat>> {
-        self.at_parent(guest, |dir, name| {
-            // SAFETY: a zeroed stat that fstatat fills in, and a NUL-terminated name
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            let status =
-                unsafe { libc::fstatat(dir, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) };
-            if status == 0 {
-                Ok(stat)
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        })
+    #[allow(clippy::unnecessary_cast)] // the platform's field types differ
+    pub fn stat_beneath(&self, guest: &[u8]) -> Option<std::io::Result<Stat>> {
+        #[cfg(unix)]
+        {
+            self.at_parent(guest, |dir, name| {
+                // SAFETY: a zeroed stat that fstatat fills in, and a NUL-terminated name
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                let status = unsafe {
+                    libc::fstatat(dir, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW)
+                };
+                if status == 0 {
+                    Ok(Stat::from_stat(
+                        &stat,
+                        self.inode(stat.st_dev as u64, stat.st_ino as u64),
+                    ))
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = guest;
+            None
+        }
     }
 
     /// Where the symlink at the canonical guest path `guest` points, read
     /// through its parent opened beneath the root. None as `at_parent` is.
     pub fn readlink_beneath(&self, guest: &[u8]) -> Option<std::io::Result<Vec<u8>>> {
-        self.at_parent(guest, |dir, name| {
-            let mut buf = vec![0u8; PATH_MAX];
-            // SAFETY: a buffer of the length given, and a NUL-terminated name
-            let n =
-                unsafe { libc::readlinkat(dir, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-            if n < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            buf.truncate(n as usize);
-            Ok(buf)
-        })
+        #[cfg(unix)]
+        {
+            self.at_parent(guest, |dir, name| {
+                let mut buf = vec![0u8; PATH_MAX];
+                // SAFETY: a buffer of the length given, and a NUL-terminated name
+                let n = unsafe {
+                    libc::readlinkat(dir, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+                };
+                if n < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                buf.truncate(n as usize);
+                Ok(buf)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = guest;
+            None
+        }
     }
 
     /// Set the times of the canonical guest path `guest` (a link's own, not
-    /// what it leads to) through its parent opened beneath the root. None as
-    /// `at_parent` is.
+    /// what it leads to) through its parent opened beneath the root, in
+    /// nanoseconds since the epoch, leaving out those that are `None`. None
+    /// as `at_parent` is.
     pub fn set_times_beneath(
         &self,
         guest: &[u8],
-        times: &[libc::timespec; 2],
+        access: Option<u64>,
+        modify: Option<u64>,
     ) -> Option<std::io::Result<()>> {
-        self.at_parent(guest, |dir, name| {
-            // SAFETY: a NUL-terminated name and two timespecs, as utimensat expects
-            let status = unsafe {
-                libc::utimensat(
-                    dir,
-                    name.as_ptr(),
-                    times.as_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if status == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        })
+        #[cfg(unix)]
+        {
+            let times = timespecs(access, modify);
+            self.at_parent(guest, |dir, name| {
+                // SAFETY: a NUL-terminated name and two timespecs, as utimensat expects
+                let status = unsafe {
+                    libc::utimensat(
+                        dir,
+                        name.as_ptr(),
+                        times.as_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if status == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (guest, access, modify);
+            None
+        }
+    }
+
+    /// Make the directory at the canonical guest path `guest`, beneath the
+    /// root. None as `at_parent` is.
+    pub fn mkdir_beneath(&self, guest: &[u8], mode: u32) -> Option<std::io::Result<()>> {
+        #[cfg(unix)]
+        {
+            self.at_parent(guest, |dir, name| {
+                // SAFETY: `dir` is open and `name` is a C string, for the call
+                match unsafe { libc::mkdirat(dir, name.as_ptr(), mode as libc::mode_t) } {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                }
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (guest, mode);
+            None
+        }
+    }
+
+    /// Delete the file, or with `directory` the directory, at the canonical
+    /// guest path `guest`, beneath the root: the kernel answers EISDIR and
+    /// ENOTDIR as Linux does for the wrong kind. None as `at_parent` is.
+    pub fn unlink_beneath(&self, guest: &[u8], directory: bool) -> Option<std::io::Result<()>> {
+        #[cfg(unix)]
+        {
+            let how = if directory { libc::AT_REMOVEDIR } else { 0 };
+            self.at_parent(guest, |dir, name| {
+                // SAFETY: `dir` is open and `name` is a C string, for the call
+                match unsafe { libc::unlinkat(dir, name.as_ptr(), how) } {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                }
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (guest, directory);
+            None
+        }
+    }
+
+    /// Make a symlink to `target` at the canonical guest path `guest`,
+    /// beneath the root. None as `at_parent` is.
+    pub fn symlink_beneath(&self, guest: &[u8], target: &[u8]) -> Option<std::io::Result<()>> {
+        #[cfg(unix)]
+        {
+            let link = std::ffi::CString::new(target).ok()?;
+            self.at_parent(guest, |dir, name| {
+                // SAFETY: `dir` is open, and `link` and `name` are C strings, for the call
+                match unsafe { libc::symlinkat(link.as_ptr(), dir, name.as_ptr()) } {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                }
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (guest, target);
+            None
+        }
+    }
+
+    /// Rename `from` to `to`, canonical guest paths, with `flags` of
+    /// `renameat2`, beneath the root. None as `at_parent` is, and where the
+    /// kernel has no `renameat2`, which the caller does by paths.
+    pub fn rename_beneath(
+        &self,
+        from: &[u8],
+        to: &[u8],
+        flags: u32,
+    ) -> Option<std::io::Result<()>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.at_parent(from, |from_dir, from_name| {
+                self.at_parent(to, |to_dir, to_name| {
+                    // SAFETY: both descriptors are open and both names are C strings, for the call
+                    let done = unsafe {
+                        libc::syscall(
+                            libc::SYS_renameat2,
+                            from_dir,
+                            from_name.as_ptr(),
+                            to_dir,
+                            to_name.as_ptr(),
+                            flags,
+                        )
+                    };
+                    if done == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                })
+                .unwrap_or_else(|| Err(std::io::Error::from_raw_os_error(libc::ENOSYS)))
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (from, to, flags);
+            None
+        }
     }
 
     /// The names in the directory at the canonical guest path `guest`, read
@@ -329,7 +474,7 @@ impl RootFs {
         let mut listed = Vec::new();
         for entry in entries {
             let result = entry.and_then(|entry| {
-                use std::os::unix::fs::DirEntryExt;
+                use crate::sys::fs::DirEntryExt;
                 Ok((
                     entry.file_name().as_bytes().to_vec(),
                     entry.ino(),
@@ -355,4 +500,22 @@ impl RootFs {
 
 fn components(path: &[u8]) -> impl DoubleEndedIterator<Item = &[u8]> {
     path.split(|&b| b == b'/').filter(|c| !c.is_empty())
+}
+
+/// An access and a modification time, in nanoseconds since the epoch, as
+/// `utimensat` takes them: `None` leaves the time as it is.
+#[cfg(unix)]
+pub(super) fn timespecs(access: Option<u64>, modify: Option<u64>) -> [libc::timespec; 2] {
+    const NS_PER_SEC: u64 = 1_000_000_000;
+    let timespec = |ns: Option<u64>| match ns {
+        Some(ns) => libc::timespec {
+            tv_sec: (ns / NS_PER_SEC) as libc::time_t,
+            tv_nsec: (ns % NS_PER_SEC) as libc::c_long,
+        },
+        None => libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+    };
+    [timespec(access), timespec(modify)]
 }

@@ -32,16 +32,19 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }})
+    # Windows is new: until a run there has been seen to pass, it reports without failing the build
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      # The containerd shim is Linux's: on Windows, the runtime alone
+      - run: cargo test ${{ matrix.os == 'windows-latest' && '-p shem' || '--workspace' }}
 
   msrv:
     name: MSRV (1.88)

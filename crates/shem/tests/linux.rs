@@ -1,6 +1,7 @@
 //! System calls, exercised directly: set the argument registers, call
 //! `Linux::handle`, and check the result and guest memory.
 
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 mod common;
 
 use std::fs;
@@ -421,6 +422,7 @@ fn getdents64_needs_room_for_one_entry() {
     assert_eq!(g.call(GETDENTS64, &[fd, buf, 8]), EINVAL);
 }
 
+#[cfg(unix)]
 #[test]
 fn statx_reports_files_links_and_stdio() {
     let mut g = Guest::new();
@@ -527,6 +529,7 @@ fn links_renames_and_removal() {
     assert!(!g.host("dir").exists() && !g.host("c").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn guest_paths_never_reach_host_files_outside_the_root() {
     let mut g = Guest::new();
@@ -582,6 +585,7 @@ fn a_directory_swapped_for_a_link_after_the_guest_got_there_stays_inside_the_roo
     assert!(!outside.join("planted").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn special_files_in_the_root_are_not_opened_on_the_host() {
     let mut g = Guest::new();
@@ -592,6 +596,7 @@ fn special_files_in_the_root_are_not_opened_on_the_host() {
     assert_eq!(g.open("/fifo", O_RDONLY | O_NONBLOCK), EPERM);
 }
 
+#[cfg(unix)]
 #[test]
 fn file_times_set_without_following_go_to_the_link_itself() {
     use std::os::unix::fs::MetadataExt;
@@ -1005,9 +1010,9 @@ fn process_calls_become_container_actions() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn execve_reads_the_program_and_follows_shebang_lines() {
-    use std::os::unix::fs::PermissionsExt;
     let mut g = Guest::new();
     let program = common::elf(&[common::ECALL], &[]);
     fs::create_dir(g.host("bin")).unwrap();
@@ -1019,11 +1024,7 @@ fn execve_reads_the_program_and_follows_shebang_lines() {
     ] {
         fs::write(g.host(&format!("bin/{name}")), contents).unwrap();
         let mode = if name == "plain" { 0o644 } else { 0o755 };
-        fs::set_permissions(
-            g.host(&format!("bin/{name}")),
-            fs::Permissions::from_mode(mode),
-        )
-        .unwrap();
+        shem::sys::fs::set_mode(&g.host(&format!("bin/{name}")), mode).unwrap();
     }
 
     let (script, argv) = (g.cstr("/bin/script"), g.strings(&["script", "arg1"]));
