@@ -132,6 +132,9 @@ class Tools:
         steps = f"{int(retired.group(1)):,} instructions" if retired else "no instructions"
         print(f"shem: ran {name} {' '.join(args)} on the compiled RV32IM layer, {steps}", file=err, flush=True)
         output = done.stdout.strip()
+        if not retired and done.stderr.strip():
+            # The program did not run: say why where the model's user can see it
+            print(f"shem: {name} did not run: {done.stderr.strip()}", file=err, flush=True)
         if done.returncode != 0:
             problems = "\n".join(line for line in done.stderr.splitlines() if "instructions retired" not in line)
             output += f"\n(exit status {done.returncode}){chr(10) + problems if problems else ''}"

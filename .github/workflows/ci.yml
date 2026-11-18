@@ -44,7 +44,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # The containerd shim is Linux's: on Windows, the runtime alone
-      - run: cargo test ${{ matrix.os == 'windows-latest' && '-p shem' || '--workspace' }}
+      - run: cargo test ${{ matrix.os == 'windows-latest' && '-p shem --no-fail-fast' || '--workspace' }}
 
   msrv:
     name: MSRV (1.88)

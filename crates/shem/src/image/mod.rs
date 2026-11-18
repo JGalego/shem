@@ -1046,7 +1046,11 @@ impl Store {
     /// Where the image `reference` (`name` or `name:tag`) lives.
     pub fn path(&self, reference: &str) -> anyhow::Result<PathBuf> {
         let (name, tag) = parse_reference(reference)?;
-        Ok(self.root.join(name).join(tag))
+        let mut path = self.root.clone();
+        for part in name.split('/') {
+            path.push(place(part));
+        }
+        Ok(path.join(tag))
     }
 
     /// Every image in the store, as (reference, manifest digest).
@@ -1066,8 +1070,16 @@ impl Store {
             if path.join("oci-layout").is_file() {
                 let relative = path.strip_prefix(&self.root)?;
                 let tag = relative.file_name().unwrap().to_string_lossy();
-                let name = relative.parent().unwrap().to_string_lossy();
-                images.push((format!("{name}:{tag}"), Image::layout_digest(&path)?));
+                let name: Vec<_> = relative
+                    .parent()
+                    .unwrap()
+                    .components()
+                    .map(|part| unplace(&part.as_os_str().to_string_lossy()))
+                    .collect();
+                images.push((
+                    format!("{}:{tag}", name.join("/")),
+                    Image::layout_digest(&path)?,
+                ));
             } else if path.is_dir() {
                 self.collect(&path, images)?;
             }
@@ -1076,9 +1088,34 @@ impl Store {
     }
 }
 
+/// The directory name for a part of an image's name: a registry's port is
+/// set off by a colon, which a Windows path may not have, and a `%` cannot
+/// be in a name otherwise.
+fn place(part: &str) -> String {
+    if cfg!(windows) {
+        part.replace(':', "%")
+    } else {
+        part.to_string()
+    }
+}
+
+/// The part of an image's name a directory was made for: `place` undone.
+fn unplace(directory: &str) -> String {
+    if cfg!(windows) {
+        directory.replace('%', ":")
+    } else {
+        directory.to_string()
+    }
+}
+
 /// Whether `name` names a file in a directory, and nothing outside it.
 pub(crate) fn is_file_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+    // Windows takes a backslash for a separator, and a colon for a drive or a stream
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\'])
+        && !(cfg!(windows) && name.contains(':'))
 }
 
 /// Split `name[:tag]`, checking the name is safe to use as a path. The name
