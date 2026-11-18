@@ -28,6 +28,7 @@ Programs use the reference interpreter by default. `--vcpu neural` selects a sta
 | Build, push and pull images | [Shemfile](shemfile.md) |
 | Run with Docker or containerd | [containerd and Docker](containerd.md) |
 | Configure nodes or mount model images | [Kubernetes](kubernetes.md) |
+| Run on Windows without WSL | [Windows](windows.md) |
 | Boot Linux or save a booted VM | [VM mode](vm.md) |
 | Run and benchmark the compiled CPU | [Neural vCPU](neural.md) |
 | Understand the runtime and its limits | [Architecture](architecture.md) |

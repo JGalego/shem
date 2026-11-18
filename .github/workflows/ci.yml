@@ -32,8 +32,6 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }})
-    # Windows is new: until a run there has been seen to pass, it reports without failing the build
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:

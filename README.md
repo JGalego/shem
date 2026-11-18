@@ -210,6 +210,7 @@ docs/
   models.md        model images
   containerd.md    the containerd shim
   kubernetes.md    shem in Pods, through a RuntimeClass
+  windows.md       shem on Windows, and what it has not got yet
   shemfile.md      the Shemfile and the image format
 ```
 
@@ -278,7 +279,7 @@ The slower suites are ignored tests that need inputs built first: guest programs
 
 ### Release
 
-The [release workflow](.github/workflows/release.yml) publishes Rust crates, the Python package, Linux and macOS binaries, toolchain and example images on GHCR, and [compiled CPU weights](https://huggingface.co/jgalego/shem-rv32im) on Hugging Face. It generates release notes from commit messages and publishes SBOMs and build provenance. CI dry-runs Rust publication and builds the Python package.
+The [release workflow](.github/workflows/release.yml) publishes Rust crates, the Python package, Linux, macOS and Windows binaries, toolchain and example images on GHCR, and [compiled CPU weights](https://huggingface.co/jgalego/shem-rv32im) on Hugging Face. It generates release notes from commit messages and publishes SBOMs and build provenance. CI dry-runs Rust publication and builds the Python package.
 
 Set the same version in [`Cargo.toml`](Cargo.toml) and [`neural/pyproject.toml`](neural/pyproject.toml).
 
@@ -310,7 +311,7 @@ Before the first release, set up publishing once:
 - **GitHub Pages**: in the repository's settings, set Pages to deploy from GitHub Actions, and set the repository variable `DOCS_SITE` to `true`, for the docs site.
 - **GHCR**: after the first release, make the new packages public (each package's settings, then "Change visibility"): `shem-toolchain`, `shem-neural`, the BuildKit frontend `shem/dockerfile` and the example images under `shem/`.
 
-Install a release's binaries without compiling, with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) (`cargo binstall shem`) or Homebrew (`brew install jgalego/shem/shem`) on Macs, Apple Silicon and Intel, and on Linux. Windows has no binary: shem uses Unix's system interfaces throughout, so run the Linux one in WSL 2.
+Install a release's binaries without compiling, with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) (`cargo binstall shem`) or Homebrew (`brew install jgalego/shem/shem`) on Macs, Apple Silicon and Intel, and on Linux. On Windows, take the release's `x86_64-pc-windows-msvc` archive or build from source: it runs without WSL, with [some things left out](docs/windows.md).
 
 ### Contribute
 

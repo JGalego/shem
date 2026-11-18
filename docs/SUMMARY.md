@@ -9,3 +9,4 @@
 - [VM mode](vm.md)
 - [containerd and Docker](containerd.md)
 - [Kubernetes](kubernetes.md)
+- [Windows](windows.md)
