@@ -7,7 +7,7 @@ import torch
 from shem_neural.compile import compile_weights, save
 from shem_neural.export import export
 from shem_neural.model.generate import _partial, reply, system_file
-from shem_neural.model.tools import compiled_layers, tool_calls
+from shem_neural.model.tools import Tools, compiled_layers, tool_calls
 from shem_neural.server import Registry
 
 
@@ -109,3 +109,20 @@ def test_replies_end_before_a_stop_text():
     # Text that only began like a stop is written after all
     assert run([" a", "\n", "b"], ["\nX"], max_tokens=3) == (" a\nb\n", [0, 1, 2], [0, 1, 2])
     assert run([" a", "b"], [], max_tokens=2) == (" ab\n", [0, 1], [0, 1])
+
+
+def test_a_tool_runs_on_an_overlay_of_the_images_files(tmp_path, monkeypatch):
+    """The image's files are read by every run: a program's writes go above them."""
+    root = tmp_path / "root"
+    (root / "bin").mkdir(parents=True)
+    program = root / "bin" / "greet"
+    program.write_text("")
+    program.chmod(0o755)
+    fake = tmp_path / "shem"
+    fake.write_text(f'#!/bin/sh\necho "$@" > {tmp_path}/argv\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("SHEM_BIN", str(fake))
+    tools = Tools(root, "/bin", tmp_path / "weights.safetensors", socket=tmp_path / "vcpu.sock")
+    tools.run("greet", {})
+    argv = (tmp_path / "argv").read_text().split()
+    assert argv[argv.index("--root") + 2] == "--root-overlay"

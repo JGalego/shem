@@ -114,6 +114,8 @@ class Tools:
             str(self.weights),
             "--root",
             str(self.root),
+            # A program's writes are not to reach the image's files, which every run reads
+            "--root-overlay",
             "--mem",
             "4M",
             "--stats",

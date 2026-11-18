@@ -161,6 +161,11 @@ struct RunArgs {
     /// Host directory to use as an executable's root filesystem
     #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
+    /// Have the guest's changes to --root go to a layer above it, removed when
+    /// the run ends, so that the directory is as it was (where the system
+    /// cannot mount an overlay, they go to it, and a warning says so)
+    #[arg(long, requires = "root")]
+    root_overlay: bool,
     /// For a model image, continue this session: one `shem push --state`
     /// published, in a registry or as an OCI layout directory
     #[arg(long, value_name = "REF")]
@@ -578,9 +583,25 @@ fn launch<V: Vcpu + Clone>(
             .chain(args.args.iter().cloned())
             .collect();
         let mem = args.mem.unwrap_or(image::CONTAINER_MEM);
+        // Before the vCPU, which a process can only enter the namespaces of an overlay without
+        let mut root = args.root.clone();
+        if args.root_overlay
+            && let Some(lower) = &args.root
+        {
+            match Store::open()?.overlay_over(&std::fs::canonicalize(lower)?) {
+                Ok(mounted) => {
+                    root = Some(mounted.path().to_path_buf());
+                    rootfs = Some(image::Held::Overlay(mounted));
+                }
+                Err(why) => eprintln!(
+                    "shem: no overlay of {} ({why}): the guest's changes go to it",
+                    lower.display()
+                ),
+            }
+        }
         let mut container = Container::from_elf(vcpu(mem, 0)?, &elf, &argv, &args.env, stdio)
             .with_context(|| format!("loading {}", args.target))?;
-        if let Some(root) = &args.root {
+        if let Some(root) = &root {
             container
                 .set_root(root)
                 .with_context(|| format!("using {} as the root filesystem", root.display()))?;

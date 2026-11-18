@@ -255,3 +255,59 @@ fn a_build_on_an_overlay_of_its_base_makes_the_image_one_that_unpacks_it_does() 
     let left = fs::read_dir(with.path().join("tmp")).map_or(0, Iterator::count);
     assert_eq!(left, 0, "the build's own directory is removed");
 }
+
+/// A directory holding the files `guest` works on, and the program itself beside it.
+fn directory() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    fs::create_dir(&root).unwrap();
+    for (name, data) in [
+        ("keep", &b"Keep"[..]),
+        ("gone", b"Gone"),
+        ("mod", b"Original contents"),
+    ] {
+        fs::write(root.join(name), data).unwrap();
+    }
+    let program = dir.path().join("prog");
+    fs::write(&program, guest()).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, root)
+}
+
+fn run_in(home: &Path, root: &Path, program: &Path, overlay: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shem"));
+    command
+        .arg("run")
+        .arg("--root")
+        .arg(root)
+        .args(overlay.then_some("--root-overlay"))
+        .args(["--mem", "1M"])
+        .arg(program)
+        .env("SHEM_HOME", home);
+    command.output().unwrap()
+}
+
+#[test]
+fn a_root_given_to_an_executable_is_changed_unless_it_is_an_overlay() {
+    let home = tempfile::tempdir().unwrap();
+    let (dir, root) = directory();
+    let program = dir.path().join("prog");
+    // Without the flag, the guest's changes are made to the directory itself
+    let plain = run_in(home.path(), &root, &program, false);
+    assert_eq!(plain.status.code(), Some(STATUS), "{plain:?}");
+    assert!(!root.join("gone").exists());
+    assert_eq!(fs::read(root.join("new")).unwrap(), b"fresh");
+    // With it, they are made to a layer above, where the system mounts overlays
+    let (dir, root) = directory();
+    let program = dir.path().join("prog");
+    let layered = run_in(home.path(), &root, &program, true);
+    assert_eq!(layered.status.code(), Some(STATUS), "{layered:?}");
+    let said = String::from_utf8_lossy(&layered.stderr);
+    if !said.contains("no overlay of") {
+        assert_eq!(fs::read(root.join("gone")).unwrap(), b"Gone");
+        assert_eq!(fs::read(root.join("mod")).unwrap(), b"Original contents");
+        assert!(!root.join("new").exists());
+    }
+    let left = fs::read_dir(home.path().join("tmp")).map_or(0, Iterator::count);
+    assert_eq!(left, 0, "the run's own directory is removed");
+}

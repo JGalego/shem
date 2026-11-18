@@ -988,9 +988,17 @@ impl Store {
     pub fn overlay_of(&self, image: &Image, digest: &str) -> Option<overlay::Mounted> {
         overlay::enter().ok()?;
         let lower = self.rootfs(image, digest).ok()?;
+        self.overlay_over(&lower).ok()
+    }
+
+    /// An overlay of the directory `lower`, which is never written to, for
+    /// what is done to it to go to a layer removed with the overlay; why not
+    /// if the system cannot mount one.
+    pub fn overlay_over(&self, lower: &Path) -> Result<overlay::Mounted, overlay::Why> {
+        overlay::enter()?;
         let scratch = self.root.with_file_name("tmp");
-        std::fs::create_dir_all(&scratch).ok()?;
-        overlay::mount(&lower, &scratch).ok()
+        std::fs::create_dir_all(&scratch).map_err(|error| error.to_string())?;
+        overlay::mount(lower, &scratch)
     }
 
     fn run_dir(&self, image: &Image, digest: &str) -> anyhow::Result<(Held, PathBuf)> {
