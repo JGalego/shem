@@ -52,6 +52,7 @@
 - The Spike install takes its softfloat submodule
 - Image names are listed with slashes and kept out of Windows-hostile directory names, and a tool that did not run says why
 - An overlay's namespaces are tried in a child first, so a kernel that refuses the id maps leaves the run as it was, and Windows skips the tests of what it has not got
+- A file's inode on Windows is the one its volume gives it, not its creation time, which two files made together share
 
 ### Performance
 
@@ -85,6 +86,10 @@
 - Types without new mypy errors, Rust and Python coverage in the job summary, a benchmark that fails if batching stops paying, and tests of the Spaces' logic
 - Releases carry an Intel Mac binary, built on Apple Silicon, for the installer and the Homebrew formula, and the README says Windows runs it in WSL 2
 - A job that builds Spike at a pinned commit and compares the reference vCPU with it on random programs, plain and compressed
+
+### Other
+
+- Release 0.4.0
 ## 0.3.0 (2026-11-14)
 
 ### Features
